@@ -27,8 +27,8 @@ sha2 = "0.10"
 serde_urlencoded = "0.7"
 # S3-compatible object storage for attachment bytes (Cloudflare R2 in
 # production, RustFS in the integration test). rustls to avoid an OpenSSL build.
-rust-s3 = { version = "0.35", default-features = false, features = [
-  "tokio-rustls-tls",
+rust-s3 = { version = "=0.38.0", default-features = false, features = [
+  "tokio-rustls-tls-ring",
 ] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -56,6 +56,7 @@ testPkgs.testers.runNixOSTest {
       testPkgs.jq
       testPkgs.gzip
       testPkgs.postgresql
+      testPkgs.python3
       testPkgs.unzip
       testPkgs.zip
       # `mc` creates the bucket before the upload subtest.

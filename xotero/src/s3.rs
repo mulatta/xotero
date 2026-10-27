@@ -63,13 +63,16 @@ impl Storage {
     pub async fn put(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<(), S3Error> {
         let response = self
             .bucket
-            .put_object_with_content_type(key, bytes, content_type)
+            .put_object_stream_builder(key)
+            .with_content_type(content_type)
+            .with_max_concurrent_chunks(2)
+            .execute_stream(&mut std::io::Cursor::new(bytes))
             .await?;
         let code = response.status_code();
         if !(200..300).contains(&code) {
             return Err(S3Error::HttpFailWithBody(
                 code,
-                String::from_utf8_lossy(response.bytes()).into_owned(),
+                "object upload did not succeed".into(),
             ));
         }
         Ok(())
@@ -92,5 +95,92 @@ impl Storage {
     /// A pre-signed GET URL the client can follow directly to the bucket.
     pub async fn presign_get(&self, key: &str) -> Result<String, S3Error> {
         self.bucket.presign_get(key, self.presign_ttl, None).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Bytes;
+    use axum::extract::DefaultBodyLimit;
+    use axum::http::{Method, StatusCode, Uri};
+    use axum::routing::any;
+    use axum::Router;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn put_rejects_malformed_successful_multipart_completion() {
+        // Given: a wire-level provider accepts parts but returns truncated XML
+        // instead of a successful multipart completion receipt.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let completed = Arc::new(AtomicBool::new(false));
+        let completion_receipt = Arc::clone(&completed);
+        let provider = Router::new()
+            .fallback(any(move |method: Method, uri: Uri, _body: Bytes| {
+                let completed = Arc::clone(&completed);
+                async move {
+                    match (method, uri.query()) {
+                        (Method::POST, Some("uploads")) => (
+                            StatusCode::OK,
+                            [("etag", "\"part\"")],
+                            "<InitiateMultipartUploadResult><Bucket>zotero</Bucket>\
+                             <Key>large</Key><UploadId>upload</UploadId>\
+                             </InitiateMultipartUploadResult>",
+                        ),
+                        (Method::DELETE, _) => (StatusCode::NO_CONTENT, [("etag", "\"part\"")], ""),
+                        (Method::POST, _) => {
+                            completed.store(true, Ordering::SeqCst);
+                            (
+                                StatusCode::OK,
+                                [("etag", "\"part\"")],
+                                "<Error><Code>InternalError</Code>",
+                            )
+                        }
+                        _ => (
+                            StatusCode::OK,
+                            [("etag", "\"part\"")],
+                            "<Error><Code>InternalError</Code>",
+                        ),
+                    }
+                }
+            }))
+            .layer(DefaultBodyLimit::disable());
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, provider).await });
+        let storage = Storage::new(&Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "zotero".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            path_style: true,
+            presign_ttl: 120,
+        })
+        .unwrap();
+
+        // When: actual Storage uploads an object above the SDK part threshold.
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            storage.put("large", &vec![b'x'; 8 * 1024 * 1024 + 1], "text/plain"),
+        )
+        .await
+        .unwrap();
+
+        // Then: HTTP 200 cannot turn malformed completion XML into success.
+        servers.abort_all();
+        while let Some(result) = servers.join_next().await {
+            assert!(result.unwrap_err().is_cancelled());
+        }
+        assert!(
+            result.is_err(),
+            "malformed provider completion was accepted"
+        );
+        assert!(
+            completion_receipt.load(Ordering::SeqCst),
+            "provider did not observe multipart completion"
+        );
     }
 }

@@ -2,6 +2,8 @@
 nixosModule-deployed service. Grouped by flow rather than per endpoint, since
 each run boots a VM."""
 
+import shlex
+
 base = "http://localhost:8189"
 auth = "-H 'Zotero-API-Key: testtoken' -H 'Zotero-API-Version: 3'"
 readonly = "-H 'Zotero-API-Key: readonlytoken' -H 'Zotero-API-Version: 3'"
@@ -1201,3 +1203,151 @@ with subtest("request journal keeps routing evidence without secrets or content"
         and "path=/uploads/{token}" in line
         for line in journal_lines
     )
+
+with subtest("storage SDK round-trips small and multipart encoded keys"):
+    machine.succeed("printf 'sdk-small' >/tmp/sdk-small")
+    machine.succeed("dd if=/dev/zero of=/tmp/sdk-large bs=1M count=9 status=none")
+    for item, payload, blob in (
+        ("SDKSMALL", "/tmp/sdk-small", "libraries/1/uploads/sdk space+%?#/small"),
+        ("SDKLARGE", "/tmp/sdk-large", "libraries/1/uploads/sdk space+%?#/large"),
+    ):
+        machine.succeed(
+            f"curl -sf -X POST {base}/users/1/items {auth} "
+            f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+            f'-d \'[{{"key":"{item}","itemType":"attachment",'
+            '"linkMode":"imported_file","filename":"sdk.bin"}]\' | jq -e .successful'
+        )
+        digest = machine.succeed(f"md5sum {payload} | cut -d' ' -f1").strip()
+        size = machine.succeed(f"stat -c %s {payload}").strip()
+        token = machine.succeed(
+            f"curl -sf -X POST {base}/users/1/items/{item}/file {auth} "
+            "-H 'If-None-Match: *' "
+            f"-d 'md5={digest}&filename=sdk.bin&filesize={size}&mtime=1' "
+            "| jq -r .uploadKey"
+        ).strip()
+        psql(f"update pending_uploads set blob_key = '{blob}' where item_key = '{item}'")
+        upload_response = machine.succeed(
+            f"curl -sS --max-time 60 -i -X POST {base}/uploads/{token} "
+            f"--data-binary @{payload} -w '\\n%{{http_code}}'"
+        )
+        assert upload_response.rsplit("\n", 1)[-1] == "201", upload_response
+        assert psql(f"select state from pending_uploads where item_key = '{item}'") == "uploaded"
+        registration = machine.succeed(
+            f"curl -sS --max-time 60 -i -X POST {base}/users/1/items/{item}/file {auth} "
+            f"-H 'If-None-Match: *' -d 'upload={token}'"
+        )
+        assert registration.startswith("HTTP/1.1 204"), registration
+        location = machine.succeed(
+            f"curl -sf -D /tmp/sdk.headers -o /dev/null "
+            f"{base}/users/1/items/{item}/file {auth} "
+            "&& grep -i '^location:' /tmp/sdk.headers | tr -d '\\r' | awk '{print $2}'"
+        ).strip()
+        machine.succeed(f"curl -sf --max-time 60 '{location}' -o /tmp/sdk-download")
+        machine.succeed(f"cmp {payload} /tmp/sdk-download")
+        print(f"SDK roundtrip {item} size={size} md5={digest} blob={blob}")
+        print(upload_response, registration)
+        # Exercise Storage.delete, not mc's independent delete implementation.
+        # A new abandoned candidate uses an encoded key and the same payload size.
+        cleanup_token = machine.succeed(
+            f"curl -sf -X POST {base}/users/1/items/{item}/file {auth} "
+            f"-H 'If-Match: {digest}' "
+            f"-d 'md5=00000000000000000000000000000000"
+            f"&filename=cleanup.bin&filesize={size}&mtime=2' | jq -r .uploadKey"
+        ).strip()
+        cleanup_blob = blob + "-cleanup"
+        psql(
+            f"update pending_uploads set blob_key = '{cleanup_blob}', upload_md5 = '{digest}' "
+            f"where item_key = '{item}'"
+        )
+        machine.succeed(
+            f"curl -sf --max-time 60 -X POST {base}/uploads/{cleanup_token} "
+            f"--data-binary @{payload}"
+        )
+        machine.succeed(f"mc stat 's3/zotero/{cleanup_blob}'")
+        psql(
+            "update pending_uploads set created_at = now() - interval '2 hours', "
+            "expires_at = now() - interval '1 hour' "
+            f"where item_key = '{item}'"
+        )
+        restart_xotero()
+        assert psql(f"select count(*) from pending_uploads where item_key = '{item}'") == "0"
+        machine.fail(f"mc stat 's3/zotero/{cleanup_blob}'")
+
+with subtest("provider failures never publish or mark uploads complete"):
+    # Run actual Storage through the live upload/registration handlers. This
+    # provider controls only wire replies that RustFS cannot deliberately emit.
+    provider = r"""
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import unquote
+
+class Provider(BaseHTTPRequestHandler):
+    def reply(self):
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        mode = Path("/tmp/sdk-provider-mode").read_text()
+        status = int(mode) if mode.isdigit() else 200
+        body = b""
+        if status == 200 and self.command == "POST":
+            if self.path.endswith("?uploads"):
+                key = unquote(self.path.split("?")[0].removeprefix("/zotero/"))
+                body = (
+                    "<InitiateMultipartUploadResult><Bucket>zotero</Bucket>"
+                    f"<Key>{key}</Key><UploadId>sdk-upload</UploadId>"
+                    "</InitiateMultipartUploadResult>"
+                ).encode()
+            else:
+                body = b"<Error><Code>InternalError</Code>"
+        if self.command == "DELETE":
+            status = 204
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("ETag", '"sdk-part"')
+        self.end_headers()
+        self.wfile.write(body)
+        print(self.command, self.path, status, repr(body), flush=True)
+    do_POST = reply
+    do_PUT = reply
+    do_DELETE = reply
+
+HTTPServer(("127.0.0.1", 9000), Provider).serve_forever()
+"""
+    machine.succeed("systemctl stop rustfs.service")
+    try:
+        machine.succeed("printf 403 >/tmp/sdk-provider-mode")
+        machine.succeed(
+            "systemd-run --unit=xotero-sdk-provider "
+            "--property=RuntimeMaxSec=180 python3 -u -c " + shlex.quote(provider)
+        )
+        machine.wait_for_open_port(9000)
+        digest = machine.succeed("md5sum /tmp/sdk-large | cut -d' ' -f1").strip()
+        for mode in ("403", "503", "malformed"):
+            machine.succeed(f"printf %s {mode} >/tmp/sdk-provider-mode")
+            token = machine.succeed(
+                f"curl -sf -X POST {base}/users/1/items/SDKLARGE/file {auth} "
+                f"-H 'If-Match: {digest}' "
+                f"-d 'md5={digest}&filename=failed.bin&filesize=9437184&mtime=3' "
+                "| jq -r .uploadKey"
+            ).strip()
+            before = library_version()
+            response = machine.succeed(
+                f"curl -sS --max-time 60 -i -X POST {base}/uploads/{token} "
+                "--data-binary @/tmp/sdk-large -w '\\n%{http_code}'"
+            )
+            assert response.rsplit("\n", 1)[-1] == "500", (mode, response)
+            states = psql("select string_agg(distinct state, ',') from pending_uploads where item_key = 'SDKLARGE'")
+            assert states == "authorized", (mode, states)
+            registration = machine.succeed(
+                f"curl -sS --max-time 60 -i -X POST {base}/users/1/items/SDKLARGE/file {auth} "
+                f"-H 'If-Match: {digest}' -d 'upload={token}'"
+            )
+            assert registration.startswith("HTTP/1.1 400"), (mode, registration)
+            assert library_version() == before
+            print(f"SDK provider mode={mode} state={states} version={before}")
+            print(response, registration)
+        wire = machine.succeed("journalctl -u xotero-sdk-provider --no-pager")
+        assert "POST /zotero/" in wire and "InternalError" in wire, wire
+        print(wire)
+    finally:
+        machine.succeed("systemctl stop xotero-sdk-provider.service")
+        machine.succeed("systemctl start rustfs.service")
+        machine.wait_for_open_port(9000)
