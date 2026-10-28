@@ -48,6 +48,7 @@ testPkgs.testers.runNixOSTest {
 
     services.rustfs = {
       enable = true;
+      package = import ./rustfs.nix { pkgs = testPkgs; };
       environmentFile = toString (
         testPkgs.writeText "rustfs-secrets.env" ''
           RUSTFS_ACCESS_KEY=rustfsadmin

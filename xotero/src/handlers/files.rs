@@ -13,7 +13,6 @@ use crate::domain::{LibraryId, RequestContext};
 use crate::error::{s3_error, server_error};
 use crate::http::access::{request_access, request_library};
 use crate::http::headers::{conflict, current_headers, header_value, version_headers};
-use crate::http::middleware::{buffered_body, MAX_BODY};
 use crate::http::validation::valid_key;
 use crate::{store, upload_token, AppState};
 
@@ -214,8 +213,15 @@ pub(crate) async fn file_post(
 }
 
 pub(crate) async fn cleanup_pending_uploads(state: &AppState) {
+    let cutoff = match store::pending_upload_cleanup_cutoff(&state.pool).await {
+        Ok(cutoff) => cutoff,
+        Err(error) => {
+            tracing::warn!(%error, "start pending upload cleanup");
+            return;
+        }
+    };
     loop {
-        let garbage = match store::claim_pending_upload_garbage(&state.pool, 32).await {
+        let garbage = match store::claim_pending_upload_garbage(&state.pool, 32, &cutoff).await {
             Ok(garbage) => garbage,
             Err(error) => {
                 tracing::warn!(%error, "claim pending upload garbage");
@@ -226,9 +232,21 @@ pub(crate) async fn cleanup_pending_uploads(state: &AppState) {
             return;
         }
         for candidate in garbage {
-            if let Err(error) = state.storage.delete(&candidate.blob_key).await {
-                tracing::warn!(%error, "delete pending upload candidate");
-                continue;
+            match tokio::time::timeout(
+                state.config.upload_timeout,
+                state.storage.delete(&candidate.blob_key),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "delete pending upload candidate");
+                    continue;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "pending upload cleanup deadline");
+                    continue;
+                }
             }
             if let Err(error) =
                 store::delete_pending_upload_garbage(&state.pool, &candidate.token_hash).await
@@ -255,6 +273,21 @@ pub(crate) async fn upload_put(
     Path(token): Path<String>,
     request: Request,
 ) -> Response {
+    let deadline = tokio::time::Instant::now() + state.config.upload_timeout;
+    match tokio::time::timeout_at(deadline, receive_upload(state, token, request, deadline)).await {
+        Ok(response) => response,
+        Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
+    }
+}
+
+async fn receive_upload(
+    state: AppState,
+    token: String,
+    request: Request,
+    deadline: tokio::time::Instant,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let (body, body_polls) = crate::upload::observed_body(body);
     let token_hash = key_hash(&token);
     let upload = match store::pending_upload(&state.pool, &token_hash).await {
         Ok(Some(upload)) => upload,
@@ -271,58 +304,124 @@ pub(crate) async fn upload_put(
         Ok(false) => return (StatusCode::FORBIDDEN, "upload access revoked").into_response(),
         Err(error) => return server_error("upload authorization", error),
     }
-    let (parts, body) = request.into_parts();
-    let body = match buffered_body(body, &parts.headers, MAX_BODY).await {
-        Ok(body) => body,
+    let size = match u64::try_from(upload.filesize) {
+        Ok(size) if size <= state.config.upload_max_bytes => size,
+        _ => return StatusCode::PAYLOAD_TOO_LARGE.into_response(),
+    };
+    // Admission owns no application bytes. Queuing is included in total deadline.
+    let permit = match tokio::time::timeout_at(
+        deadline,
+        crate::upload::admit(state.uploads.clone(), &body_polls),
+    )
+    .await
+    {
+        Ok(Ok(permit)) => permit,
+        Ok(Err(error)) => {
+            tracing::error!(%error, "upload admission");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(_) => return StatusCode::REQUEST_TIMEOUT.into_response(),
+    };
+    let mut reader = match crate::upload::attachment_reader(
+        body,
+        &parts.headers,
+        state.config.upload_max_bytes,
+        size,
+        upload.upload_md5.clone(),
+    ) {
+        Ok(reader) => reader,
         Err(status) => return status.into_response(),
     };
-    let actual_md5 = {
-        use md5::{Digest, Md5};
-        format!("{:x}", Md5::new().chain_update(&body).finalize())
-    };
-    if body.len() as i64 != upload.filesize || actual_md5 != upload.upload_md5.to_lowercase() {
-        tracing::warn!("uploaded bytes do not match authorization");
-        return (
-            StatusCode::BAD_REQUEST,
-            "uploaded bytes do not match md5/filesize",
-        )
-            .into_response();
-    }
-    match store::claim_pending_upload(&state.pool, &token_hash).await {
-        Ok(true) => {}
-        Ok(false) => {
-            return (StatusCode::CONFLICT, "upload token already used").into_response();
-        }
-        Err(error) => return server_error("claim pending upload", error),
-    }
-    let content_type = if upload.compressed {
-        "application/zip"
-    } else {
-        "application/octet-stream"
-    };
-    if let Err(error) = state
-        .storage
-        .put(&upload.blob_key, &body, content_type)
-        .await
-    {
-        if let Err(reset_error) = store::reset_pending_upload(&state.pool, &token_hash).await {
-            tracing::warn!(error = %reset_error, "reset failed pending upload");
-        }
-        cleanup_pending_uploads(&state).await;
-        return s3_error("store file", error);
-    }
-    match store::mark_pending_upload_uploaded(&state.pool, &token_hash).await {
-        Ok(true) => {}
-        Ok(false) => {
-            if let Err(error) = store::discard_pending_upload(&state.pool, &token_hash).await {
-                tracing::warn!(%error, "discard incomplete pending upload");
+    let (mut reply, response) = tokio::sync::oneshot::channel();
+    // The supervisor survives a dropped HTTP future. It finishes the durable
+    // claim before observing cancellation, then drops SDK work before cleanup.
+    tokio::spawn(async move {
+        let _permit = permit;
+        let response = match store::claim_pending_upload(&state.pool, &token_hash).await {
+            Ok(true) => {
+                let content_type = if upload.compressed {
+                    "application/zip"
+                } else {
+                    "application/octet-stream"
+                };
+                let transfer = tokio::select! {
+                    biased;
+                    _ = reply.closed() => Err(StatusCode::BAD_REQUEST.into_response()),
+                    result = tokio::time::timeout_at(
+                        deadline,
+                        state.storage.put(
+                            &upload.blob_key,
+                            &mut reader,
+                            content_type,
+                            state.config.upload_parts,
+                        ),
+                    ) => match result {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(error)) => Err(match reader.error {
+                            Some(status) => status.into_response(),
+                            None => s3_error("store file", error),
+                        }),
+                        Err(_) => Err(StatusCode::REQUEST_TIMEOUT.into_response()),
+                    }
+                };
+                match transfer {
+                    Ok(()) => {
+                        match store::mark_pending_upload_uploaded(
+                            &state.pool,
+                            &token_hash,
+                            deadline,
+                            reply.closed(),
+                        )
+                        .await
+                        {
+                            Ok(true) => StatusCode::CREATED.into_response(),
+                            Ok(false) => {
+                                discard_upload(&state, &token_hash, false).await;
+                                StatusCode::CONFLICT.into_response()
+                            }
+                            // Unknown acknowledgement must never cause object deletion.
+                            Err(error) => server_error("complete pending upload", error),
+                        }
+                    }
+                    Err(response) => {
+                        // Before the first SDK chunk is full, a reader error
+                        // precedes any network request. Preserve small-file retries.
+                        if reader.error.is_some() && reader.bytes < 8 * 1024 * 1024 {
+                            if let Err(error) =
+                                store::reset_pending_upload(&state.pool, &token_hash).await
+                            {
+                                tracing::warn!(%error, "reset unstarted upload");
+                            }
+                        } else {
+                            discard_upload(&state, &token_hash, true).await;
+                        }
+                        response
+                    }
+                }
             }
-            cleanup_pending_uploads(&state).await;
-            return (StatusCode::CONFLICT, "upload token already used").into_response();
+            Ok(false) => StatusCode::CONFLICT.into_response(),
+            Err(error) => {
+                // A failed claim does not prove ownership. Another contender
+                // may already own Uploading; startup resolves unknown claims.
+                server_error("claim pending upload", error)
+            }
+        };
+        if reply.send(response).is_err() {
+            tracing::debug!("upload requester disconnected");
         }
-        Err(error) => return server_error("complete pending upload", error),
+    });
+    response.await.unwrap_or_else(|error| {
+        tracing::error!(%error, "upload supervisor");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
+}
+
+async fn discard_upload(state: &AppState, token_hash: &[u8], uncertain: bool) {
+    if let Err(error) = store::discard_pending_upload(&state.pool, token_hash, uncertain).await {
+        tracing::warn!(%error, "discard failed upload");
+        return;
     }
-    StatusCode::CREATED.into_response()
+    cleanup_pending_uploads(state).await;
 }
 
 /// The client reads md5/mtime from this response's headers and then downloads

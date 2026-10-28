@@ -13,6 +13,7 @@ mod http;
 mod query;
 mod s3;
 mod store;
+mod upload;
 
 use crate::app::{router, AppState};
 use crate::config::Config;
@@ -66,6 +67,7 @@ async fn main() {
     }
     let storage = Arc::new(s3::Storage::new(&config.s3).expect("init object storage"));
     let state = AppState {
+        uploads: Arc::new(tokio::sync::Semaphore::new(config.upload_concurrency)),
         config,
         pool,
         storage,

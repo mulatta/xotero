@@ -457,33 +457,72 @@ pub async fn reset_pending_upload(pool: &PgPool, token_hash: &[u8]) -> sqlx::Res
     Ok(())
 }
 
-pub async fn discard_pending_upload(pool: &PgPool, token_hash: &[u8]) -> sqlx::Result<()> {
+pub async fn discard_pending_upload(
+    pool: &PgPool,
+    token_hash: &[u8],
+    uncertain: bool,
+) -> sqlx::Result<()> {
     sqlx::query(
-        "update pending_uploads set state = 'discarded' \
+        "update pending_uploads set state = 'discarded', gc_attempted_at = null, \
+             expires_at = case when $2 then 'infinity'::timestamptz else expires_at end \
          where token_hash = $1 and state = 'uploading'",
     )
     .bind(token_hash)
+    .bind(uncertain)
     .execute(pool)
     .await?;
     Ok(())
 }
 
-pub async fn mark_pending_upload_uploaded(pool: &PgPool, token_hash: &[u8]) -> sqlx::Result<bool> {
-    let changed = sqlx::query(
-        "update pending_uploads set state = 'uploaded' \
-         where token_hash = $1 and state = 'uploading' and expires_at > now()",
-    )
-    .bind(token_hash)
-    .execute(pool)
-    .await?
-    .rows_affected();
-    Ok(changed == 1)
+pub async fn mark_pending_upload_uploaded(
+    pool: &PgPool,
+    token_hash: &[u8],
+    deadline: tokio::time::Instant,
+    cancelled: impl std::future::Future<Output = ()>,
+) -> sqlx::Result<bool> {
+    let prepare = async {
+        let mut tx = pool.begin().await?;
+        sqlx::query("select token_hash from pending_uploads where token_hash = $1 for update")
+            .bind(token_hash)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let changed = sqlx::query(
+            "update pending_uploads set state = 'uploaded' \
+             where token_hash = $1 and state = 'uploading' and expires_at > clock_timestamp()",
+        )
+        .bind(token_hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        Ok::<_, sqlx::Error>((tx, changed == 1))
+    };
+    // Dropping preparation rolls back, including a row-lock wait. Cancellation
+    // cannot interrupt COMMIT: a lost acknowledgement is an unknown outcome,
+    // never authority to compensate a possibly published candidate.
+    let (tx, changed) = tokio::select! {
+        biased;
+        _ = cancelled => return Ok(false),
+        _ = tokio::time::sleep_until(deadline) => return Ok(false),
+        result = prepare => result?,
+    };
+    if tokio::time::Instant::now() >= deadline {
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(changed)
 }
 
 pub async fn reset_interrupted_pending_uploads(pool: &PgPool) -> sqlx::Result<()> {
-    sqlx::query("update pending_uploads set state = 'authorized' where state = 'uploading'")
-        .execute(pool)
-        .await?;
+    // Infinite expiry is a non-purgeable cleanup identity, never a live token:
+    // Discarded/Deleting cannot publish. Remote initiation may finish after a
+    // canceled request's first empty listing, so uncertain identities survive.
+    sqlx::query(
+        "update pending_uploads set state = 'discarded', expires_at = 'infinity', \
+             gc_attempted_at = null \
+         where state = 'uploading' or expires_at = 'infinity'::timestamptz",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -492,25 +531,42 @@ pub struct PendingUploadGarbage {
     pub blob_key: String,
 }
 
+pub async fn pending_upload_cleanup_cutoff(pool: &PgPool) -> sqlx::Result<String> {
+    sqlx::query_scalar("select clock_timestamp()::text")
+        .fetch_one(pool)
+        .await
+}
+
 pub async fn claim_pending_upload_garbage(
     pool: &PgPool,
     limit: i64,
+    cutoff: &str,
 ) -> sqlx::Result<Vec<PendingUploadGarbage>> {
+    // Retained identities recur, but a pass must not revisit its own attempts.
+    // The global fence also covers expired registration changing Deleting to
+    // Discarded; monotonic attempts preserve it across overlapping passes.
     let rows = sqlx::query(
         "with candidates as ( \
              select token_hash from pending_uploads \
-             where state = 'discarded' \
-                or (expires_at <= now() and state not in ('uploading', 'deleting')) \
+             where created_at <= $2::text::timestamptz \
+               and (gc_attempted_at is null or gc_attempted_at < $2::text::timestamptz) \
+               and ((state = 'discarded' and (expires_at <> 'infinity'::timestamptz \
+                    or gc_attempted_at is null \
+                    or gc_attempted_at < $2::text::timestamptz - interval '1 minute')) \
+                or (expires_at <= $2::text::timestamptz and state not in ('uploading', 'deleting')) \
                 or (state = 'deleting' \
                     and coalesce(gc_attempted_at, '-infinity') \
-                        < now() - interval '1 minute') \
-             order by expires_at limit $1 for update skip locked \
+                        < $2::text::timestamptz - interval '1 minute')) \
+             order by coalesce(gc_attempted_at, created_at), token_hash \
+             limit $1 for update skip locked \
          ) \
-         update pending_uploads p set state = 'deleting', gc_attempted_at = now() \
+         update pending_uploads p set state = 'deleting', \
+             gc_attempted_at = greatest(p.gc_attempted_at, clock_timestamp(), $2::text::timestamptz) \
          from candidates c where p.token_hash = c.token_hash \
          returning p.token_hash, p.blob_key",
     )
     .bind(limit)
+    .bind(cutoff)
     .fetch_all(pool)
     .await?;
     Ok(rows
@@ -523,10 +579,19 @@ pub async fn claim_pending_upload_garbage(
 }
 
 pub async fn delete_pending_upload_garbage(pool: &PgPool, token_hash: &[u8]) -> sqlx::Result<()> {
-    sqlx::query("delete from pending_uploads where token_hash = $1 and state = 'deleting'")
-        .bind(token_hash)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "with removed as ( \
+             delete from pending_uploads where token_hash = $1 and state = 'deleting' \
+                 and expires_at <> 'infinity'::timestamptz \
+         ) \
+         update pending_uploads set state = 'discarded', \
+             gc_attempted_at = greatest(gc_attempted_at, clock_timestamp()) \
+         where token_hash = $1 and state = 'deleting' \
+             and expires_at = 'infinity'::timestamptz",
+    )
+    .bind(token_hash)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

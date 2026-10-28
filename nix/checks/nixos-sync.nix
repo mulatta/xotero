@@ -38,10 +38,10 @@ testPkgs.testers.runNixOSTest {
     };
 
     # RustFS: an S3-compatible store for the attachment upload/download paths.
-    # Use nixpkgs' package and service module so this repository does not carry
-    # a second RustFS build or lifecycle definition.
+    # Share the pinned provider compatibility correction across service checks.
     services.rustfs = {
       enable = true;
+      package = import ./rustfs.nix { pkgs = testPkgs; };
       environmentFile = toString (
         testPkgs.writeText "rustfs-secrets.env" ''
           RUSTFS_ACCESS_KEY=rustfsadmin
@@ -50,13 +50,17 @@ testPkgs.testers.runNixOSTest {
       );
     };
     systemd.services.xotero.after = [ "rustfs.service" ];
+    services.postgresql.settings = {
+      log_lock_waits = true;
+      deadlock_timeout = "10ms";
+    };
 
     environment.systemPackages = [
       testPkgs.curl
       testPkgs.jq
       testPkgs.gzip
       testPkgs.postgresql
-      testPkgs.python3
+      (testPkgs.python3.withPackages (ps: [ ps.psycopg ]))
       testPkgs.unzip
       testPkgs.zip
       # `mc` creates the bucket before the upload subtest.

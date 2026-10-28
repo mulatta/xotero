@@ -107,6 +107,26 @@ in
       '';
     };
 
+    uploadConcurrency = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 4;
+      description = "Maximum admitted attachment uploads before reading request bodies.";
+    };
+    uploadParts = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 2;
+      description = "Maximum concurrent SDK multipart parts per attachment upload.";
+    };
+    uploadMaxBytes = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 256 * 1024 * 1024;
+      description = "Maximum encoded and decoded attachment upload size in bytes.";
+    };
+    uploadTimeout = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 300;
+      description = "Total attachment upload deadline in seconds, including admission.";
+    };
     s3 = lib.mkOption {
       description = "S3-compatible object storage for attachment bytes (e.g. Cloudflare R2).";
       type = lib.types.submodule {
@@ -259,6 +279,10 @@ in
         XOTERO_S3_BUCKET = cfg.s3.bucket;
         XOTERO_S3_PATH_STYLE = lib.boolToString cfg.s3.pathStyle;
         XOTERO_S3_PRESIGN_TTL = toString cfg.s3.presignTtl;
+        XOTERO_UPLOAD_CONCURRENCY = toString cfg.uploadConcurrency;
+        XOTERO_UPLOAD_PARTS = toString cfg.uploadParts;
+        XOTERO_UPLOAD_MAX_BYTES = toString cfg.uploadMaxBytes;
+        XOTERO_UPLOAD_TIMEOUT = toString cfg.uploadTimeout;
         # %d expands to the systemd credentials directory at runtime.
         XOTERO_S3_ACCESS_KEY_FILE = "%d/s3-access-key";
         XOTERO_S3_SECRET_KEY_FILE = "%d/s3-secret-key";

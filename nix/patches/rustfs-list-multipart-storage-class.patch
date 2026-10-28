@@ -1,0 +1,67 @@
+diff --git a/crates/ecstore/src/set_disk/ops/multipart.rs b/crates/ecstore/src/set_disk/ops/multipart.rs
+--- a/crates/ecstore/src/set_disk/ops/multipart.rs
++++ b/crates/ecstore/src/set_disk/ops/multipart.rs
+@@ -1398,6 +1398,7 @@
+                         object,
+                         upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
+                         initiated,
++                        user_defined: file_info.metadata,
+                         ..Default::default()
+                     }))
+                 }
+diff --git a/rustfs/src/storage/s3_api/multipart.rs b/rustfs/src/storage/s3_api/multipart.rs
+--- a/rustfs/src/storage/s3_api/multipart.rs
++++ b/rustfs/src/storage/s3_api/multipart.rs
+@@ -191,6 +191,14 @@
+                     initiated: u.initiated.map(Timestamp::from),
+                     owner: Some(owner.clone()),
+                     initiator: Some(initiator.clone()),
++                    storage_class: Some(
++                        effective_storage_class(
++                            u.user_defined.get("x-amz-storage-class").map(String::as_str),
++                            None,
++                        )
++                        .to_string()
++                        .into(),
++                    ),
+                     ..Default::default()
+                 })
+                 .collect(),
+@@ -452,6 +460,37 @@
+         );
+     }
+ 
++    #[test]
++    fn test_list_multipart_uploads_reports_effective_storage_class() {
++        for (stored, expected) in [
++            (None, "STANDARD"),
++            (Some("STANDARD_IA"), "STANDARD"),
++            (Some("REDUCED_REDUNDANCY"), "REDUCED_REDUNDANCY"),
++        ] {
++            let mut upload = MultipartInfo {
++                object: "object".to_string(),
++                upload_id: "upload".to_string(),
++                ..Default::default()
++            };
++            if let Some(stored) = stored {
++                upload.user_defined.insert("x-amz-storage-class".to_string(), stored.to_string());
++            }
++            let output = build_list_multipart_uploads_output(
++                "bucket".to_string(),
++                String::new(),
++                ListMultipartsInfo {
++                    uploads: vec![upload],
++                    ..Default::default()
++                },
++            );
++            let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).unwrap()).unwrap();
++            assert!(
++                xml.contains(&format!("<StorageClass>{expected}</StorageClass>")),
++                "stored class {stored:?}: {xml}"
++            );
++        }
++    }
++
+     #[test]
+     fn test_list_multipart_uploads_output_maps_uploads_and_prefixes() {
+         let result = ListMultipartsInfo {

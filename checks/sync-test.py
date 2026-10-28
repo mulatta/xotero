@@ -444,20 +444,28 @@ with subtest("an unregistered replacement cannot change the live attachment"):
         == "t"
     )
 
-    # A crash after the atomic claim but before S3 completion restores the token
-    # to authorized when the single service process restarts.
+    # Streaming interruption can leave multipart state under this exact key.
+    # Restart discards it instead of reusing a candidate with uncertain bytes.
     psql(
         """update pending_uploads set state = 'uploading'
            where library_id = 1 and item_key = 'ATTACH22'"""
     )
     restart_xotero()
-    assert (
-        psql(
-            """select state from pending_uploads
-               where library_id = 1 and item_key = 'ATTACH22'"""
-        )
-        == "authorized"
-    )
+    assert psql(
+        "select state || ':' || (expires_at = 'infinity'::timestamptz)::text "
+        "from pending_uploads where item_key = 'ATTACH22'"
+    ) == "discarded:true"
+    assert http_code(f"-X POST {base}/uploads/{abandoned} --data-binary world") == "409"
+    assert http_code(
+        f"-X POST {base}/users/1/items/ATTACH22/file {auth} -d 'upload={abandoned}'"
+    ) == "400"
+    assert_attachment("ATTACH22", old_md5, "hello", "interrupted-candidate-cleanup")
+    abandoned = machine.succeed(
+        f"curl -sf -X POST {base}/users/1/items/ATTACH22/file {auth} "
+        f"-H 'If-Match: {old_md5}' "
+        f"-d 'md5={world_md5}&filename=t.pdf&filesize=5&mtime=1700000000001' "
+        "| jq -r .uploadKey"
+    ).strip()
     machine.succeed(
         f"printf world | curl -sf -X POST {base}/uploads/{abandoned} --data-binary @-"
     )
@@ -486,7 +494,8 @@ with subtest("an unregistered replacement cannot change the live attachment"):
     assert (
         psql(
             """select count(*) from pending_uploads
-               where library_id = 1 and item_key = 'ATTACH22'"""
+               where library_id = 1 and item_key = 'ATTACH22'
+                 and expires_at <> 'infinity'::timestamptz"""
         )
         == "0"
     )
@@ -516,7 +525,7 @@ with subtest("expired upload candidates are deleted before their rows"):
            where library_id = 1 and item_key = 'ATTACH22' and state = 'uploaded'"""
     )
     restart_xotero()
-    assert psql("select count(*) from pending_uploads where token_hash is not null") == "0"
+    assert psql("select count(*) from pending_uploads where expires_at <> 'infinity'::timestamptz") == "0"
     machine.fail(f"mc stat 's3/zotero/{expired_blob}'")
     assert_attachment("ATTACH22", world_md5, "world", "expired-candidate-cleanup")
     psql(
@@ -535,7 +544,7 @@ with subtest("expired upload candidates are deleted before their rows"):
            from generate_series(1, 33) as i"""
     )
     restart_xotero()
-    assert psql("select count(*) from pending_uploads") == "0"
+    assert psql("select count(*) from pending_uploads where expires_at <> 'infinity'::timestamptz") == "0"
 
 with subtest("concurrent replacements compare-and-swap the registered md5"):
     world_md5 = "7d793037a0760186574b0282f2f435e7"
@@ -1287,6 +1296,12 @@ class Provider(BaseHTTPRequestHandler):
         mode = Path("/tmp/sdk-provider-mode").read_text()
         status = int(mode) if mode.isdigit() else 200
         body = b""
+        if self.command == "GET":
+            status = 200
+            body = (
+                "<ListMultipartUploadsResult><Bucket>zotero</Bucket>"
+                "<IsTruncated>false</IsTruncated></ListMultipartUploadsResult>"
+            ).encode()
         if status == 200 and self.command == "POST":
             if self.path.endswith("?uploads"):
                 key = unquote(self.path.split("?")[0].removeprefix("/zotero/"))
@@ -1308,6 +1323,7 @@ class Provider(BaseHTTPRequestHandler):
     do_POST = reply
     do_PUT = reply
     do_DELETE = reply
+    do_GET = reply
 
 HTTPServer(("127.0.0.1", 9000), Provider).serve_forever()
 """
@@ -1335,7 +1351,11 @@ HTTPServer(("127.0.0.1", 9000), Provider).serve_forever()
             )
             assert response.rsplit("\n", 1)[-1] == "500", (mode, response)
             states = psql("select string_agg(distinct state, ',') from pending_uploads where item_key = 'SDKLARGE'")
-            assert states == "authorized", (mode, states)
+            assert states == "discarded", (mode, states)
+            assert psql(
+                "select bool_and(expires_at = 'infinity'::timestamptz) "
+                "from pending_uploads where item_key = 'SDKLARGE'"
+            ) == "t"
             registration = machine.succeed(
                 f"curl -sS --max-time 60 -i -X POST {base}/users/1/items/SDKLARGE/file {auth} "
                 f"-H 'If-Match: {digest}' -d 'upload={token}'"
@@ -1351,3 +1371,671 @@ HTTPServer(("127.0.0.1", 9000), Provider).serve_forever()
         machine.succeed("systemctl stop xotero-sdk-provider.service")
         machine.succeed("systemctl start rustfs.service")
         machine.wait_for_open_port(9000)
+
+with subtest("stream admission cancellation deadlines and restart use real PostgreSQL and RustFS"):
+    streaming_probe = r"""
+import gzip
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import socket
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+import psycopg
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit, parse_qs, unquote, quote
+import xml.etree.ElementTree as ET
+
+base = "http://127.0.0.1:8189"
+auth = ["-H", "Zotero-API-Key: testtoken"]
+root = Path("/run/xotero-checkpoint8")
+root.mkdir(mode=0o700)
+override = Path("/run/systemd/system/xotero.service.d/checkpoint8.conf")
+override.parent.mkdir(parents=True, exist_ok=True)
+condition = threading.Condition()
+events = []
+blocked = {}
+late = {}
+owned = []
+unrelated_id = None
+cleanup_pass_gate = threading.Event()
+cleanup_pass_prefix = "libraries/1/uploads/checkpoint8-pass-"
+clock_advanced = False
+
+def sql(statement):
+    return subprocess.check_output(
+        ["sudo", "-u", "xotero", "psql", "-v", "ON_ERROR_STOP=1", "-At", "-d", "xotero", "-c", statement],
+        text=True,
+    ).strip()
+
+def event(method, key, size=0):
+    with condition:
+        events.append((method, key, size))
+        condition.notify_all()
+
+def wait_event(predicate):
+    with condition:
+        assert condition.wait_for(lambda: predicate(events), timeout=20), events
+
+def journal_message(stream):
+    # journald emits binary MESSAGE fields as JSON byte arrays.
+    raw = stream.readline()
+    print("JOURNAL_RAW", raw.decode("utf-8").rstrip(), flush=True)
+    match json.loads(raw)["MESSAGE"]:
+        case str() as message:
+            pass
+        case list() as data:
+            message = bytes(data).decode("utf-8", errors="replace")
+        case invalid:
+            raise AssertionError(("invalid journal MESSAGE", invalid))
+    return re.sub(r"\x1b\[[0-9;]*m", "", message)
+
+class Proxy(BaseHTTPRequestHandler):
+    def relay(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        request = urlsplit(self.path)
+        key = unquote(request.path.removeprefix("/zotero/"))
+        query = parse_qs(request.query)
+        if self.command == "DELETE" and not query and key.startswith(cleanup_pass_prefix):
+            event("pass-delete", key)
+            if sum(row[0] == "pass-delete" for row in events) == 33:
+                assert cleanup_pass_gate.wait(30), "cleanup pass barrier not released"
+        phase = "initiate" if request.query == "uploads" else "complete"
+        gate = late.get((phase, key)) if self.command == "POST" else None
+        if gate is not None:
+            event("held-" + phase, key)
+            assert gate.wait(30), (phase, key)
+        backend = http.client.HTTPConnection("127.0.0.1", 9000, timeout=20)
+        try:
+            backend.request(self.command, self.path, body, dict(self.headers))
+            response = backend.getresponse()
+            data = response.read()
+            headers = response.getheaders()
+            status = response.status
+        finally:
+            backend.close()
+        if gate is not None:
+            event("late-" + phase, key, status)
+        if self.command == "PUT" and "partNumber" in query and key in blocked:
+            event("held-part", key, len(body))
+            assert blocked[key].wait(30), key
+        if self.command == "DELETE":
+            event("abort" if "uploadId" in query else "delete", key)
+        self.send_response(status)
+        for name, value in headers:
+            if name.lower() not in ("connection", "transfer-encoding", "content-length"):
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+    do_GET = relay
+    do_POST = relay
+    do_PUT = relay
+    do_DELETE = relay
+    def log_message(self, *_args):
+        pass
+
+proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+proxy.daemon_threads = True
+thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+thread.start()
+
+def configure(deadline=300, maximum=268435456):
+    override.write_text(
+        "[Service]\n"
+        f"Environment=XOTERO_S3_ENDPOINT=http://127.0.0.1:{proxy.server_port}\n"
+        f"Environment=XOTERO_UPLOAD_TIMEOUT={deadline}\n"
+        f"Environment=XOTERO_UPLOAD_MAX_BYTES={maximum}\n"
+    )
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    service_ready("restart")
+
+def service_ready(action):
+    cursor = subprocess.check_output(
+        ["journalctl", "-u", "xotero", "-n", "1", "--show-cursor", "-o", "cat"], text=True,
+    ).rsplit("-- cursor: ", 1)[1].strip()
+    journal = subprocess.Popen(
+        ["journalctl", "-u", "xotero", "--after-cursor", cursor, "-f", "-o", "json"],
+        stdout=subprocess.PIPE, bufsize=0,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(journal.stdout, selectors.EVENT_READ)
+    try:
+        subprocess.run(["systemctl", action, "xotero"], check=True)
+        while True:
+            assert selector.select(20), "missing listener readiness event"
+            message = journal_message(journal.stdout)
+            print("STARTUP_EVENT", message, flush=True)
+            if "bind=127.0.0.1:8189" in message:
+                break
+    finally:
+        selector.close()
+        journal.terminate()
+        journal.wait(timeout=10)
+    with socket.create_connection(("127.0.0.1", 8189), timeout=10):
+        pass
+    pid = subprocess.check_output(["systemctl", "show", "xotero", "-p", "MainPID", "--value"], text=True).strip()
+    print("CHECKPOINT8_SERVICE_PID", pid, flush=True)
+
+def curl(path, *args):
+    return subprocess.check_output(["curl", "-sS", "--max-time", "30", *args, base + path], text=True)
+
+current = None
+def authorize(size, digest):
+    precondition = "If-None-Match: *" if current is None else "If-Match: " + current
+    token = json.loads(curl(
+        "/users/1/items/STREAM22/file", *auth, "-X", "POST", "-H", precondition,
+        "-d", f"md5={digest}&filename=stream.bin&filesize={size}&mtime=8",
+    ))["uploadKey"]
+    key = sql("select blob_key from pending_uploads where token_hash = decode('" +
+              hashlib.sha256(token.encode()).hexdigest() + "', 'hex')")
+    owned.append(key)
+    return token, key
+
+def register(token):
+    return curl("/users/1/items/STREAM22/file", *auth, "-X", "POST", "-d", "upload=" + token,
+                "-o", "/dev/null", "-w", "%{http_code}")
+
+def headers(connection):
+    data = b""
+    while b"\r\n\r\n" not in data:
+        piece = connection.recv(4096)
+        assert piece, data
+        data += piece
+    return data
+
+def pending(token):
+    connection = socket.create_connection(("127.0.0.1", 8189), timeout=10)
+    connection.sendall(
+        f"POST /uploads/{token} HTTP/1.1\r\nHost: localhost\r\n"
+        "Content-Length: 5\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n".encode()
+    )
+    return connection
+
+def await_state(connection, key, state):
+    observed = []
+    for notification in connection.notifies(timeout=20):
+        observed.append(notification.payload)
+        if notification.payload == state + ":" + key:
+            return
+    raise AssertionError((state, key, observed))
+
+def s3(method, path, data=None):
+    result = subprocess.run(
+        ["curl", "-sS", "--max-time", "20", "--aws-sigv4", "aws:amz:us-east-1:s3",
+         "--user", "rustfsadmin:rustfsadmin", "-X", method, "-w", "\n%{http_code}",
+         *(["--data-binary", "@-"] if data is not None else []),
+         "http://127.0.0.1:9000/zotero/" + path],
+        input=data, capture_output=True, check=True,
+    ).stdout
+    body, status = result.rsplit(b"\n", 1)
+    return body, int(status)
+
+def multipart_ids(key):
+    body, status = s3("GET", "?uploads&prefix=" + key)
+    assert status == 200, (status, body)
+    return [entry.find("{*}UploadId").text for entry in ET.fromstring(body).findall("{*}Upload")
+            if entry.find("{*}Key").text == key]
+
+payload = root / "multipart"
+payload.write_bytes(b"x" * (32 * 1024 * 1024))
+digest = hashlib.md5(payload.read_bytes()).hexdigest()
+disconnect_payload = root / "disconnect"
+disconnect_payload.write_bytes(b"x" * (16 * 1024 * 1024))
+disconnect_digest = hashlib.md5(disconnect_payload.read_bytes()).hexdigest()
+subprocess.run(["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1",
+                "-c", "create role root login; grant xotero to root"], check=True)
+try:
+    sql('''
+        create function checkpoint8_state_event() returns trigger
+        language plpgsql as $$ begin
+          if TG_OP = 'DELETE' then
+            perform pg_notify('checkpoint8_state', 'deleted:' || old.blob_key);
+            return old;
+          end if;
+          if old.state = 'deleting' and new.state = 'discarded' then
+            perform pg_notify('checkpoint8_state', 'cleaned:' || new.blob_key);
+          else
+            perform pg_notify('checkpoint8_state', new.state || ':' || new.blob_key);
+          end if;
+          return new;
+        end $$;
+        create trigger checkpoint8_state_event
+        after update of state or delete on pending_uploads
+        for each row execute function checkpoint8_state_event()
+    ''')
+    # A pass spanning the retry interval must not revisit retained identities.
+    # Hold the 33rd exact delete: the first batch has already committed cleanup.
+    # Advance only this isolated VM's realtime clock, then restore it in finally.
+    sql('''
+        insert into pending_uploads (
+          token_hash, library_id, authorizer_key_hash, bootstrap_user_id,
+          item_key, blob_key, md5, upload_md5, filename, filesize, mtime,
+          state, created_at, expires_at
+        )
+        select decode(md5('checkpoint8-pass-' || i) || md5('checkpoint8-pass-' || i), 'hex'),
+          1, decode(repeat('00',32), 'hex'), 1, 'STREAM22',
+          'libraries/1/uploads/checkpoint8-pass-' || i,
+          repeat('0',32), repeat('0',32), 'pass', 0, 0, 'discarded',
+          now() - interval '2 hours', 'infinity'::timestamptz
+        from generate_series(1,33) as i
+    ''')
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            startup = executor.submit(configure)
+            try:
+                wait_event(lambda rows: sum(row[0] == "pass-delete" for row in rows) == 33)
+                assert sql(
+                    "select count(*) from pending_uploads where blob_key like "
+                    "'libraries/1/uploads/checkpoint8-pass-%' and state='discarded'"
+                ) == "32"
+                subprocess.run(["date", "-s", "+120 seconds"], check=True)
+                clock_advanced = True
+            finally:
+                cleanup_pass_gate.set()
+            startup.result(timeout=30)
+        deletes = [row[1] for row in events if row[0] == "pass-delete"]
+        print("STREAM_CLEANUP_PASS_ATTEMPTS", json.dumps({
+            "attempts": len(deletes), "distinct_candidates": len(set(deletes)),
+            "realtime_advance_seconds": 120, "listener_ready": True,
+        }), flush=True)
+        assert len(deletes) == len(set(deletes)) == 33, deletes
+        assert sql(
+            "select count(*) from pending_uploads where blob_key like "
+            "'libraries/1/uploads/checkpoint8-pass-%' "
+            "and state='discarded' and expires_at='infinity'::timestamptz"
+        ) == "33"
+        print("STREAM_CLEANUP_PASS retained=33 attempts=33 realtime_advance_seconds=120 listener_ready=true", flush=True)
+    finally:
+        if clock_advanced:
+            subprocess.run(["date", "-s", "-120 seconds"], check=True)
+            clock_advanced = False
+        sql("delete from pending_uploads where blob_key like 'libraries/1/uploads/checkpoint8-pass-%'")
+    version = sql("select version from library where id=1")
+    curl("/users/1/items", *auth, "-X", "POST", "-H", "If-Unmodified-Since-Version: " + version,
+         "-d", '[{"key":"STREAM22","itemType":"attachment","linkMode":"imported_file"}]')
+    # First four receive 100 only when Hyper's body is polled. Fifth is observed
+    # at an actual Pending acquisition poll, carrying its measured body polls.
+    for iteration in range(2):
+        sockets = []
+        tokens = []
+        for _ in range(4):
+            token, _key = authorize(5, "5d41402abc4b2a76b9719d911017c592")
+            tokens.append(token)
+            connection = pending(token)
+            sockets.append(connection)
+            assert headers(connection).startswith(b"HTTP/1.1 100")
+        cursor = subprocess.check_output(
+            ["journalctl", "-u", "xotero", "-n", "1", "--show-cursor", "-o", "cat"], text=True,
+        ).rsplit("-- cursor: ", 1)[1].strip()
+        journal = subprocess.Popen(
+            ["journalctl", "-u", "xotero", "--after-cursor", cursor, "-f", "-o", "json"],
+            stdout=subprocess.PIPE, bufsize=0,
+        )
+        fifth_token, _key = authorize(5, "5d41402abc4b2a76b9719d911017c592")
+        fifth = pending(fifth_token)
+        selector = selectors.DefaultSelector()
+        selector.register(journal.stdout, selectors.EVENT_READ)
+        try:
+            while True:
+                assert selector.select(10), "missing fifth admission event"
+                message = journal_message(journal.stdout)
+                print("ADMISSION_EVENT", message, flush=True)
+                if "upload_admission_blocked=true" in message:
+                    measured_polls = int(re.search(r"upload_body_polls=(\d+)", message)[1])
+                    break
+            assert measured_polls == 0, measured_polls
+            print("STREAM_ADMISSION", json.dumps({"iteration": iteration, "permits": 4, "blocked_acquire_polled": True, "fifth_body_polls": measured_polls}), flush=True)
+        finally:
+            selector.close()
+            journal.terminate()
+            journal.wait(timeout=10)
+        for connection in sockets:
+            connection.close()
+        fifth.settimeout(10)
+        assert headers(fifth).startswith(b"HTTP/1.1 100")
+        fifth.sendall(b"hello")
+        assert headers(fifth).startswith(b"HTTP/1.1 201")
+        fifth.close()
+        for token in tokens:
+            assert register(token) == "400"
+        assert register(fifth_token) == "204"
+        current = "5d41402abc4b2a76b9719d911017c592"
+    # A losing claim fails before mutation while another supervisor owns the
+    # same token. Its error cannot compensate the successful owner's transfer.
+    token, key = authorize(payload.stat().st_size, digest)
+    blocked[key] = threading.Event()
+    sql('''
+        create sequence checkpoint8_claim_order;
+        create function checkpoint8_claim_fault() returns trigger language plpgsql as $$
+        begin
+          if nextval('checkpoint8_claim_order') = 1 then
+            perform pg_advisory_xact_lock(818908);
+            raise exception 'checkpoint8 injected pre-mutation claim failure';
+          end if;
+          return null;
+        end $$;
+        create trigger checkpoint8_claim_fault before update of state on pending_uploads
+        for each statement execute function checkpoint8_claim_fault()
+    ''')
+    holder = psycopg.connect("dbname=xotero user=root host=/run/postgresql", autocommit=True)
+    holder.execute("select pg_advisory_lock(818908)")
+    cursor = subprocess.check_output(
+        ["journalctl", "-u", "postgresql", "-n", "1", "--show-cursor", "-o", "cat"], text=True,
+    ).rsplit("-- cursor: ", 1)[1].strip()
+    journal = subprocess.Popen(
+        ["journalctl", "-u", "postgresql", "--after-cursor", cursor, "-f", "-o", "json"],
+        stdout=subprocess.PIPE, bufsize=0,
+    )
+    selector = selectors.DefaultSelector()
+    selector.register(journal.stdout, selectors.EVENT_READ)
+    clients = []
+    try:
+        command = ["curl", "-sS", "-i", "--max-time", "30", "-X", "POST",
+                   "--data-binary", "@" + str(payload), "-w", "\n%{http_code}", base + "/uploads/" + token]
+        loser = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        clients.append(loser)
+        print("CHECKPOINT8_CURL_PID", loser.pid, "losing-claim", flush=True)
+        while True:
+            assert selector.select(20), "missing losing claim advisory lock wait"
+            message = journal_message(journal.stdout)
+            if "still waiting" in message and int(sql(
+                "select count(*) from pg_stat_activity where usename='xotero' and wait_event_type='Lock'"
+            )) > 0:
+                break
+        winner = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        clients.append(winner)
+        print("CHECKPOINT8_CURL_PID", winner.pid, "winning-claim", flush=True)
+        wait_event(lambda rows: sum(row[0] == "held-part" and row[1] == key for row in rows) == 2)
+        holder.execute("select pg_advisory_unlock(818908)")
+        output, error = loser.communicate(timeout=10)
+        assert output.rsplit("\n", 1)[-1] == "500", (output, error)
+        assert sql(f"select state from pending_uploads where blob_key='{key}'") == "uploading"
+        sql("drop trigger checkpoint8_claim_fault on pending_uploads; drop function checkpoint8_claim_fault(); drop sequence checkpoint8_claim_order")
+        blocked[key].set()
+        output, error = winner.communicate(timeout=20)
+        assert output.rsplit("\n", 1)[-1] == "201", (output, error)
+        assert register(token) == "204"
+        current = digest
+        print("STREAM_CLAIM_OWNERSHIP losing_status=500 winner_status=201 registration=204", flush=True)
+    finally:
+        holder.close()
+        blocked[key].set()
+        selector.close()
+        journal.terminate()
+        journal.wait(timeout=10)
+        for client in clients:
+            if client.poll() is None:
+                client.terminate()
+            client.communicate(timeout=10)
+        sql("drop trigger if exists checkpoint8_claim_fault on pending_uploads; drop function if exists checkpoint8_claim_fault(); drop sequence if exists checkpoint8_claim_order")
+    token, _key = authorize(5, "5d41402abc4b2a76b9719d911017c592")
+    assert curl("/uploads/" + token, "-X", "POST", "--data-binary", "hello", "-o", "/dev/null", "-w", "%{http_code}") == "201"
+    assert register(token) == "204"
+    current = "5d41402abc4b2a76b9719d911017c592"
+    # Actual backend has accepted two parts, but their completion responses
+    # cannot reach the SDK until explicit release. No timer releases this gate.
+    for mode in ("locked-deadline", "locked-disconnect", "deadline", "disconnect", "restart"):
+        configure(10 if mode in ("deadline", "locked-deadline") else 300)
+        transfer_payload = disconnect_payload if mode == "disconnect" else payload
+        upload_size = transfer_payload.stat().st_size
+        token, key = authorize(upload_size, disconnect_digest if mode == "disconnect" else digest)
+        blocked[key] = threading.Event()
+        notifications = psycopg.connect("dbname=xotero user=root host=/run/postgresql", autocommit=True)
+        notifications.execute("LISTEN checkpoint8_state")
+        process = subprocess.Popen(
+            ["curl", "-sS", "-i", "--max-time", "30", "-X", "POST",
+             *(["-H", "Content-Length: " + str(upload_size)] if mode == "disconnect" else []),
+             "--data-binary", "@" + str(transfer_payload), "-w", "\n%{http_code}", base + "/uploads/" + token],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        print("CHECKPOINT8_CURL_PID", process.pid, mode, flush=True)
+        holder = None
+        lock_journal = None
+        lock_selector = None
+        try:
+            wait_event(lambda rows: sum(row[0] == "held-part" and row[1] == key for row in rows) == 2)
+            parts = [row for row in events if row[0] == "held-part" and row[1] == key]
+            assert sum(row[2] for row in parts) == 16 * 1024 * 1024, parts
+            assert sql(f"select state from pending_uploads where blob_key='{key}'") == "uploading"
+            if mode.startswith("locked-"):
+                # LISTEN and the exact token row lock precede release of actual
+                # backend part responses, so final Uploaded SQL must wait.
+                holder = psycopg.connect("dbname=xotero user=root host=/run/postgresql")
+                holder.execute("select token_hash from pending_uploads where blob_key=%s for update", (key,))
+                cursor = subprocess.check_output(
+                    ["journalctl", "-u", "postgresql", "-n", "1", "--show-cursor", "-o", "cat"], text=True,
+                ).rsplit("-- cursor: ", 1)[1].strip()
+                lock_journal = subprocess.Popen(
+                    ["journalctl", "-u", "postgresql", "--after-cursor", cursor, "-f", "-o", "json"],
+                    stdout=subprocess.PIPE, bufsize=0,
+                )
+                lock_selector = selectors.DefaultSelector()
+                lock_selector.register(lock_journal.stdout, selectors.EVENT_READ)
+                blocked[key].set()
+                while True:
+                    assert lock_selector.select(20), "missing actual final-state SQL lock wait"
+                    message = journal_message(lock_journal.stdout)
+                    if "still waiting" in message:
+                        waiting = sql(
+                            "select count(*) from pg_stat_activity where usename='xotero' "
+                            "and wait_event_type='Lock' and query like '%pending_uploads%'"
+                        )
+                        if int(waiting) > 0:
+                            break
+                print("STREAM_MARK_WAIT", mode, "actual_sql_wait=true", flush=True)
+                if mode == "locked-deadline":
+                    output, error = process.communicate(timeout=20)
+                    assert output.rsplit("\n", 1)[-1] == "408", (output, error)
+                else:
+                    process.terminate()
+                    process.communicate(timeout=10)
+                    # The cancellation resolver must itself reach a lock wait
+                    # before fixture unlocks, not race against released marking.
+                    while True:
+                        assert lock_selector.select(20), "missing cancellation resolver SQL wait"
+                        message = journal_message(lock_journal.stdout)
+                        if "still waiting" in message:
+                            waiting = sql(
+                                "select count(*) from pg_stat_activity where usename='xotero' "
+                                "and wait_event_type='Lock' and query like '%discarded%'"
+                            )
+                            if int(waiting) > 0:
+                                break
+                holder.commit()
+                await_state(notifications, key, "discarded")
+                print("STREAM_MARK_CANCEL", mode, "state=discarded", flush=True)
+            if mode == "disconnect":
+                # Hyper only polls keepalive EOF once the HTTP body is consumed.
+                # Both held parts now cover the complete declared request body.
+                assert sum(row[2] for row in parts) == upload_size
+                print("STREAM_DISCONNECT_BODY", json.dumps({
+                    "content_length": upload_size, "held_bytes": sum(row[2] for row in parts),
+                    "backend_parts_still_held": not blocked[key].is_set(),
+                }), flush=True)
+                process.terminate()
+                process.communicate(timeout=10)
+            elif mode == "restart":
+                subprocess.run(["systemctl", "stop", "xotero"], check=True)
+                assert sql(f"select state from pending_uploads where blob_key='{key}'") == "uploading"
+                service_ready("start")
+            # Proxy DELETE receipt is not DB completion. Observe committed
+            # deletion for quiescent paths, retained cleanup state otherwise.
+            await_state(notifications, key, "deleted" if mode.startswith("locked-") else "cleaned")
+            assert ("delete", key, 0) in events, events
+            if not mode.startswith("locked-"):
+                assert ("abort", key, 0) in events, events
+            expected_rows = "0" if mode.startswith("locked-") else "1"
+            assert sql(f"select count(*) from pending_uploads where blob_key='{key}'") == expected_rows
+            assert register(token) == "400"
+            if mode == "deadline":
+                output, error = process.communicate(timeout=15)
+                assert output.rsplit("\n", 1)[-1] == "408", (output, error)
+                print(output, flush=True)
+            print("STREAM_CLEANUP", json.dumps({"mode": mode, "key": key, "held_parts": 2, "held_bytes": 16777216, "exact_abort": not mode.startswith("locked-"), "durable_cleanup_observed": True, "registration": 400}), flush=True)
+        finally:
+            blocked[key].set()
+            if holder is not None:
+                holder.close()
+            if notifications is not None:
+                notifications.close()
+            if lock_selector is not None:
+                lock_selector.close()
+            if lock_journal is not None:
+                lock_journal.terminate()
+                lock_journal.wait(timeout=10)
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=10)
+    configure()
+    unrelated_key = "checkpoint8-unrelated-" + str(os.getpid())
+    receipt, status = s3("POST", unrelated_key + "?uploads")
+    assert status == 200, receipt
+    unrelated_id = ET.fromstring(receipt).find("{*}UploadId").text
+    for phase in ("initiate", "complete"):
+        configure(10)
+        token, key = authorize(payload.stat().st_size, digest)
+        late[(phase, key)] = threading.Event()
+        notifications = psycopg.connect("dbname=xotero user=root host=/run/postgresql", autocommit=True)
+        notifications.execute("LISTEN checkpoint8_state")
+        client = subprocess.Popen(
+            ["curl", "-sS", "-i", "--max-time", "30", "-X", "POST", "--data-binary",
+             "@" + str(payload), "-w", "\n%{http_code}", base + "/uploads/" + token],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        print("CHECKPOINT8_CURL_PID", client.pid, "late-" + phase, flush=True)
+        try:
+            wait_event(lambda rows: ("held-" + phase, key, 0) in rows)
+            output, error = client.communicate(timeout=20)
+            assert output.rsplit("\n", 1)[-1] == "408", (output, error)
+            await_state(notifications, key, "cleaned")
+            assert sql(f"select state || ':' || (expires_at='infinity'::timestamptz)::text from pending_uploads where blob_key='{key}'") == "discarded:true"
+            # First pass has completed durably BEFORE late remote side effect.
+            late[(phase, key)].set()
+            wait_event(lambda rows: any(row[0] == "late-" + phase and row[1] == key for row in rows))
+            result = next(row[2] for row in events if row[0] == "late-" + phase and row[1] == key)
+            if phase == "initiate":
+                assert result == 200 and len(multipart_ids(key)) == 1
+            else:
+                # RustFS abort wins against a Complete not yet forwarded.
+                assert result >= 400, result
+                # Also exercise object reappearance under the uncertain identity;
+                # this is explicit fault injection, not a claimed RustFS race.
+                assert s3("PUT", key, b"late-completion-object")[1] == 200
+            configure()
+            await_state(notifications, key, "cleaned")
+            assert multipart_ids(key) == []
+            assert s3("GET", key)[1] == 404
+            assert multipart_ids(unrelated_key) == [unrelated_id]
+            assert register(token) == "400"
+            configure()
+            await_state(notifications, key, "cleaned")
+            assert multipart_ids(key) == [] and multipart_ids(unrelated_key) == [unrelated_id]
+            print("STREAM_LATE_RECOVERY", json.dumps({"phase": phase, "key": key, "late_status": result,
+                  "retained_identity": True, "unrelated_multipart_preserved": True,
+                  "second_restart_idempotent": True, "object_reappearance_injected": phase == "complete"}), flush=True)
+        finally:
+            late[(phase, key)].set()
+            notifications.close()
+            if client.poll() is None:
+                client.terminate()
+            client.communicate(timeout=10)
+    configure()
+    # Exercise accepted maximum over actual pinned Hyper transport, not an
+    # artificial Body segmentation. Sparse fixture and streaming digest avoid
+    # adding a full-file allocation to the test process.
+    boundary = root / "boundary"
+    with boundary.open("wb") as file:
+        file.truncate(256 * 1024 * 1024)
+    with boundary.open("rb") as file:
+        boundary_hash = hashlib.file_digest(file, "md5").hexdigest()
+    token, key = authorize(boundary.stat().st_size, boundary_hash)
+    response = curl("/uploads/" + token, "-X", "POST", "-i",
+                    "--data-binary", "@" + str(boundary), "-w", "\n%{http_code}")
+    assert response.rsplit("\n", 1)[-1] == "201", response
+    assert sql(f"select state from pending_uploads where blob_key='{key}'") == "uploaded"
+    notifications = psycopg.connect("dbname=xotero user=root host=/run/postgresql", autocommit=True)
+    notifications.execute("LISTEN checkpoint8_state")
+    try:
+        sql(f"update pending_uploads set created_at=now()-interval '2 hours', expires_at=now()-interval '1 hour' where blob_key='{key}'")
+        configure()
+        await_state(notifications, key, "deleted")
+        assert s3("GET", key)[1] == 404
+    finally:
+        notifications.close()
+        boundary.unlink()
+    print("STREAM_TRANSPORT_BOUNDARY bytes=268435456 status=201 verified_hash=" + boundary_hash, response, flush=True)
+    compressed = gzip.compress(b"hello", mtime=0)
+    token, _key = authorize(5, current)
+    result = subprocess.run(
+        ["curl", "-sS", "--max-time", "20", "-X", "POST", "-H", "Content-Encoding: gzip",
+         "--data-binary", "@-", "-w", "\n%{http_code}", base + "/uploads/" + token],
+        input=compressed, capture_output=True, check=True,
+    )
+    assert result.stdout.rsplit(b"\n", 1)[-1] == b"201", result.stdout
+    assert register(token) == "204"
+    print("STREAM_GZIP encoded=" + str(len(compressed)) + " decoded=5 status=201 registration=204", flush=True)
+    # Malformed/size/hash failures cannot publish; small pre-network failures
+    # remain retryable, while fresh authorization remains usable after cleanup.
+    for data, size, expected_hash, encoding, expected in (
+        (b"hello", 4, current, "identity", "400"),
+        (b"hello", 5, "0" * 32, "identity", "400"),
+        (b"not gzip", 5, current, "gzip", "400"),
+        (compressed[:-1], 5, current, "gzip", "400"),
+        (compressed + b"junk", 5, current, "gzip", "400"),
+    ):
+        token, _key = authorize(size, expected_hash)
+        result = subprocess.run(
+            ["curl", "-sS", "-i", "--max-time", "20", "-X", "POST", "-H", "Content-Encoding: " + encoding,
+             "--data-binary", "@-", "-w", "\n%{http_code}", base + "/uploads/" + token],
+            input=data, capture_output=True, check=True,
+        )
+        assert result.stdout.decode().rsplit("\n", 1)[-1] == expected, result.stdout
+        assert register(token) == "400"
+        print("STREAM_FAILURE", size, encoding, expected, result.stdout.decode(), flush=True)
+    configure(maximum=4)
+    token, _key = authorize(5, current)
+    assert curl("/uploads/" + token, "-X", "POST", "--data-binary", "hello", "-o", "/dev/null", "-w", "%{http_code}") == "413"
+    assert register(token) == "400"
+    print("STREAM_LIMIT max=4 declared=5 status=413 registration=400", flush=True)
+    token, _key = authorize(4, current)
+    response = curl("/uploads/" + token, "-X", "POST", "-i", "--data-binary", "hello", "-w", "\n%{http_code}")
+    assert response.rsplit("\n", 1)[-1] == "413", response
+    assert register(token) == "400"
+    print("STREAM_LIMIT_PLUS_ONE max=4 declared=4 actual=5 registration=400", response, flush=True)
+finally:
+    cleanup_pass_gate.set()
+    if clock_advanced:
+        subprocess.run(["date", "-s", "-120 seconds"], check=True)
+    for gate in blocked.values():
+        gate.set()
+    for gate in late.values():
+        gate.set()
+    if unrelated_id is not None:
+        assert s3("DELETE", unrelated_key + "?uploadId=" + quote(unrelated_id, safe=""))[1] == 204
+    override.unlink()
+    sql("drop trigger if exists checkpoint8_state_event on pending_uploads; drop function if exists checkpoint8_state_event()")
+    subprocess.run(["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1",
+                    "-c", "drop role root"], check=True)
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    service_ready("restart")
+    proxy.shutdown()
+    proxy.server_close()
+    thread.join(timeout=10)
+    payload.unlink()
+    disconnect_payload.unlink()
+    (root / "boundary").unlink(missing_ok=True)
+    root.rmdir()
+    print("CHECKPOINT8_PROBE_CLEANUP", os.getpid(), "root_removed", not root.exists(), flush=True)
+"""
+    print(machine.succeed("python3 -u -c " + shlex.quote(streaming_probe), timeout=180))
+    assert_attachment("STREAM22", "5d41402abc4b2a76b9719d911017c592", "hello", "stream-live-pointer")
+    assert_attachment("ATTACH22", "8b04d5e3775d298e78455efc5ca404d5", "first", "stream-unrelated-pointer")

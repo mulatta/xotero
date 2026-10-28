@@ -24,6 +24,10 @@ pub(crate) struct Config {
     pub(crate) public_url: String,
     pub(crate) database_url: String,
     pub(crate) s3: s3::Config,
+    pub(crate) upload_concurrency: usize,
+    pub(crate) upload_parts: usize,
+    pub(crate) upload_max_bytes: u64,
+    pub(crate) upload_timeout: std::time::Duration,
 }
 
 impl Config {
@@ -62,7 +66,29 @@ impl Config {
                 .or_else(|_| std::env::var("DATABASE_URL"))
                 .unwrap_or_else(|_| "postgres://localhost/xotero".into()),
             s3: load_s3(),
+            upload_concurrency: positive_env("XOTERO_UPLOAD_CONCURRENCY", 4),
+            upload_parts: positive_env("XOTERO_UPLOAD_PARTS", 2),
+            upload_max_bytes: positive_env("XOTERO_UPLOAD_MAX_BYTES", 256 * 1024 * 1024),
+            upload_timeout: std::time::Duration::from_secs(positive_env(
+                "XOTERO_UPLOAD_TIMEOUT",
+                300,
+            )),
         }
+    }
+}
+
+fn positive_env<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr + Default + PartialOrd,
+{
+    match std::env::var(name) {
+        Ok(value) => value
+            .parse()
+            .ok()
+            .filter(|value| *value > T::default())
+            .unwrap_or_else(|| panic!("{name} must be a positive integer")),
+        Err(std::env::VarError::NotPresent) => default,
+        Err(std::env::VarError::NotUnicode(_)) => panic!("{name} must be Unicode"),
     }
 }
 
@@ -221,11 +247,39 @@ mod tests {
             return;
         }
         let keys = load_keys();
+        for name in [
+            "XOTERO_UPLOAD_CONCURRENCY",
+            "XOTERO_UPLOAD_PARTS",
+            "XOTERO_UPLOAD_MAX_BYTES",
+            "XOTERO_UPLOAD_TIMEOUT",
+        ] {
+            positive_env::<usize>(name, 1);
+        }
         if std::env::var_os("XOTERO_KEYS").is_none()
             && std::env::var_os("XOTERO_API_KEY_FILE").is_none()
             && std::env::var_os("XOTERO_API_KEY").is_none()
         {
             assert!(keys.is_empty());
+        }
+    }
+
+    #[test]
+    fn upload_bounds_reject_zero_negative_malformed_and_overflow() {
+        for name in [
+            "XOTERO_UPLOAD_CONCURRENCY",
+            "XOTERO_UPLOAD_PARTS",
+            "XOTERO_UPLOAD_MAX_BYTES",
+            "XOTERO_UPLOAD_TIMEOUT",
+        ] {
+            for value in ["0", "-1", "", "invalid", "18446744073709551616"] {
+                // Given invalid selected limits, when parsing in isolation.
+                let result = key_loader_child(Some((name, value.as_ref())));
+                // Then no default or unlimited setting may replace them.
+                assert!(!result.status.success(), "{name} accepted {value:?}");
+            }
+            assert!(key_loader_child(Some((name, "1".as_ref())))
+                .status
+                .success());
         }
     }
 

@@ -32,6 +32,7 @@ pub(crate) struct AppState {
     pub(crate) config: Arc<Config>,
     pub(crate) pool: PgPool,
     pub(crate) storage: Arc<s3::Storage>,
+    pub(crate) uploads: Arc<tokio::sync::Semaphore>,
 }
 
 /// An unguessable upload token (128 bits of OS randomness, hex-encoded). `None`
@@ -236,6 +237,10 @@ mod body_tests {
             public_url: "http://localhost:8189".into(),
             database_url: "postgres://localhost/test".into(),
             s3: storage_config.clone(),
+            upload_concurrency: 4,
+            upload_parts: 2,
+            upload_max_bytes: 256 * 1024 * 1024,
+            upload_timeout: Duration::from_secs(300),
         };
         router(AppState {
             config: Arc::new(config),
@@ -243,6 +248,7 @@ mod body_tests {
                 .connect_lazy("postgres://localhost/test")
                 .unwrap(),
             storage: Arc::new(s3::Storage::new(&storage_config).unwrap()),
+            uploads: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
 
