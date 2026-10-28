@@ -135,6 +135,10 @@ impl Storage {
     }
 
     /// A pre-signed GET URL the client can follow directly to the bucket.
+    pub fn presign_ttl(&self) -> u32 {
+        self.presign_ttl
+    }
+
     pub async fn presign_get(&self, key: &str) -> Result<String, S3Error> {
         self.bucket.presign_get(key, self.presign_ttl, None).await
     }

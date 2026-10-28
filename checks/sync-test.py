@@ -484,6 +484,9 @@ with subtest("an unregistered replacement cannot change the live attachment"):
     # without re-uploading bytes.
     restart_xotero()
     assert_attachment("ATTACH22", old_md5, "hello", "replacement-after-restart")
+    displaced_blob = psql(
+        "select blob_key from file where library_id = 1 and item_key = 'ATTACH22'"
+    )
     assert (
         http_code(
             f"-X POST {base}/users/1/items/ATTACH22/file {auth} "
@@ -500,6 +503,13 @@ with subtest("an unregistered replacement cannot change the live attachment"):
         == "0"
     )
     assert_attachment("ATTACH22", world_md5, "world", "replacement-registered")
+    # Then: publishing the replacement durably retires the displaced pointer in
+    # the same transaction, without deleting its still-valid download bytes.
+    assert psql(
+        f"select state = 'queued' and not_before > clock_timestamp() "
+        f"from blob_retirements where blob_key = '{displaced_blob}'"
+    ) == "t"
+    machine.succeed(f"mc stat 's3/zotero/{displaced_blob}'")
 
 with subtest("expired upload candidates are deleted before their rows"):
     world_md5 = "7d793037a0760186574b0282f2f435e7"
@@ -1509,6 +1519,7 @@ def service_ready(action):
     selector = selectors.DefaultSelector()
     selector.register(journal.stdout, selectors.EVENT_READ)
     try:
+        subprocess.run(["systemctl", "reset-failed", "xotero"], check=True)
         subprocess.run(["systemctl", action, "xotero"], check=True)
         while True:
             assert selector.select(20), "missing listener readiness event"
@@ -2039,3 +2050,531 @@ finally:
     print(machine.succeed("python3 -u -c " + shlex.quote(streaming_probe), timeout=180))
     assert_attachment("STREAM22", "5d41402abc4b2a76b9719d911017c592", "hello", "stream-live-pointer")
     assert_attachment("ATTACH22", "8b04d5e3775d298e78455efc5ca404d5", "first", "stream-unrelated-pointer")
+
+with subtest("retirement migration preserves populated shared pointers and pending uploads"):
+    machine.succeed("sudo -u postgres createdb checkpoint9_upgrade")
+    try:
+        machine.succeed(
+            "for migration in /etc/xotero-checkpoint9-migrations/00{0,1}*.sql; do "
+            "case \"$migration\" in */0014*) continue;; esac; "
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 -d checkpoint9_upgrade -f \"$migration\"; done"
+        )
+        seed = """
+            insert into library (id, kind, version) values (2, 'personal', 17);
+            insert into file (library_id, item_key, md5, blob_md5, filename,
+                              filesize, mtime, version, blob_key)
+            values (1, 'UPGRADE2', 'original', 'bytes', 'first', 5, 9, 11, 'shared'),
+                   (2, 'UPGRADE3', 'original', 'bytes', 'second', 5, 9, 17, 'shared');
+            insert into pending_uploads (token_hash, library_id, authorizer_key_hash,
+                        item_key, blob_key, md5, upload_md5, filename, filesize, mtime, state)
+            values (decode(repeat('11',32),'hex'),1,decode(repeat('22',32),'hex'),
+                    'UPGRADE4','pending','original','bytes','pending',5,9,'uploaded');
+        """
+        machine.succeed(
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 -d checkpoint9_upgrade -c "
+            + shlex.quote(seed)
+        )
+        before = machine.succeed(
+            "sudo -u postgres psql -At -d checkpoint9_upgrade -c "
+            + shlex.quote(
+                "select json_agg(f order by library_id)::text from file f; "
+                "select row_to_json(p)::text from pending_uploads p"
+            )
+        )
+        machine.succeed(
+            "sudo -u postgres psql -v ON_ERROR_STOP=1 -d checkpoint9_upgrade "
+            "-f /etc/xotero-checkpoint9-migrations/0014_blob_retirement.sql"
+        )
+        after = machine.succeed(
+            "sudo -u postgres psql -At -d checkpoint9_upgrade -c "
+            + shlex.quote(
+                "select json_agg(f order by library_id)::text from file f; "
+                "select row_to_json(p)::text from pending_uploads p"
+            )
+        )
+        assert before == after, (before, after)
+        for invalid in (
+            "insert into storage_policy values (false,0)",
+            "update storage_policy set max_issued_presign_ttl=-1",
+            "insert into blob_retirements (blob_key,not_before) values ('',now())",
+            "insert into blob_retirements (blob_key,not_before,state) values ('x',now(),'deleted')",
+        ):
+            machine.fail(
+                "sudo -u postgres psql -v ON_ERROR_STOP=1 -d checkpoint9_upgrade -c "
+                + shlex.quote(invalid)
+            )
+        print("RETIREMENT_UPGRADE shared_file_rows=2 pending_uploaded=1 unchanged=true")
+    finally:
+        machine.succeed("sudo -u postgres dropdb checkpoint9_upgrade")
+
+with subtest("registered blob retirement observes grace locks claims and durable retry"):
+    retirement_probe = r"""
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import selectors
+import socket
+import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlencode, urlsplit, unquote
+import psycopg
+
+root = Path("/run/xotero-checkpoint9")
+override = Path("/run/systemd/system/xotero.service.d/checkpoint9.conf")
+print("CHECKPOINT9_RESOURCES", os.getpid(), str(root), str(override), flush=True)
+root.mkdir(mode=0o755)
+(root / "kdf").write_text("0123456789abcdef0123456789abcdef")
+subprocess.run(["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1",
+                "-c", "create role root superuser login"], check=True)
+db = psycopg.connect("dbname=xotero user=root host=/run/postgresql", autocommit=True)
+clients = []
+condition = threading.Condition()
+events = []
+failures = set()
+before_delete = {}
+after_delete = {}
+
+def sql(statement, parameters=()):
+    return db.execute(statement, parameters)
+
+def scalar(statement, parameters=()):
+    return sql(statement, parameters).fetchone()[0]
+
+def event(kind, key, status=0):
+    with condition:
+        events.append((kind, key, status))
+        condition.notify_all()
+    print("GC_BACKEND_EVENT", kind, key, status, flush=True)
+
+def await_event(kind, key):
+    with condition:
+        assert condition.wait_for(
+            lambda: any(row[:2] == (kind, key) for row in events), timeout=20
+        ), (kind, key, events)
+
+class Proxy(BaseHTTPRequestHandler):
+    def relay(self):
+        request = urlsplit(self.path)
+        key = unquote(request.path.removeprefix("/zotero/"))
+        deleting = self.command == "DELETE" and not request.query
+        if deleting:
+            event("delete-entered", key)
+            gate = before_delete.get(key)
+            if gate is not None:
+                assert gate.wait(30), key
+            if key in failures:
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                event("delete-failed", key, 503)
+                return
+        backend = http.client.HTTPConnection("127.0.0.1", 9000, timeout=20)
+        try:
+            body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            backend.request(self.command, self.path, body, dict(self.headers))
+            response = backend.getresponse()
+            data, headers, status = response.read(), response.getheaders(), response.status
+        finally:
+            backend.close()
+        if deleting:
+            event("backend-deleted", key, status)
+            gate = after_delete.get(key)
+            if gate is not None:
+                assert gate.wait(30), key
+        self.send_response(status)
+        for name, value in headers:
+            if name.lower() not in ("connection", "transfer-encoding", "content-length"):
+                self.send_header(name, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            event("collector-disconnected", key)
+    do_GET = relay
+    do_DELETE = relay
+    def log_message(self, *_args):
+        pass
+
+proxy = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
+proxy.daemon_threads = True
+proxy_thread = threading.Thread(target=proxy.serve_forever, daemon=True)
+proxy_thread.start()
+print("CHECKPOINT9_PROXY", os.getpid(), proxy.server_port, flush=True)
+
+def request(method, path, body=b"", extra=None, key="testtoken"):
+    headers = {"Zotero-API-Key": key, "Content-Type": "application/x-www-form-urlencoded"}
+    headers.update(extra or {})
+    conn = http.client.HTTPConnection("127.0.0.1", 8189, timeout=30)
+    try:
+        conn.request(method, path, body, headers)
+        response = conn.getresponse()
+        return response.status, dict(response.getheaders()), response.read()
+    finally:
+        conn.close()
+
+def download(url):
+    parsed = urlsplit(url)
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port, timeout=20)
+    try:
+        conn.request("GET", parsed.path + "?" + parsed.query)
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+def create_item(key):
+    version = scalar("select version from library where id=1")
+    status, _, body = request("POST", "/users/1/items",
+        json.dumps([{"key": key, "itemType": "attachment", "linkMode": "imported_file"}]),
+        {"If-Unmodified-Since-Version": str(version), "Content-Type": "application/json"})
+    assert status == 200 and not json.loads(body)["failed"], (status, body)
+
+def candidate(item, content, prior=None):
+    digest = hashlib.md5(content).hexdigest()
+    status, _, body = request("POST", f"/users/1/items/{item}/file",
+        urlencode({"md5": digest, "filename": "fixture", "filesize": len(content), "mtime": 9}),
+        {"If-Match": prior} if prior is not None else {"If-None-Match": "*"})
+    assert status == 200, (status, body)
+    token = json.loads(body)["uploadKey"]
+    assert request("POST", "/uploads/" + token, content)[0] == 201
+    blob = scalar("select blob_key from pending_uploads where token_hash=%s",
+                  (hashlib.sha256(token.encode()).digest(),))
+    return token, blob, digest
+
+def register(item, token):
+    return request("POST", f"/users/1/items/{item}/file", urlencode({"upload": token}))[0]
+
+def signed(item, key="testtoken"):
+    status, headers, body = request("GET", f"/users/1/items/{item}/file", key=key)
+    assert status == 302, (status, body)
+    return headers["location"]
+
+def due(blob):
+    sql("update blob_retirements set not_before=clock_timestamp()-interval '1 second', "
+        "retry_after='-infinity' where blob_key=%s", (blob,))
+
+def queued(blob):
+    sql("insert into blob_retirements (blob_key,not_before) "
+        "values (%s,clock_timestamp()-interval '1 second')", (blob,))
+
+def gc_start():
+    pid = subprocess.check_output(["systemctl", "show", "xotero", "-p", "MainPID", "--value"], text=True).strip()
+    executable = os.readlink(f"/proc/{pid}/exe")
+    env = dict(os.environ,
+        XOTERO_DATABASE_URL="postgresql:///xotero?host=/run/postgresql",
+        XOTERO_LOGIN_KDF_KEY_FILE=str(root / "kdf"),
+        XOTERO_S3_ENDPOINT=f"http://127.0.0.1:{proxy.server_port}",
+        XOTERO_S3_ACCESS_KEY="rustfsadmin", XOTERO_S3_SECRET_KEY="rustfsadmin",
+        XOTERO_S3_REGION="us-east-1", XOTERO_S3_BUCKET="zotero",
+        XOTERO_UPLOAD_TIMEOUT="10")
+    process = subprocess.Popen([executable, "maintenance", "gc", "--once"],
+        env=env, user="xotero", group="xotero",
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    clients.append(process)
+    print("CHECKPOINT9_GC_PID", process.pid, flush=True)
+    return process
+
+def finish(process, expected=0):
+    output, _ = process.communicate(timeout=30)
+    print("GC_PROCESS_EXIT", process.pid, process.returncode, output, flush=True)
+    assert process.returncode == expected, (process.returncode, output)
+
+def gc():
+    finish(gc_start())
+
+@contextmanager
+def journal(unit):
+    cursor = subprocess.check_output(["journalctl", "-u", unit, "-n", "1",
+        "--show-cursor", "-o", "cat"], text=True).rsplit("-- cursor: ", 1)[1].strip()
+    process = subprocess.Popen(["journalctl", "-u", unit, "--after-cursor", cursor, "-f", "-o", "json"],
+        stdout=subprocess.PIPE, bufsize=0)
+    print("CHECKPOINT9_JOURNAL_PID", process.pid, unit, flush=True)
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        def next_message():
+            assert selector.select(20), ("missing journal event", unit)
+            data = json.loads(process.stdout.readline())["MESSAGE"]
+            return data if isinstance(data, str) else bytes(data).decode()
+        try:
+            yield next_message
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+def blocked(next_message, fragment):
+    while True:
+        message = next_message()
+        if "still waiting" in message:
+            rows = sql("select pid, wait_event, query from pg_stat_activity "
+                "where usename='xotero' and wait_event_type='Lock' and query like %s",
+                ("%" + fragment + "%",)).fetchall()
+            if rows:
+                print("GC_LOCK_EVENT", json.dumps(rows), flush=True)
+                return rows
+
+def configure(ttl):
+    override.parent.mkdir(parents=True, exist_ok=True)
+    override.write_text("[Service]\nEnvironment=XOTERO_S3_PRESIGN_TTL=" + str(ttl) + "\n")
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    restart()
+
+def restart():
+    with journal("xotero") as next_message:
+        subprocess.run(["systemctl", "reset-failed", "xotero"], check=True)
+        subprocess.run(["systemctl", "restart", "xotero"], check=True)
+        while "xotero listening" not in next_message():
+            pass
+    with socket.create_connection(("127.0.0.1", 8189), timeout=10):
+        pass
+
+def bytes_exist(blob):
+    return subprocess.run(["mc", "stat", "s3/zotero/" + blob], capture_output=True).returncode == 0
+
+try:
+    # Given a registered pointer and an issued high-TTL URL, replacement must
+    # atomically enqueue old bytes while a lower-TTL restart preserves promise.
+    create_item("GCGRAC22")
+    token, old, digest = candidate("GCGRAC22", b"old-grace")
+    assert register("GCGRAC22", token) == 204
+    configure(900)
+    old_url = signed("GCGRAC22", "readonlytoken")
+    assert "X-Amz-Expires=900" in old_url
+    configure(120)
+    token, new, _ = candidate("GCGRAC22", b"new-grace", digest)
+    retired_after = scalar("select extract(epoch from clock_timestamp())")
+    assert register("GCGRAC22", token) == 204
+    deadline = scalar("select extract(epoch from not_before) from blob_retirements where blob_key=%s", (old,))
+    assert deadline >= retired_after + 960, (deadline, retired_after)
+    assert scalar("select max_issued_presign_ttl from storage_policy") == 900
+    assert register("GCGRAC22", token) == 400
+    gc()
+    assert download(old_url) == (200, b"old-grace")
+    assert scalar("select state from blob_retirements where blob_key=%s", (old,)) == "queued"
+    due(old)
+    gc()
+    assert not bytes_exist(old) and bytes_exist(new)
+    assert scalar("select state from blob_retirements where blob_key=%s", (old,)) == "deleted"
+    print("GC_GRACE", json.dumps({"ttl_max": 900, "restart_ttl": 120, "skew": 60,
+        "retired_after": str(retired_after), "deadline": str(deadline),
+        "old_url_during_grace": 200, "after_explicit_due_gc": "deleted"}), flush=True)
+
+    # Given a rejected pointer mutation, retirement/version/token changes roll
+    # back together; no compensation delete may follow a registration error.
+    create_item("GCATAM22")
+    token, atomic_old, digest = candidate("GCATAM22", b"atomic-old")
+    assert register("GCATAM22", token) == 204
+    token, atomic_new, _ = candidate("GCATAM22", b"atomic-new", digest)
+    version = scalar("select version from library where id=1")
+    sql("create function checkpoint9_fail() returns trigger language plpgsql as $$ "
+        "begin raise exception 'checkpoint9 rollback'; end $$; "
+        "create trigger checkpoint9_fail before update on file for each row "
+        "when (new.item_key='GCATAM22') execute function checkpoint9_fail()")
+    assert register("GCATAM22", token) == 500
+    assert scalar("select count(*) from blob_retirements where blob_key=%s", (atomic_old,)) == 0
+    assert scalar("select version from library where id=1") == version
+    assert scalar("select blob_key from file where item_key='GCATAM22' and library_id=1") == atomic_old
+    assert bytes_exist(atomic_old) and bytes_exist(atomic_new)
+    sql("drop trigger checkpoint9_fail on file; drop function checkpoint9_fail()")
+    assert register("GCATAM22", token) == 204
+    print("GC_ATOMIC rollback_pointer_version_queue=true successful_retry=204", flush=True)
+
+    # Given a signer blocked on policy after acquiring target SHARE, retirement
+    # waits. Its timestamp must be sampled after that wait, not transaction start.
+    token, delayed_new, digest = candidate("GCATAM22", b"delayed-new", hashlib.md5(b"atomic-new").hexdigest())
+    with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+        holder.execute("select singleton from storage_policy for update")
+        with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=2) as workers:
+            signer = workers.submit(signed, "GCATAM22")
+            blocked(next_message, "update storage_policy")
+            publisher = workers.submit(register, "GCATAM22", token)
+            blocked(next_message, "select version from library")
+            release = scalar("select extract(epoch from clock_timestamp())")
+            holder.commit()
+            delayed_url = signer.result(timeout=20)
+            assert publisher.result(timeout=20) == 204
+    deadline = scalar("select extract(epoch from not_before) from blob_retirements where blob_key=%s", (atomic_new,))
+    assert deadline >= release + 960, (deadline, release)
+    assert download(delayed_url) == (200, b"atomic-new")
+    print("GC_DELAYED_SIGNER", json.dumps({"release": str(release), "deadline": str(deadline),
+        "old_url": 200, "target_share_held": True}), flush=True)
+
+    # Given a blob lock wait after authority validation, even that later wait
+    # must precede the retirement clock.
+    token, latest, _ = candidate("GCATAM22", b"after-blob-wait", digest)
+    with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+        holder.execute("select pg_advisory_xact_lock(1481593922,hashtext(%s))", (delayed_new,))
+        with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=1) as workers:
+            publisher = workers.submit(register, "GCATAM22", token)
+            blocked(next_message, "pg_advisory_xact_lock")
+            release = scalar("select extract(epoch from clock_timestamp())")
+            holder.commit()
+            assert publisher.result(timeout=20) == 204
+    deadline = scalar("select extract(epoch from not_before) from blob_retirements where blob_key=%s", (delayed_new,))
+    assert deadline >= release + 960
+    print("GC_BLOB_WAIT_CLOCK", str(release), str(deadline), flush=True)
+
+    # Given an existing later grace promise, another retirement cannot shorten
+    # it even though the currently configured TTL is smaller.
+    create_item("GCMNNN22")
+    token, monotonic_old, digest = candidate("GCMNNN22", b"monotonic-old")
+    assert register("GCMNNN22", token) == 204
+    promised_deadline = scalar(
+        "insert into blob_retirements (blob_key,not_before) "
+        "values (%s,clock_timestamp()+interval '2 hours') returning extract(epoch from not_before)",
+        (monotonic_old,))
+    token, _, _ = candidate("GCMNNN22", b"monotonic-new", digest)
+    assert register("GCMNNN22", token) == 204
+    assert scalar("select extract(epoch from not_before) from blob_retirements where blob_key=%s",
+                  (monotonic_old,)) == promised_deadline
+    print("GC_MONOTONIC_DEADLINE", str(promised_deadline), "unchanged=true", flush=True)
+
+    # Given revocation committed before the locked recheck, even an already
+    # middleware-authorized signer returns no new URL.
+    key = "checkpoint9-read-key"
+    key_id = scalar("insert into api_keys (user_id,name,token_hash) values (1,'gc reader',%s) returning id",
+                    (hashlib.sha256(key.encode()).digest(),))
+    sql("insert into api_key_user_permissions (api_key_id,library,files) values (%s,true,true)", (key_id,))
+    with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+        holder.execute("update api_key_user_permissions set files=false where api_key_id=%s", (key_id,))
+        with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=1) as workers:
+            signer = workers.submit(request, "GET", "/users/1/items/GCATAM22/file", key=key)
+            blocked(next_message, "api_key_user_permissions")
+            holder.commit()
+            status, headers, _ = signer.result(timeout=20)
+            assert status == 403 and "location" not in headers, (status, headers)
+    print("GC_SIGNER_REVOKED status=403 location=false", flush=True)
+
+    # Given failure only at signing COMMIT, neither a URL nor an uncommitted
+    # policy promise may escape. Actual SDK signing happens before this fault.
+    sql("create function checkpoint9_sign_commit() returns trigger language plpgsql as $$ "
+        "begin raise exception 'checkpoint9 signing commit'; end $$; "
+        "create constraint trigger checkpoint9_sign_commit after update on storage_policy "
+        "deferrable initially deferred for each row execute function checkpoint9_sign_commit()")
+    status, headers, _ = request("GET", "/users/1/items/GCATAM22/file")
+    assert status == 500 and "location" not in headers, (status, headers)
+    sql("drop trigger checkpoint9_sign_commit on storage_policy; drop function checkpoint9_sign_commit()")
+    print("GC_SIGN_COMMIT_FAILURE status=500 location=false", flush=True)
+
+    # Given GC waiting on a blob, a committed new reference in another library
+    # (without a matching object row) must be visible to its fresh statement.
+    shared_library = scalar("insert into library (kind,version) values ('personal',0) returning id")
+    due(atomic_old)
+    with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+        holder.execute("select pg_advisory_xact_lock(1481593922,hashtext(%s))", (atomic_old,))
+        with journal("postgresql") as next_message:
+            collector = gc_start()
+            blocked(next_message, "pg_advisory_xact_lock")
+            holder.execute("insert into file (library_id,item_key,blob_key,md5,blob_md5,"
+                "filename,filesize,mtime,version) values (%s,'SHARED22',%s,'old','old','fixture',10,9,0)",
+                (shared_library, atomic_old))
+            holder.commit()
+            finish(collector)
+    assert bytes_exist(atomic_old)
+    assert scalar("select state from blob_retirements where blob_key=%s", (atomic_old,)) == "queued"
+    print("GC_FRESH_GLOBAL_REFERENCE library", shared_library, "object_join_absent=true bytes=true", flush=True)
+    sql("delete from file where library_id=%s", (shared_library,))
+    sql("delete from library where id=%s", (shared_library,))
+
+    # Given a claim committed while publication waits on its earlier library
+    # lock, publication must reject before any remote response arrives.
+    create_item("GCCLAI22")
+    token, claimed, _ = candidate("GCCLAI22", b"claim-race")
+    queued(claimed)
+    before_delete[claimed] = threading.Event()
+    version = scalar("select version from library where id=1")
+    with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+        holder.execute("select id from library where id=1 for update")
+        with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=1) as workers:
+            publisher = workers.submit(register, "GCCLAI22", token)
+            blocked(next_message, "select version from library")
+            collector = gc_start()
+            await_event("delete-entered", claimed)
+            assert scalar("select state from blob_retirements where blob_key=%s", (claimed,)) == "claimed"
+            assert scalar("select count(*) from pg_stat_activity where usename='xotero' "
+                          "and state='idle in transaction'") == 0
+            holder.commit()
+            assert publisher.result(timeout=20) == 400
+    assert scalar("select version from library where id=1") == version
+    assert bytes_exist(claimed)
+    before_delete[claimed].set()
+    finish(collector)
+    assert not bytes_exist(claimed)
+    assert register("GCCLAI22", token) == 400
+    print("GC_CLAIM_PUBLICATION committed_claim_before_delete=true publication=400 tombstone=400", flush=True)
+
+    # Given a backend delete failure, the committed claim survives. Retrying a
+    # claimed key still checks global references before touching remote bytes.
+    due(atomic_new)
+    failures.add(atomic_new)
+    finish(gc_start(), 1)
+    assert bytes_exist(atomic_new)
+    assert scalar("select state from blob_retirements where blob_key=%s", (atomic_new,)) == "claimed"
+    failures.remove(atomic_new)
+    sql("insert into file (library_id,item_key,blob_key,md5,blob_md5,filename,filesize,mtime,version) "
+        "values (1,'RETRYREF',%s,'old','old','fixture',10,9,0)", (atomic_new,))
+    due(atomic_new)
+    gc()
+    assert bytes_exist(atomic_new)
+    sql("delete from file where library_id=1 and item_key='RETRYREF'")
+    gc()
+    assert not bytes_exist(atomic_new) and bytes_exist(latest)
+    print("GC_DELETE_RETRY failure=503 claim_retained=true live_reference_skipped=true retry=deleted", flush=True)
+
+    # Given real S3 success whose response cannot reach collector, kill only
+    # that recorded collector PID. Claimed survives crash and retry is safe.
+    due(delayed_new)
+    after_delete[delayed_new] = threading.Event()
+    collector = gc_start()
+    await_event("backend-deleted", delayed_new)
+    assert not bytes_exist(delayed_new)
+    assert scalar("select state from blob_retirements where blob_key=%s", (delayed_new,)) == "claimed"
+    collector.kill()
+    finish(collector, -9)
+    after_delete[delayed_new].set()
+    due(delayed_new)
+    gc()
+    assert scalar("select state from blob_retirements where blob_key=%s", (delayed_new,)) == "deleted"
+    assert bytes_exist(latest) and download(signed("GCATAM22")) == (200, b"after-blob-wait")
+    print("GC_CRASH_RETRY backend_success_before_kill=true retry=deleted live_bytes=true", flush=True)
+
+    # Given in-flight Uploading ownership, once maintenance never takes the
+    # server startup reset path, even while no registered work remains due.
+    create_item("GCUPLD22")
+    token, uploading, _ = candidate("GCUPLD22", b"upload-owner")
+    sql("update pending_uploads set state='uploading' where blob_key=%s", (uploading,))
+    gc()
+    assert scalar("select state from pending_uploads where blob_key=%s", (uploading,)) == "uploading"
+    sql("update pending_uploads set state='uploaded' where blob_key=%s", (uploading,))
+    assert register("GCUPLD22", token) == 204
+    print("GC_ONCE_PENDING uploading_unchanged=true registration=204", flush=True)
+finally:
+    for gate in list(before_delete.values()) + list(after_delete.values()):
+        gate.set()
+    for process in clients:
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=10)
+    sql("drop trigger if exists checkpoint9_fail on file; drop function if exists checkpoint9_fail()")
+    sql("drop trigger if exists checkpoint9_sign_commit on storage_policy; "
+        "drop function if exists checkpoint9_sign_commit()")
+    override.unlink(missing_ok=True)
+    subprocess.run(["systemctl", "daemon-reload"], check=True)
+    restart()
+    db.close()
+    subprocess.run(["sudo", "-u", "postgres", "psql", "-v", "ON_ERROR_STOP=1",
+                    "-c", "drop role root"], check=True)
+    proxy.shutdown()
+    proxy.server_close()
+    proxy_thread.join(timeout=10)
+    (root / "kdf").unlink()
+    root.rmdir()
+    print("CHECKPOINT9_PROBE_CLEANUP", os.getpid(), "root_removed", not root.exists(),
+          "proxy_thread_alive", proxy_thread.is_alive(), flush=True)
+"""
+    print(machine.succeed("python3 -u -c " + shlex.quote(retirement_probe), timeout=240))

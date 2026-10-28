@@ -54,6 +54,7 @@ testPkgs.testers.runNixOSTest {
       log_lock_waits = true;
       deadlock_timeout = "10ms";
     };
+    environment.etc."xotero-checkpoint9-migrations".source = ../../xotero/migrations;
 
     environment.systemPackages = [
       testPkgs.curl

@@ -19,7 +19,9 @@ use crate::app::{router, AppState};
 use crate::config::Config;
 use std::sync::Arc;
 
-use crate::handlers::files::{cleanup_pending_uploads, pending_upload_cleanup_loop};
+use crate::handlers::files::{
+    cleanup_pending_uploads, cleanup_retired_blobs, pending_upload_cleanup_loop,
+};
 
 pub(crate) fn upload_token() -> Option<String> {
     use std::io::Read;
@@ -40,7 +42,38 @@ async fn main() {
         )
         .init();
 
+    let arguments: Vec<String> = std::env::args().skip(1).collect();
+    let gc_once = match arguments.as_slice() {
+        [] => false,
+        [maintenance, gc, once]
+            if maintenance == "maintenance" && gc == "gc" && once == "--once" =>
+        {
+            true
+        }
+        _ => {
+            tracing::error!("usage: xotero [maintenance gc --once]");
+            std::process::exit(2);
+        }
+    };
     let config = Arc::new(Config::from_env());
+
+    if gc_once {
+        // Maintenance runs beside the serving process: never migrate/bootstrap,
+        // reset Uploading ownership, spawn cleanup loops, or open a listener.
+        let pool = sqlx::PgPool::connect(&config.database_url)
+            .await
+            .expect("connect for blob collection");
+        let storage = s3::Storage::new(&config.s3).expect("init object storage");
+        match cleanup_retired_blobs(&pool, &storage, config.upload_timeout).await {
+            Ok(true) => {}
+            Ok(false) => std::process::exit(1),
+            Err(error) => {
+                tracing::error!(%error, "collect retired blobs");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
 
     let pool = store::connect(&config.database_url)
         .await

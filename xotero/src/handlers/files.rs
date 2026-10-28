@@ -264,6 +264,43 @@ pub(crate) async fn pending_upload_cleanup_loop(state: AppState) {
     }
 }
 
+/// One finite due-work pass. The durable claim outlives this process and every
+/// remote failure; only an acknowledged claim COMMIT authorizes deletion.
+pub(crate) async fn cleanup_retired_blobs(
+    pool: &sqlx::PgPool,
+    storage: &crate::s3::Storage,
+    timeout: std::time::Duration,
+) -> sqlx::Result<bool> {
+    let cutoff = store::pending_upload_cleanup_cutoff(pool).await?;
+    let mut after = String::new();
+    let mut complete = true;
+    loop {
+        let keys = store::due_blob_keys(pool, &cutoff, &after).await?;
+        if keys.is_empty() {
+            return Ok(complete);
+        }
+        for key in keys {
+            after.clone_from(&key);
+            let Some(claim) = store::claim_retired_blob(pool, &key).await? else {
+                continue;
+            };
+            // No transaction or blob lock spans the S3 operation. A concurrent
+            // publisher sees Claimed, including throughout deletion retries.
+            match tokio::time::timeout(timeout, storage.delete(&claim.blob_key)).await {
+                Ok(Ok(())) => store::finish_retired_blob(pool, claim).await?,
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "retired blob deletion will retry");
+                    complete = false;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "retired blob deletion deadline");
+                    complete = false;
+                }
+            }
+        }
+    }
+}
+
 /// Receive the raw attachment bytes for a pending upload token, verify them
 /// against the authorized md5/filesize, and store an immutable candidate.
 /// Rejects an unknown token. Verifying here (where the bytes are in hand) keeps
@@ -430,20 +467,37 @@ async fn discard_upload(state: &AppState, token_hash: &[u8], uncertain: bool) {
 /// an unguessable, expiring capability the client follows without an API key).
 pub(crate) async fn file_get(
     State(state): State<AppState>,
+    Extension(context): Extension<RequestContext>,
     Path((_id, key)): Path<(String, String)>,
 ) -> Response {
     if !valid_key(&key) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    let meta = match store::file_meta(&state.pool, request_library(), &key).await {
-        Ok(Some(meta)) => meta,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(error) => return server_error("file meta", error),
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => return server_error("begin file signing", error),
     };
+    let meta =
+        match store::file_for_signing(&mut tx, &key, request_access(), &context, &state.config)
+            .await
+        {
+            Ok(store::FileSigningOutcome::Allowed(meta)) => meta,
+            Ok(store::FileSigningOutcome::Missing) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(store::FileSigningOutcome::Denied) => return StatusCode::FORBIDDEN.into_response(),
+            Err(error) => return server_error("authorize file signing", error),
+        };
+    if let Err(error) = store::record_presign_ttl(&mut tx, state.storage.presign_ttl()).await {
+        return server_error("record file signing lifetime", error);
+    }
     let url = match state.storage.presign_get(&meta.blob_key).await {
         Ok(url) => url,
         Err(error) => return s3_error("presign download", error),
     };
+    // The library shared lock protects actual signing, not just URL metadata
+    // lookup. An unknown COMMIT outcome must not release this URL to the client.
+    if let Err(error) = tx.commit().await {
+        return server_error("commit file signing lifetime", error);
+    }
     let mut headers = HeaderMap::new();
     headers.insert("location", header_value(&url));
     headers.insert(

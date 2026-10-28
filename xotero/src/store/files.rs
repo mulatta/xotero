@@ -20,8 +20,8 @@ pub struct FileMeta {
 }
 
 /// Client-visible metadata and immutable object pointer for an attachment file.
-pub async fn file_meta(
-    pool: &PgPool,
+pub async fn file_meta<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
     library_id: LibraryId,
     item_key: &str,
 ) -> sqlx::Result<Option<FileMeta>> {
@@ -37,7 +37,7 @@ pub async fn file_meta(
     )
     .bind(library_id.get())
     .bind(item_key)
-    .fetch_optional(pool)
+    .fetch_optional(executor)
     .await?;
     Ok(row.map(|r| FileMeta {
         md5: r.get("md5"),
@@ -97,6 +97,13 @@ struct UploadAuthority {
     permissions: Permissions,
 }
 
+#[derive(Clone, Copy)]
+struct FileScope {
+    library_id: LibraryId,
+    group_id: Option<GroupId>,
+    write: bool,
+}
+
 impl UploadAuthority {
     async fn resolve(
         conn: &mut sqlx::PgConnection,
@@ -133,13 +140,13 @@ impl UploadAuthority {
     async fn allows(
         &self,
         conn: &mut sqlx::PgConnection,
-        upload: &PendingUpload,
+        scope: FileScope,
         grant_rows: (bool, bool),
     ) -> sqlx::Result<bool> {
-        let Some(group_id) = upload.group_id else {
-            return Ok(self.principal.library_id == upload.library_id
+        let Some(group_id) = scope.group_id else {
+            return Ok(self.principal.library_id == scope.library_id
                 && self.permissions.library
-                && self.permissions.write
+                && (!scope.write || self.permissions.write)
                 && self.permissions.files);
         };
         match super::groups::resolve_group_library_with_grants(
@@ -153,7 +160,7 @@ impl UploadAuthority {
         .await?
         {
             super::GroupLibraryResolution::Allowed(access) => {
-                Ok(access.library_id == upload.library_id && access.file_write)
+                Ok(access.library_id == scope.library_id && (!scope.write || access.file_write))
             }
             super::GroupLibraryResolution::Denied | super::GroupLibraryResolution::Missing => {
                 Ok(false)
@@ -175,42 +182,65 @@ impl PendingUpload {
         else {
             return Ok(false);
         };
-        authority.allows(&mut conn, self, (true, true)).await
+        authority
+            .allows(
+                &mut conn,
+                FileScope {
+                    library_id: self.library_id,
+                    group_id: self.group_id,
+                    write: true,
+                },
+                (true, true),
+            )
+            .await
     }
 }
 
 /// Discovery supplies lock candidates only. Rebinding discovered identities
 /// fails closed rather than acquiring an earlier library lock out of order.
-async fn lock_upload_authorities(
+async fn lock_file_authorities(
     conn: &mut sqlx::PgConnection,
-    upload: &PendingUpload,
+    access: LibraryAccess,
     context: &RequestContext,
+    upload: Option<&PendingUpload>,
     config: &Config,
 ) -> sqlx::Result<Option<i64>> {
+    let scope = FileScope {
+        library_id: access.library_id,
+        group_id: access.group_id,
+        write: upload.is_some(),
+    };
     let caller_hash = Sha256::digest(context.presented_key.as_bytes());
-    let credentials = [
-        (
+    let mut credentials = vec![(
+        caller_hash.as_slice(),
+        context
+            .api_key_id
+            .is_none()
+            .then_some(context.principal.user_id),
+    )];
+    if let Some(upload) = upload {
+        credentials.push((
             upload.authorizer_key_hash.as_slice(),
             upload.bootstrap_user_id,
-        ),
-        (
-            caller_hash.as_slice(),
-            context
-                .api_key_id
-                .is_none()
-                .then_some(context.principal.user_id),
-        ),
-    ];
+        ));
+    }
     let mut authorities = Vec::with_capacity(2);
-    for (hash, bootstrap_user_id) in credentials {
+    for &(hash, bootstrap_user_id) in &credentials {
         let Some(authority) =
             UploadAuthority::resolve(&mut *conn, config, hash, bootstrap_user_id).await?
         else {
             return Ok(None);
         };
+        if authorities.is_empty()
+            && (authority.api_key_id != context.api_key_id
+                || authority.principal.user_id != context.principal.user_id
+                || authority.principal.library_id != context.principal.library_id)
+        {
+            return Ok(None);
+        }
         authorities.push(authority);
     }
-    let mut libraries = vec![upload.library_id.get()];
+    let mut libraries = vec![scope.library_id.get()];
     let mut users = Vec::new();
     let mut keys = Vec::new();
     for authority in &authorities {
@@ -224,7 +254,7 @@ async fn lock_upload_authorities(
     libraries.dedup();
     let mut current_version = None;
     for library in libraries {
-        let query = if library == upload.library_id.get() {
+        let query = if library == scope.library_id.get() && scope.write {
             "select version from library where id = $1 for update"
         } else {
             "select version from library where id = $1 for share"
@@ -236,16 +266,16 @@ async fn lock_upload_authorities(
         let Some(version) = version else {
             return Ok(None);
         };
-        if library == upload.library_id.get() {
+        if library == scope.library_id.get() {
             current_version = Some(version);
         }
     }
-    if let Some(group) = upload.group_id {
+    if let Some(group) = scope.group_id {
         let owner: Option<i64> = sqlx::query_scalar(
             "select owner_user_id from groups where id = $1 and library_id = $2 for share",
         )
         .bind(group.get())
-        .bind(upload.library_id.get())
+        .bind(scope.library_id.get())
         .fetch_optional(&mut *conn)
         .await?;
         let Some(owner) = owner else {
@@ -290,7 +320,7 @@ async fn lock_upload_authorities(
     }
     let mut all_grants: Vec<i64> = Vec::new();
     let mut explicit_grants: Vec<i64> = Vec::new();
-    if let Some(group) = upload.group_id {
+    if let Some(group) = scope.group_id {
         let memberships = sqlx::query(
             "select user_id from group_memberships \
              where group_id = $1 and user_id = any($2) order by user_id for share",
@@ -340,11 +370,96 @@ async fn lock_upload_authorities(
                 .api_key_id
                 .is_some_and(|id| explicit_grants.contains(&id.get())),
         );
-        if !current.allows(&mut *conn, upload, grant_rows).await? {
+        if !current.allows(&mut *conn, scope, grant_rows).await? {
             return Ok(None);
         }
     }
     Ok(current_version)
+}
+
+pub enum FileSigningOutcome {
+    Allowed(FileMeta),
+    Missing,
+    Denied,
+}
+
+/// The caller's transaction must span this validation, the policy update,
+/// actual signing, and COMMIT. No URL may escape an unknown COMMIT outcome.
+pub async fn file_for_signing(
+    conn: &mut sqlx::PgConnection,
+    item_key: &str,
+    access: LibraryAccess,
+    context: &RequestContext,
+    config: &Config,
+) -> sqlx::Result<FileSigningOutcome> {
+    if lock_file_authorities(conn, access, context, None, config)
+        .await?
+        .is_none()
+    {
+        return Ok(FileSigningOutcome::Denied);
+    }
+    // Separate statement after every authority/library wait sees the pointer
+    // protected by the shared target-library lock, not discovery's snapshot.
+    Ok(
+        match file_meta(&mut *conn, access.library_id, item_key).await? {
+            Some(meta) => FileSigningOutcome::Allowed(meta),
+            None => FileSigningOutcome::Missing,
+        },
+    )
+}
+
+pub async fn record_presign_ttl(conn: &mut sqlx::PgConnection, ttl: u32) -> sqlx::Result<()> {
+    // Policy is last in signer order. Retirement reads it without a row lock.
+    sqlx::query(
+        "update storage_policy \
+         set max_issued_presign_ttl = greatest(max_issued_presign_ttl, $1) \
+         where singleton",
+    )
+    .bind(i64::from(ttl))
+    .execute(conn)
+    .await?;
+    Ok(())
+}
+
+/// Call only inside a transaction, after all library/authority/object locks.
+/// Sort actual advisory IDs so hash collisions serialize rather than deadlock.
+pub(super) async fn lock_blob_keys(
+    conn: &mut sqlx::PgConnection,
+    keys: &[&str],
+) -> sqlx::Result<()> {
+    let ids: Vec<i32> = sqlx::query_scalar(
+        "select distinct hashtext(key) as id from unnest($1::text[]) as key order by id",
+    )
+    .bind(keys)
+    .fetch_all(&mut *conn)
+    .await?;
+    for id in ids {
+        // Two-int namespace is disjoint from single-bigint identity locks.
+        sqlx::query("select pg_advisory_xact_lock(1481593922, $1)")
+            .bind(id)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
+}
+
+/// Caller holds exclusive libraries and the complete sorted blob-lock set.
+/// Later batch removal callers must acquire that set before retiring any key.
+pub(super) async fn retire_blob(conn: &mut sqlx::PgConnection, blob_key: &str) -> sqlx::Result<()> {
+    // This fresh statement follows blob waits too. Transaction-start time and
+    // a policy snapshot taken before a delayed signer are not safe clocks.
+    sqlx::query(
+        "insert into blob_retirements (blob_key, not_before) \
+         select $1, clock_timestamp() \
+             + (max_issued_presign_ttl + 60) * interval '1 second' \
+         from storage_policy where singleton \
+         on conflict (blob_key) do update \
+         set not_before = greatest(blob_retirements.not_before, excluded.not_before)",
+    )
+    .bind(blob_key)
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 const PENDING_UPLOAD_COLUMNS: &str = "\
@@ -603,6 +718,75 @@ pub enum FileRegistrationOutcome {
     Denied,
 }
 
+pub async fn due_blob_keys(pool: &PgPool, cutoff: &str, after: &str) -> sqlx::Result<Vec<String>> {
+    // Discovery takes no queue-row locks. Keyset pagination makes a pass finite
+    // even when live references prevent claiming the earliest due rows.
+    sqlx::query_scalar(
+        "select blob_key from blob_retirements \
+         where blob_key > $1 and state <> 'deleted' \
+           and not_before <= $2::text::timestamptz \
+           and retry_after <= $2::text::timestamptz \
+         order by blob_key limit 32",
+    )
+    .bind(after)
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await
+}
+
+pub struct ClaimedBlob {
+    pub blob_key: String,
+}
+
+pub async fn claim_retired_blob(
+    pool: &PgPool,
+    blob_key: &str,
+) -> sqlx::Result<Option<ClaimedBlob>> {
+    let mut tx = pool.begin().await?;
+    lock_blob_keys(&mut tx, &[blob_key]).await?;
+    // Never fold the advisory lock into this statement: READ COMMITTED needs a
+    // new snapshot after waiting for a publisher. Count every file row globally.
+    let due: Option<bool> = sqlx::query_scalar(
+        "select state <> 'deleted' and not_before <= clock_timestamp() \
+             and retry_after <= clock_timestamp() \
+             and not exists (select 1 from file where blob_key = $1) \
+         from blob_retirements where blob_key = $1 for update",
+    )
+    .bind(blob_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if due != Some(true) {
+        return Ok(None);
+    }
+    sqlx::query(
+        "update blob_retirements set state = 'claimed', attempts = attempts + 1, \
+             retry_after = clock_timestamp() + interval '1 minute' \
+         where blob_key = $1",
+    )
+    .bind(blob_key)
+    .execute(&mut *tx)
+    .await?;
+    // An error here is unknown outcome: only a later freshly checked pass may
+    // delete. The caller receives no claim until COMMIT is acknowledged.
+    tx.commit().await?;
+    Ok(Some(ClaimedBlob {
+        blob_key: blob_key.to_owned(),
+    }))
+}
+
+pub async fn finish_retired_blob(pool: &PgPool, claim: ClaimedBlob) -> sqlx::Result<()> {
+    // Claimed remains a permanent publication barrier even if delete succeeded
+    // but this statement/acknowledgement fails. Retrying S3 delete is idempotent.
+    sqlx::query(
+        "update blob_retirements set state = 'deleted', deleted_at = clock_timestamp() \
+         where blob_key = $1 and state = 'claimed'",
+    )
+    .bind(claim.blob_key)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Atomically make one immutable candidate the registered attachment and consume
 /// its capability. Library serialization makes the file compare-and-swap safe
 /// for both existing rows and concurrent first uploads.
@@ -645,7 +829,8 @@ pub async fn register_file(
         return Ok(FileRegistrationOutcome::InvalidUpload);
     }
 
-    let Some(current_version) = lock_upload_authorities(&mut tx, &upload, context, config).await?
+    let Some(current_version) =
+        lock_file_authorities(&mut tx, access, context, Some(&upload), config).await?
     else {
         return Ok(FileRegistrationOutcome::Denied);
     };
@@ -668,14 +853,15 @@ pub async fn register_file(
         tx.commit().await?;
         return Ok(FileRegistrationOutcome::InvalidItem);
     }
-    let current_md5 = sqlx::query_scalar::<_, String>(
-        "select md5 from file where library_id = $1 and item_key = $2",
-    )
-    .bind(library_id.get())
-    .bind(item_key)
-    .fetch_optional(&mut *tx)
-    .await?;
-    let precondition_matches = match (upload.expected_md5.as_deref(), current_md5.as_deref()) {
+    let current =
+        sqlx::query("select md5, blob_key from file where library_id = $1 and item_key = $2")
+            .bind(library_id.get())
+            .bind(item_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let current_md5 = current.as_ref().map(|row| row.get::<&str, _>("md5"));
+    let old_blob = current.as_ref().map(|row| row.get::<&str, _>("blob_key"));
+    let precondition_matches = match (upload.expected_md5.as_deref(), current_md5) {
         (None, None) => true,
         (Some(expected), Some(current)) => expected.eq_ignore_ascii_case(current),
         _ => false,
@@ -687,6 +873,26 @@ pub async fn register_file(
             .await?;
         tx.commit().await?;
         return Ok(FileRegistrationOutcome::Conflict(current_version));
+    }
+    let mut blobs = vec![upload.blob_key.as_str()];
+    if let Some(old_blob) = old_blob {
+        blobs.push(old_blob);
+    }
+    lock_blob_keys(&mut tx, &blobs).await?;
+    // Fresh post-lock state forbids publication after a GC claim, including a
+    // failed deletion or crash between remote success and tombstone persistence.
+    let blocked: bool = sqlx::query_scalar(
+        "select exists (select 1 from blob_retirements \
+         where blob_key = $1 and state in ('claimed', 'deleted'))",
+    )
+    .bind(&upload.blob_key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if blocked {
+        return Ok(FileRegistrationOutcome::InvalidUpload);
+    }
+    if let Some(old_blob) = old_blob.filter(|key| *key != upload.blob_key) {
+        retire_blob(&mut tx, old_blob).await?;
     }
     let version = current_version + 1;
     sqlx::query("update library set version = $2 where id = $1")
