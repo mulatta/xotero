@@ -2337,6 +2337,210 @@ def bytes_exist(blob):
     return subprocess.run(["mc", "stat", "s3/zotero/" + blob], capture_output=True).returncode == 0
 
 try:
+    # Given a real registered attachment, partial metadata preserves its pointer
+    # and unknown fields, while explicit conversion retires exactly that pointer.
+    print("CHECKPOINT10_BEGIN", flush=True)
+    create_item("RTCNVR22")
+    token, converted, _ = candidate("RTCNVR22", b"conversion-bytes")
+    assert register("RTCNVR22", token) == 204
+    conversion_url = signed("RTCNVR22")
+    def mutate(batch, expected_status=200):
+        version = scalar("select version from library where id=1")
+        status, headers, body = request("POST", "/users/1/items", json.dumps(batch),
+            {"If-Unmodified-Since-Version": str(version), "Content-Type": "application/json"})
+        assert status == expected_status, (status, body)
+        if status == 200:
+            result = json.loads(body)
+            assert not result["failed"], result
+            assert int(headers["last-modified-version"]) == version + 1
+            assert scalar("select version from library where id=1") == version + 1
+            return version + 1, result["successful"]
+        return version, None
+
+    partial_version, result = mutate([{"key": "RTCNVR22", "lastRead": 7,
+                                      "futureField": {"nested": [3, "preserved"]}}])
+    assert result["0"]["data"]["itemType"] == "attachment"
+    assert result["0"]["data"]["linkMode"] == "imported_file"
+    assert scalar("select blob_key from file where library_id=1 and item_key='RTCNVR22'") == converted
+    assert scalar("select count(*) from blob_retirements where blob_key=%s", (converted,)) == 0
+    assert download(signed("RTCNVR22")) == (200, b"conversion-bytes")
+    conversion_start = scalar("select extract(epoch from clock_timestamp())")
+    conversion_version, result = mutate([{"key": "RTCNVR22", "itemType": "book"}])
+    assert conversion_version == partial_version + 1
+    assert result["0"]["data"]["futureField"] == {"nested": [3, "preserved"]}
+    assert scalar("select version from object where library_id=1 and key='RTCNVR22'") == conversion_version
+    assert scalar("select count(*) from file where library_id=1 and item_key='RTCNVR22'") == 0
+    assert request("GET", "/users/1/items/RTCNVR22/file")[0] == 404
+    assert scalar("select count(*) from blob_retirements where blob_key=%s", (converted,)) == 1, \
+        "checkpoint10 conversion removed reference without retirement"
+    conversion_deadline = scalar("select extract(epoch from not_before) from blob_retirements where blob_key=%s",
+                                 (converted,))
+    ttl = scalar("select max_issued_presign_ttl from storage_policy")
+    assert conversion_deadline >= conversion_start + ttl + 60
+    assert download(conversion_url) == (200, b"conversion-bytes")
+    print("RETIREMENT_CONVERSION", json.dumps({"version": conversion_version,
+          "deadline": str(conversion_deadline), "unknown_json": True, "partial_pointer": True}), flush=True)
+
+    # Given duplicate keys, sequential intermediate conversion still removes the
+    # old identity even if the final merged JSON is a stored attachment again.
+    create_item("RTDUPL22")
+    token, duplicate_blob, _ = candidate("RTDUPL22", b"duplicate-bytes")
+    assert register("RTDUPL22", token) == 204
+    duplicate_version, result = mutate([
+        {"key": "RTDUPL22", "itemType": "book", "futureField": {"kept": True}},
+        {"key": "RTDUPL22", "itemType": "attachment"}])
+    assert result["0"]["data"]["itemType"] == "book"
+    assert result["1"]["data"]["itemType"] == "attachment"
+    assert result["1"]["data"]["linkMode"] == "imported_file"
+    assert result["1"]["data"]["futureField"] == {"kept": True}
+    assert result["0"]["version"] == result["1"]["version"] == duplicate_version
+    assert scalar("select count(*) from file where library_id=1 and item_key='RTDUPL22'") == 0
+    assert scalar("select state from blob_retirements where blob_key=%s", (duplicate_blob,)) == "queued"
+    print("RETIREMENT_DUPLICATE intermediate_conversion=true per_index_preserved=true", flush=True)
+
+    # Given a shared key, first deletion cannot collect live bytes; last deletion
+    # renews grace from its own removal, then once maintenance deletes only once.
+    create_item("RTSHRA22")
+    create_item("RTSHRB22")
+    token, shared_blob, _ = candidate("RTSHRA22", b"shared-removal")
+    assert register("RTSHRA22", token) == 204
+    sql("insert into file (library_id,item_key,md5,blob_md5,filename,filesize,mtime,version,blob_key) "
+        "select library_id,'RTSHRB22',md5,blob_md5,filename,filesize,mtime,version,blob_key "
+        "from file where library_id=1 and item_key='RTSHRA22'")
+    shared_url = signed("RTSHRB22")
+    def remove(keys, expected_status=204):
+        version = scalar("select version from library where id=1")
+        status, headers, body = request("DELETE", "/users/1/items?itemKey=" + ",".join(keys),
+            extra={"If-Unmodified-Since-Version": str(version)})
+        assert status == expected_status, (status, body)
+        if status == 204:
+            assert int(headers["last-modified-version"]) == version + 1
+            assert scalar("select version from library where id=1") == version + 1
+            for key in keys:
+                assert scalar("select version from deletion where library_id=1 and kind='item' and key=%s",
+                              (key,)) == version + 1
+        return version
+    remove(["RTSHRA22"])
+    first_deadline = scalar("select not_before from blob_retirements where blob_key=%s", (shared_blob,))
+    assert download(shared_url) == (200, b"shared-removal")
+    due(shared_blob)
+    gc()
+    assert bytes_exist(shared_blob) and download(signed("RTSHRB22")) == (200, b"shared-removal")
+    # Put deadline back at the first promise; no sleep is needed for strict
+    # extension because PostgreSQL clock_timestamp follows the first removal.
+    sql("update blob_retirements set not_before=%s where blob_key=%s", (first_deadline, shared_blob))
+    last_removal_start = scalar("select extract(epoch from clock_timestamp())")
+    remove(["RTSHRB22"])
+    last_deadline = scalar("select not_before from blob_retirements where blob_key=%s", (shared_blob,))
+    assert last_deadline > first_deadline
+    assert last_deadline.timestamp() >= float(last_removal_start + ttl + 60)
+    assert download(shared_url) == (200, b"shared-removal")
+    gc()
+    assert bytes_exist(shared_blob)
+    due(shared_blob)
+    gc()
+    gc()
+    assert not bytes_exist(shared_blob)
+    assert scalar("select state from blob_retirements where blob_key=%s", (shared_blob,)) == "deleted"
+    assert sum(row[:2] == ("backend-deleted", shared_blob) for row in events) == 1
+    print("RETIREMENT_SHARED", json.dumps({"first_deadline": str(first_deadline),
+          "last_deadline": str(last_deadline), "first_download": True, "deletes": 1}), flush=True)
+
+    # Given a failure after an earlier removal in the same batch, PostgreSQL
+    # restores both pointers, JSON, version and the earlier retirement upsert.
+    for key in ["RTATMA22", "RTATMB22"]:
+        create_item(key)
+        token, blob, _ = candidate(key, key.encode())
+        assert register(key, token) == 204
+        # Stable fixture keys make distinct advisory IDs deterministic, instead
+        # of assuming randomly allocated upload keys never hash-collide.
+        stable_blob = "checkpoint10-batch-" + key
+        subprocess.run(["mc", "mv", "s3/zotero/" + blob, "s3/zotero/" + stable_blob], check=True)
+        sql("update file set blob_key=%s where library_id=1 and item_key=%s", (stable_blob, key))
+    before_rows = sql("select item_key,blob_key,version from file where item_key=any(%s) order by item_key",
+                      (["RTATMA22", "RTATMB22"],)).fetchall()
+    before_objects = sql("select key,data,version from object where library_id=1 and key=any(%s) order by key",
+                         (["RTATMA22", "RTATMB22"],)).fetchall()
+    sql("create function checkpoint10_fail() returns trigger language plpgsql as $$ "
+        "begin if new.key='RTATMB22' then raise exception 'checkpoint10 mutation failure'; end if; "
+        "return new; end $$; create trigger checkpoint10_fail before insert on deletion "
+        "for each row execute function checkpoint10_fail()")
+    rollback_version = remove(["RTATMA22", "RTATMB22"], 500)
+    assert scalar("select version from library where id=1") == rollback_version
+    assert sql("select item_key,blob_key,version from file where item_key=any(%s) order by item_key",
+               (["RTATMA22", "RTATMB22"],)).fetchall() == before_rows
+    assert sql("select key,data,version from object where library_id=1 and key=any(%s) order by key",
+               (["RTATMA22", "RTATMB22"],)).fetchall() == before_objects
+    assert scalar("select count(*) from blob_retirements where blob_key=any(%s)",
+                  ([row[1] for row in before_rows],)) == 0
+    sql("drop trigger checkpoint10_fail on deletion; drop function checkpoint10_fail()")
+    print("RETIREMENT_ROLLBACK pointers_versions_json_queue_restored=true", flush=True)
+
+    sql("create function checkpoint10_fail() returns trigger language plpgsql as $$ "
+        "begin if new.key='RTATMB22' then raise exception 'checkpoint10 mutation failure'; end if; "
+        "return new; end $$; create trigger checkpoint10_fail before update on object "
+        "for each row execute function checkpoint10_fail()")
+    rollback_version, _ = mutate([{"key": "RTATMA22", "itemType": "book"},
+                                 {"key": "RTATMB22", "itemType": "book"}], 500)
+    assert scalar("select version from library where id=1") == rollback_version
+    assert sql("select item_key,blob_key,version from file where item_key=any(%s) order by item_key",
+               (["RTATMA22", "RTATMB22"],)).fetchall() == before_rows
+    assert sql("select key,data,version from object where library_id=1 and key=any(%s) order by key",
+               (["RTATMA22", "RTATMB22"],)).fetchall() == before_objects
+    assert scalar("select count(*) from blob_retirements where blob_key=any(%s)",
+                  ([row[1] for row in before_rows],)) == 0
+    sql("drop trigger checkpoint10_fail on object; drop function checkpoint10_fail()")
+    print("RETIREMENT_CONVERSION_ROLLBACK earlier_removal_restored=true", flush=True)
+
+    # Given two touched pointers in input order opposite their numeric lock IDs,
+    # the complete ordered set precedes any retirement table write. The precise
+    # PostgreSQL lock event is subscribed before triggering the HTTP mutation.
+    ordered = sql("select item_key,blob_key,hashtext(blob_key) from file "
+                  "where item_key=any(%s) order by hashtext(blob_key)",
+                  (["RTATMA22", "RTATMB22"],)).fetchall()
+    assert ordered[0][2] != ordered[1][2], ordered
+    with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+        holder.execute("select pg_advisory_xact_lock(1481593922,%s)", (ordered[1][2],))
+        with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=1) as workers:
+            mutation = workers.submit(mutate, [
+                {"key": ordered[1][0], "itemType": "book"},
+                {"key": ordered[0][0], "itemType": "book"}])
+            waiting = blocked(next_message, "pg_advisory_xact_lock")
+            pid = waiting[0][0]
+            locks = sql("select objid::bigint,granted from pg_locks where pid=%s "
+                        "and locktype='advisory' and classid=1481593922 order by granted desc",
+                        (pid,)).fetchall()
+            assert (ordered[0][2] % (2**32), True) in locks, locks
+            assert (ordered[1][2] % (2**32), False) in locks, locks
+            assert scalar("select count(*) from pg_locks where pid=%s "
+                          "and relation='blob_retirements'::regclass", (pid,)) == 0
+            release = scalar("select extract(epoch from clock_timestamp())")
+            holder.commit()
+            mutation.result(timeout=20)
+    for _, blob, _ in ordered:
+        deadline = scalar("select extract(epoch from not_before) from blob_retirements where blob_key=%s",
+                          (blob,))
+        assert deadline >= release + ttl + 60
+    print("RETIREMENT_BATCH_LOCKS", json.dumps({"numeric_ids": [row[2] for row in ordered],
+          "complete_before_queue": True, "fresh_after_wait": True}), flush=True)
+
+    # Given orphan/stale file rows, discovery cannot use the attachment join.
+    # Their removal still renews the shared original blob's grace.
+    # Seed legacy rows without requiring attachment JSON or a live original pointer.
+    for key in ["RTARPH22", "RTSTALE2"]:
+        sql("insert into file (library_id,item_key,md5,blob_md5,filename,filesize,mtime,version,blob_key) "
+            "values (1,%s,%s,%s,'legacy',8,9,%s,%s)",
+            (key, hashlib.md5(b"RTATMA22").hexdigest(), hashlib.md5(b"RTATMA22").hexdigest(),
+             rollback_version, before_rows[0][1]))
+    sql("insert into object (library_id,kind,key,version,data) values "
+        "(1,'item','RTSTALE2',%s,'{\"itemType\":\"book\",\"futureField\":true}')", (rollback_version,))
+    prior = scalar("select not_before from blob_retirements where blob_key=%s", (before_rows[0][1],))
+    mutate([{"key": "RTARPH22", "itemType": "book"}, {"key": "RTSTALE2", "title": "legacy"}])
+    assert scalar("select count(*) from file where item_key=any(%s)", (["RTARPH22", "RTSTALE2"],)) == 0
+    assert scalar("select not_before from blob_retirements where blob_key=%s", (before_rows[0][1],)) > prior
+    print("RETIREMENT_ORPHAN_STALE direct_file_discovery=true removed=true grace_extended=true", flush=True)
+    print("CHECKPOINT10_END", flush=True)
+
     # Given a registered pointer and an issued high-TTL URL, replacement must
     # atomically enqueue old bytes while a lower-TTL restart preserves promise.
     create_item("GCGRAC22")
@@ -2561,6 +2765,8 @@ finally:
             process.kill()
         process.communicate(timeout=10)
     sql("drop trigger if exists checkpoint9_fail on file; drop function if exists checkpoint9_fail()")
+    sql("drop trigger if exists checkpoint10_fail on deletion; "
+        "drop trigger if exists checkpoint10_fail on object; drop function if exists checkpoint10_fail()")
     sql("drop trigger if exists checkpoint9_sign_commit on storage_policy; "
         "drop function if exists checkpoint9_sign_commit()")
     override.unlink(missing_ok=True)

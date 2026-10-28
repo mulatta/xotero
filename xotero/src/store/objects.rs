@@ -261,13 +261,23 @@ pub async fn write(
         Outcome::Conflict(current) => return Ok(ObjectMutation::Conflict(current)),
     };
 
+    let batch: Vec<(String, Value)> = batch
+        .into_iter()
+        .map(|provided| {
+            let key = provided
+                .get("key")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .unwrap_or_else(generate_key);
+            (key, provided)
+        })
+        .collect();
+    if kind == "item" {
+        let keys: Vec<&str> = batch.iter().map(|(key, _)| key.as_str()).collect();
+        super::files::lock_file_references(&mut tx, library_id, &keys).await?;
+    }
     let mut successful = Map::new();
-    for (index, provided) in batch.into_iter().enumerate() {
-        let key = provided
-            .get("key")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .unwrap_or_else(generate_key);
+    for (index, (key, provided)) in batch.into_iter().enumerate() {
         // Start from the existing object (read in this txn so the version guard
         // serialises it) and overlay the provided top-level fields; a new key has
         // nothing to merge into, so the provided object is stored as-is.
@@ -317,11 +327,7 @@ pub async fn write(
             // File metadata is valid only while one stored attachment identity
             // remains continuous. Reusing a deleted or converted key must not
             // resurrect bytes registered for its previous identity.
-            sqlx::query("delete from file where library_id = $1 and item_key = $2")
-                .bind(library_id.get())
-                .bind(&key)
-                .execute(&mut *tx)
-                .await?;
+            super::files::remove_file_reference(&mut tx, library_id, &key).await?;
         }
         sqlx::query("delete from deletion where library_id = $1 and kind = $2 and key = $3")
             .bind(library_id.get())
@@ -358,6 +364,10 @@ pub async fn delete(
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(ObjectMutation::Conflict(current)),
     };
+    if kind == "item" {
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        super::files::lock_file_references(&mut tx, library_id, &keys).await?;
+    }
     for key in keys {
         if kind == "item" && !allow_stored_file_write {
             let data: Option<Value> = sqlx::query_scalar(
@@ -379,11 +389,7 @@ pub async fn delete(
             .execute(&mut *tx)
             .await?;
         if kind == "item" {
-            sqlx::query("delete from file where library_id = $1 and item_key = $2")
-                .bind(library_id.get())
-                .bind(key)
-                .execute(&mut *tx)
-                .await?;
+            super::files::remove_file_reference(&mut tx, library_id, key).await?;
         }
         sqlx::query(
             "insert into deletion (library_id, kind, key, version) values ($1, $2, $3, $4) \

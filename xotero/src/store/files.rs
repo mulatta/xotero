@@ -462,6 +462,54 @@ pub(super) async fn retire_blob(conn: &mut sqlx::PgConnection, blob_key: &str) -
     Ok(())
 }
 
+/// Caller holds the exclusive library lock. Lock every touched object's current
+/// references before batch mutations, including intermediate duplicate-key
+/// conversions and stale file rows hidden by the attachment metadata join.
+pub(super) async fn lock_file_references(
+    conn: &mut sqlx::PgConnection,
+    library_id: LibraryId,
+    item_keys: &[&str],
+) -> sqlx::Result<()> {
+    sqlx::query(
+        "select key from object where library_id = $1 and kind = 'item' \
+         and key = any($2) order by key for update",
+    )
+    .bind(library_id.get())
+    .bind(item_keys)
+    .fetch_all(&mut *conn)
+    .await?;
+    let blobs: Vec<String> = sqlx::query_scalar(
+        "select blob_key from file where library_id = $1 and item_key = any($2)",
+    )
+    .bind(library_id.get())
+    .bind(item_keys)
+    .fetch_all(&mut *conn)
+    .await?;
+    let keys: Vec<&str> = blobs.iter().map(String::as_str).collect();
+    lock_blob_keys(conn, &keys).await
+}
+
+/// Caller holds ordered library/object locks and the complete batch blob-lock
+/// set. Retire actual removals even while another global reference remains, so
+/// the last reference's removal always renews the safe URL grace.
+pub(super) async fn remove_file_reference(
+    conn: &mut sqlx::PgConnection,
+    library_id: LibraryId,
+    item_key: &str,
+) -> sqlx::Result<()> {
+    let blob: Option<String> = sqlx::query_scalar(
+        "delete from file where library_id = $1 and item_key = $2 returning blob_key",
+    )
+    .bind(library_id.get())
+    .bind(item_key)
+    .fetch_optional(&mut *conn)
+    .await?;
+    if let Some(blob) = blob {
+        retire_blob(conn, &blob).await?;
+    }
+    Ok(())
+}
+
 const PENDING_UPLOAD_COLUMNS: &str = "\
     library_id, group_id, authorizer_key_hash, bootstrap_user_id, \
     item_key, expected_md5, blob_key, md5, upload_md5, filename, filesize, \
