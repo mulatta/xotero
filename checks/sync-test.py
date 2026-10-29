@@ -556,7 +556,7 @@ with subtest("expired upload candidates are deleted before their rows"):
     restart_xotero()
     assert psql("select count(*) from pending_uploads where expires_at <> 'infinity'::timestamptz") == "0"
 
-with subtest("concurrent replacements compare-and-swap the registered md5"):
+with subtest("serial replacements compare-and-swap the registered md5"):
     world_md5 = "7d793037a0760186574b0282f2f435e7"
     first_md5 = "8b04d5e3775d298e78455efc5ca404d5"
     other_md5 = "795f3202b17cb6bc3d4b771d8c6c9eaf"
@@ -2162,6 +2162,8 @@ class Proxy(BaseHTTPRequestHandler):
         request = urlsplit(self.path)
         key = unquote(request.path.removeprefix("/zotero/"))
         deleting = self.command == "DELETE" and not request.query
+        if not deleting:
+            event("request-" + self.command, key)
         if deleting:
             event("delete-entered", key)
             gate = before_delete.get(key)
@@ -2197,6 +2199,9 @@ class Proxy(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             event("collector-disconnected", key)
     do_GET = relay
+    do_HEAD = relay
+    do_PUT = relay
+    do_POST = relay
     do_DELETE = relay
     def log_message(self, *_args):
         pass
@@ -2336,7 +2341,249 @@ def restart():
 def bytes_exist(blob):
     return subprocess.run(["mc", "stat", "s3/zotero/" + blob], capture_output=True).returncode == 0
 
+def registration_state(item):
+    return scalar("select jsonb_build_object('library', (select version from library where id=1), "
+        "'file', (select to_jsonb(f) from file f where library_id=1 and item_key=%s), "
+        "'object', (select to_jsonb(o) from object o where library_id=1 and key=%s and kind='item'), "
+        "'pending', (select coalesce(jsonb_agg(to_jsonb(p) order by token_hash),'[]') "
+        "from pending_uploads p where library_id=1 and item_key=%s), "
+        "'retirements', (select coalesce(jsonb_agg(to_jsonb(r) order by blob_key),'[]') "
+        "from blob_retirements r))", (item, item, item))
+
+def lock_edges(next_message, holder_pid, fragment, count):
+    # Recursive edges include soft queue blockers: the second tuple waiter can
+    # wait on the first contender rather than directly on the fixture holder.
+    while True:
+        message = next_message()
+        if "still waiting" not in message:
+            continue
+        rows = sql("with recursive edges(pid, path) as ("
+            "select pid, array[pid] from pg_stat_activity where usename='xotero' "
+            "and wait_event_type='Lock' and query like %s union all "
+            "select b, path || b from edges cross join lateral unnest(pg_blocking_pids(pid)) b "
+            "where not b=any(path)) "
+            "select a.pid, pg_blocking_pids(a.pid), a.query from pg_stat_activity a "
+            "where a.pid in (select path[1] from edges where pid=%s) "
+            "and a.wait_event_type='Lock' order by a.pid",
+            ("%" + fragment + "%", holder_pid)).fetchall()
+        if len(rows) == count:
+            print("CHECKPOINT12_LOCK_EDGES", json.dumps(rows), "holder", holder_pid, flush=True)
+            return rows
+
+def assert_registered(item, blob, digest, content, version):
+    state = registration_state(item)
+    assert state["library"] == version
+    assert state["file"]["blob_key"] == blob and state["file"]["md5"] == digest
+    assert state["file"]["version"] == version
+    assert state["object"]["version"] == version
+    assert state["object"]["data"]["md5"] == digest
+    assert state["object"]["data"]["version"] == version
+    assert download(signed(item)) == (200, content)
+    return state
+
+def commit_relay(control, directory):
+    import pwd
+    import struct
+    identity = pwd.getpwnam("xotero")
+    os.setgid(identity.pw_gid)
+    os.setuid(identity.pw_uid)
+    sessions = {}
+    guard = threading.Lock()
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(directory / ".s.PGSQL.5432"))
+    listener.listen()
+    def exact(sock, length):
+        data = b""
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                raise EOFError()
+            data += chunk
+        return data
+    def frame(sock):
+        header = exact(sock, 5)
+        length = struct.unpack("!I", header[1:])[0]
+        assert length >= 4, length
+        return header[:1], exact(sock, length - 4), header
+    def session(client):
+        upstream = socket.socket(socket.AF_UNIX)
+        state = {"armed": False, "commit": False, "pid": None, "tag": False}
+        def frontend():
+            try:
+                while True:
+                    kind, body, header = frame(client)
+                    if state["armed"] and kind == b"Q" and body == b"COMMIT\x00":
+                        state["commit"] = True
+                    upstream.sendall(header + body)
+            except (EOFError, OSError):
+                upstream.shutdown(socket.SHUT_RDWR)
+        try:
+            upstream.connect("/run/postgresql/.s.PGSQL.5432")
+            header = exact(client, 4)
+            startup = exact(client, struct.unpack("!I", header)[0] - 4)
+            # sslmode=disable guarantees an authentic, unencrypted startup.
+            assert struct.unpack("!I", startup[:4])[0] == 196608
+            upstream.sendall(header + startup)
+            worker = threading.Thread(target=frontend, daemon=True)
+            worker.start()
+            while True:
+                kind, body, header = frame(upstream)
+                if kind == b"K":
+                    state["pid"] = struct.unpack("!II", body)[0]
+                    with guard:
+                        sessions[state["pid"]] = state
+                if state["commit"]:
+                    if kind == b"C":
+                        assert body == b"COMMIT\x00", body
+                        state["tag"] = True
+                    elif kind == b"Z":
+                        assert state["tag"] and body == b"I", (state, body)
+                        control.send({"event": "server_commit_completed", "pid": state["pid"],
+                            "command_complete_hex": b"COMMIT\x00".hex(),
+                            "ready_for_query_hex": body.hex(), "ack_forwarded": False})
+                        return
+                    else:
+                        raise AssertionError(("unexpected COMMIT response", kind, body))
+                else:
+                    client.sendall(header + body)
+        except (EOFError, OSError):
+            pass
+        except BaseException as error:
+            control.send({"error": repr(error), "pid": state["pid"]})
+        finally:
+            for sock in (client, upstream):
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                sock.close()
+            with guard:
+                sessions.pop(state["pid"], None)
+    def accept():
+        while True:
+            client, _ = listener.accept()
+            threading.Thread(target=session, args=(client,), daemon=True).start()
+    threading.Thread(target=accept, daemon=True).start()
+    control.send({"ready": os.getpid()})
+    while True:
+        pid = control.recv()
+        with guard:
+            assert pid in sessions, (pid, list(sessions))
+            sessions[pid]["armed"] = True
+        control.send({"armed": pid})
+
 try:
+    for same_token, item in ((False, "RACEDT22"), (True, "RACEST22")):
+        create_item(item)
+        token, baseline, baseline_md5 = candidate(item, b"race-baseline")
+        assert register(item, token) == 204
+        contents = [b"race-first", b"race-second"]
+        candidates = [candidate(item, contents[0], baseline_md5)]
+        candidates.append(candidates[0] if same_token else candidate(item, contents[1], baseline_md5))
+        assert all(row[2] != baseline_md5 for row in candidates)
+        version = scalar("select version from library where id=1")
+        with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+            holder_pid = holder.info.backend_pid
+            if same_token:
+                holder.execute("select 1 from pending_uploads where token_hash=%s for update",
+                    (hashlib.sha256(candidates[0][0].encode()).digest(),))
+                fragment = "from pending_uploads"
+            else:
+                holder.execute("select version from library where id=1 for update")
+                fragment = "select version from library"
+            with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=2) as workers:
+                futures = [workers.submit(register, item, row[0]) for row in candidates]
+                try:
+                    edges = lock_edges(next_message, holder_pid, fragment, 2)
+                finally:
+                    holder.rollback()
+                statuses = [future.result(timeout=20) for future in futures]
+        assert sorted(statuses) == ([204, 400] if same_token else [204, 412]), statuses
+        winner = statuses.index(204)
+        token, blob, digest = candidates[winner]
+        state = assert_registered(item, blob, digest, contents[0 if same_token else winner], version + 1)
+        for row in candidates:
+            assert register(item, row[0]) == 400
+        assert registration_state(item) == state
+        assert bytes_exist(baseline) and bytes_exist(blob)
+        print("CHECKPOINT12_OVERLAP", json.dumps({"same_token": same_token,
+            "statuses": statuses, "edges": edges, "before_version": version,
+            "after": state, "winner": winner}), flush=True)
+
+    # The service, including any error compensation, uses the observed S3 relay.
+    # The PostgreSQL relay preserves peer authentication and per-backend sessions.
+    import multiprocessing
+    import pwd
+    pg_directory = root / "pg"
+    pg_override = Path("/run/systemd/system/xotero.service.d/checkpoint12.conf")
+    print("CHECKPOINT12_RESOURCES", str(pg_directory), str(pg_override), flush=True)
+    pg_directory.mkdir()
+    identity = pwd.getpwnam("xotero")
+    os.chown(pg_directory, identity.pw_uid, identity.pw_gid)
+    parent_control, child_control = multiprocessing.Pipe()
+    relay_process = multiprocessing.get_context("fork").Process(
+        target=commit_relay, args=(child_control, pg_directory), daemon=True)
+    print("CHECKPOINT12_RELAY_CREATING", flush=True)
+    relay_process.start()
+    print("CHECKPOINT12_RELAY_PID", relay_process.pid, flush=True)
+    try:
+        assert parent_control.poll(20)
+        assert parent_control.recv() == {"ready": relay_process.pid}
+        pg_override.write_text("[Service]\n"
+            "Environment=\"XOTERO_DATABASE_URL=postgresql:///xotero?host=" + str(pg_directory) +
+            "&sslmode=disable&application_name=checkpoint12\"\n"
+            f"Environment=XOTERO_S3_ENDPOINT=http://127.0.0.1:{proxy.server_port}\n")
+        subprocess.run(["systemctl", "daemon-reload"], check=True)
+        restart()
+        create_item("ACKLST22")
+        token, ack_old, digest = candidate("ACKLST22", b"ack-old")
+        assert register("ACKLST22", token) == 204
+        token, ack_new, digest = candidate("ACKLST22", b"ack-new", digest)
+        before = registration_state("ACKLST22")
+        # Positive endpoint control proves the running service traverses relay.
+        assert download(signed("ACKLST22")) == (200, b"ack-old")
+        assert any(kind == "request-GET" and key == ack_old for kind, key, _ in events)
+        with psycopg.connect("dbname=xotero user=root host=/run/postgresql") as holder:
+            holder.execute("select version from library where id=1 for update")
+            with journal("postgresql") as next_message, ThreadPoolExecutor(max_workers=1) as workers:
+                future = workers.submit(register, "ACKLST22", token)
+                try:
+                    edges = lock_edges(next_message, holder.info.backend_pid, "select version from library", 1)
+                    target_pid = edges[0][0]
+                    parent_control.send(target_pid)
+                    assert parent_control.poll(20)
+                    assert parent_control.recv() == {"armed": target_pid}
+                finally:
+                    holder.rollback()
+                assert future.result(timeout=20) == 500
+        assert parent_control.poll(20)
+        cut = parent_control.recv()
+        assert cut.get("event") == "server_commit_completed" and cut["pid"] == target_pid, cut
+        after = assert_registered("ACKLST22", ack_new, digest, b"ack-new", before["library"] + 1)
+        assert after["pending"] == []
+        assert any(row["blob_key"] == ack_old and row["state"] == "queued" for row in after["retirements"])
+        assert bytes_exist(ack_old) and bytes_exist(ack_new)
+        assert register("ACKLST22", token) == 400
+        assert registration_state("ACKLST22") == after
+        assert not any(kind == "delete-entered" and key == ack_new for kind, key, _ in events)
+        print("CHECKPOINT12_COMMIT_PROXY", json.dumps({"cut": cut, "edges": edges,
+            "before": before, "after": after, "http": 500, "retry": 400,
+            "candidate_delete": False, "candidate_bytes": True, "service_s3_relay": True}), flush=True)
+    finally:
+        try:
+            pg_override.unlink(missing_ok=True)
+            subprocess.run(["systemctl", "daemon-reload"], check=True)
+            restart()
+        finally:
+            relay_process.terminate()
+            relay_process.join(timeout=10)
+            assert not relay_process.is_alive()
+            parent_control.close()
+            child_control.close()
+            (pg_directory / ".s.PGSQL.5432").unlink(missing_ok=True)
+            pg_directory.rmdir()
+            print("CHECKPOINT12_RELAY_CLEANUP", relay_process.pid, relay_process.exitcode, flush=True)
+
     # Given a real registered attachment, partial metadata preserves its pointer
     # and unknown fields, while explicit conversion retires exactly that pointer.
     print("CHECKPOINT10_BEGIN", flush=True)
@@ -2575,6 +2822,7 @@ try:
     assert register("GCATAM22", token) == 204
     token, atomic_new, _ = candidate("GCATAM22", b"atomic-new", digest)
     version = scalar("select version from library where id=1")
+    atomic_before = registration_state("GCATAM22")
     sql("create function checkpoint9_fail() returns trigger language plpgsql as $$ "
         "begin raise exception 'checkpoint9 rollback'; end $$; "
         "create trigger checkpoint9_fail before update on file for each row "
@@ -2584,6 +2832,10 @@ try:
     assert scalar("select version from library where id=1") == version
     assert scalar("select blob_key from file where item_key='GCATAM22' and library_id=1") == atomic_old
     assert bytes_exist(atomic_old) and bytes_exist(atomic_new)
+    assert registration_state("GCATAM22") == atomic_before
+    print("CHECKPOINT12_PRECOMMIT_ROLLBACK", json.dumps({"http": 500,
+        "before": atomic_before, "after": registration_state("GCATAM22"),
+        "old_bytes": True, "candidate_bytes": True}), flush=True)
     sql("drop trigger checkpoint9_fail on file; drop function checkpoint9_fail()")
     assert register("GCATAM22", token) == 204
     print("GC_ATOMIC rollback_pointer_version_queue=true successful_retry=204", flush=True)
