@@ -10,6 +10,197 @@ use crate::domain::{
 
 use super::is_stored_file_attachment;
 
+#[derive(Debug)]
+pub enum LegacyReconciliationError {
+    Database(sqlx::Error),
+    Storage(crate::s3::S3Error),
+    Invalid(&'static str),
+}
+
+impl std::fmt::Display for LegacyReconciliationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Database(error) => write!(formatter, "legacy reconciliation database: {error}"),
+            Self::Storage(error) => write!(formatter, "legacy reconciliation storage: {error}"),
+            Self::Invalid(reason) => write!(formatter, "legacy reconciliation: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for LegacyReconciliationError {}
+
+impl From<sqlx::Error> for LegacyReconciliationError {
+    fn from(error: sqlx::Error) -> Self {
+        Self::Database(error)
+    }
+}
+
+impl From<crate::s3::S3Error> for LegacyReconciliationError {
+    fn from(error: crate::s3::S3Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+/// Resolve the finite 0015 candidate set before serving or background cleanup.
+/// The complete pass is atomic. Pages bound application descriptor memory; the
+/// 4096-row ceiling also bounds lock cardinality (at most 8192 blob identities).
+/// Larger installations fail explicitly rather than partially correcting data.
+///
+/// # Errors
+/// Fails on stale/malformed descriptors, unavailable retirement targets, storage
+/// errors, or unverifiable bytes. COMMIT errors have unknown outcome; callers
+/// must never compensate by deleting storage objects.
+pub async fn reconcile_legacy_blobs(
+    pool: &PgPool,
+    storage: &crate::s3::Storage,
+    timeout: std::time::Duration,
+) -> Result<(), LegacyReconciliationError> {
+    let mut tx = pool.begin().await?;
+    // Only this reconciler writes markers. Serialize passes before acquiring
+    // libraries; no operational path ever requests this marker table lock.
+    sqlx::query("lock table legacy_blob_reconciliation in share row exclusive mode")
+        .execute(&mut *tx)
+        .await?;
+    let count: i64 = sqlx::query_scalar("select count(*) from legacy_blob_reconciliation")
+        .fetch_one(&mut *tx)
+        .await?;
+    if count > 4096 {
+        return Err(LegacyReconciliationError::Invalid(
+            "candidate count exceeds bounded startup limit of 4096",
+        ));
+    }
+    // All earlier locks for the entire pass precede every blob lock. execute
+    // drains rows without retaining an installation-sized descriptor vector.
+    sqlx::query(
+        "select l.id from library l where exists \
+         (select 1 from legacy_blob_reconciliation r where r.library_id = l.id) \
+         order by l.id for update of l",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "select o.key from object o join legacy_blob_reconciliation r \
+         on r.library_id = o.library_id and r.item_key = o.key \
+         where o.kind = 'item' order by o.library_id, o.key for update of o",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "select f.item_key from file f join legacy_blob_reconciliation r \
+         using (library_id, item_key) order by f.library_id, f.item_key for update of f",
+    )
+    .execute(&mut *tx)
+    .await?;
+    // Same global two-int namespace as lock_blob_keys. Sorting the UNION of
+    // both pointer sets on the database side establishes order across pages,
+    // including hash collisions and shared bare keys.
+    sqlx::query(
+        "do $$ declare blob_id integer; begin \
+         for blob_id in \
+             select hashtext(blob_key) from legacy_blob_reconciliation \
+             union select hashtext(item_key) from legacy_blob_reconciliation \
+             order by 1 \
+         loop perform pg_advisory_xact_lock(1481593922, blob_id); end loop; \
+         end $$",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let mut after = (0i64, String::new());
+    loop {
+        // Fresh READ COMMITTED snapshots follow every lock wait. Captured
+        // pointer, byte hash, size and compression must still match exactly.
+        let rows = sqlx::query(
+            "select r.*, \
+             (f.blob_key, f.blob_md5, f.filesize, f.compressed) is not distinct from \
+             (r.blob_key, r.blob_md5, r.filesize, r.compressed) as unchanged, \
+             exists (select 1 from blob_retirements b \
+                 where b.blob_key = r.blob_key \
+                 and b.state in ('claimed', 'deleted')) as current_blocked, \
+             exists (select 1 from blob_retirements b \
+                 where b.blob_key = r.item_key \
+                 and b.state in ('claimed', 'deleted')) as bare_blocked \
+             from legacy_blob_reconciliation r \
+             left join file f using (library_id, item_key) \
+             where (r.library_id, r.item_key) > ($1, $2) \
+             order by r.library_id, r.item_key limit 32",
+        )
+        .bind(after.0)
+        .bind(&after.1)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for row in rows {
+            let library: i64 = row.try_get("library_id")?;
+            let key: String = row.try_get("item_key")?;
+            let current: String = row.try_get("blob_key")?;
+            let hash: String = row.try_get("blob_md5")?;
+            let size: i64 = row.try_get("filesize")?;
+            // Historical metadata has no item-key constraint. In particular,
+            // an empty bare key would address the bucket rather than an object.
+            if key.is_empty() || key.contains('/') || matches!(key.as_str(), "." | "..") {
+                return Err(LegacyReconciliationError::Invalid(
+                    "unsupported recorded legacy item key",
+                ));
+            }
+            if !row.try_get::<bool, _>("unchanged")? {
+                return Err(LegacyReconciliationError::Invalid(
+                    "recorded file descriptor changed",
+                ));
+            }
+            if row.try_get::<bool, _>("current_blocked")? {
+                return Err(LegacyReconciliationError::Invalid(
+                    "current object is claimed or deleted",
+                ));
+            }
+            if size < 0 || hash.len() != 32 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(LegacyReconciliationError::Invalid(
+                    "invalid recorded byte size or blob MD5",
+                ));
+            }
+            let size = u64::try_from(size)
+                .map_err(|_| LegacyReconciliationError::Invalid("invalid recorded byte size"))?;
+            if !storage
+                .verify_object(&current, size, &hash, timeout)
+                .await?
+            {
+                if row.try_get::<bool, _>("bare_blocked")? {
+                    return Err(LegacyReconciliationError::Invalid(
+                        "bare object is claimed or deleted",
+                    ));
+                }
+                if !storage.verify_object(&key, size, &hash, timeout).await? {
+                    return Err(LegacyReconciliationError::Invalid(
+                        "neither current nor bare object verifies",
+                    ));
+                }
+                // Blob locks protect the fresh retirement checks and earlier
+                // file locks protect every descriptor through publication.
+                sqlx::query(
+                    "update file set blob_key = $3 where library_id = $1 and item_key = $2",
+                )
+                .bind(library)
+                .bind(&key)
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+                retire_blob(&mut tx, &current).await?;
+            }
+            sqlx::query(
+                "delete from legacy_blob_reconciliation where library_id = $1 and item_key = $2",
+            )
+            .bind(library)
+            .bind(&key)
+            .execute(&mut *tx)
+            .await?;
+            after = (library, key);
+        }
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub struct FileMeta {
     pub md5: String,
     pub blob_md5: String,

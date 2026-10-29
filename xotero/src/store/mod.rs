@@ -23,7 +23,7 @@ pub use files::{
     claim_pending_upload, claim_pending_upload_garbage, claim_retired_blob, create_pending_upload,
     delete_pending_upload_garbage, discard_pending_upload, due_blob_keys, file_for_signing,
     file_meta, finish_retired_blob, mark_pending_upload_uploaded, pending_upload,
-    pending_upload_cleanup_cutoff, record_presign_ttl, register_file,
+    pending_upload_cleanup_cutoff, reconcile_legacy_blobs, record_presign_ttl, register_file,
     reset_interrupted_pending_uploads, reset_pending_upload, stored_file_attachment_exists,
     FileRegistrationOutcome, FileSigningOutcome, PendingUpload, PendingUploadState,
 };

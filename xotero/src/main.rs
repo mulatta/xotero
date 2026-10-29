@@ -78,6 +78,12 @@ async fn main() {
     let pool = store::connect(&config.database_url)
         .await
         .expect("connect to database");
+    let storage = Arc::new(s3::Storage::new(&config.s3).expect("init object storage"));
+    if let Err(error) = store::reconcile_legacy_blobs(&pool, &storage, config.upload_timeout).await
+    {
+        tracing::error!(%error, "reconcile legacy blob pointers before serving");
+        std::process::exit(1);
+    }
     store::bootstrap_identity(
         &pool,
         config.user_id,
@@ -98,7 +104,6 @@ async fn main() {
         (None, None) => {}
         _ => panic!("bootstrap OIDC issuer and subject must both be nonempty"),
     }
-    let storage = Arc::new(s3::Storage::new(&config.s3).expect("init object storage"));
     let state = AppState {
         uploads: Arc::new(tokio::sync::Semaphore::new(config.upload_concurrency)),
         config,

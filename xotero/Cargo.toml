@@ -13,6 +13,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 hmac = "0.12"
 # Verify uploaded attachment bytes against the client-declared md5.
 md-5 = "0.10"
+quick-xml = "=0.41.0"
 sqlx = { version = "0.8", default-features = false, features = [
   "runtime-tokio",
   "postgres",

@@ -325,6 +325,436 @@ machine.wait_for_unit("rustfs.service")
 machine.succeed("mc alias set s3 http://localhost:9000 rustfsadmin rustfsadmin")
 machine.succeed("mc mb s3/zotero")
 
+with subtest("checkpoint11 populated v13 shared bare upgrade"):
+    # Independent supported history, real storage and real HTTP downloads.
+    upgrade_script = r'''
+import hashlib
+import http.server
+import io
+import json
+import os
+import selectors
+import subprocess
+import threading
+import time
+import zipfile
+
+database = "checkpoint11_upgrade"
+print("CHECKPOINT11_FIXTURE_PID=" + str(os.getpid()), flush=True)
+subprocess.run(["sudo", "-u", "postgres", "createdb", "-O", "xotero", database], check=True)
+url = "postgresql://xotero@localhost/" + database + "?host=/run/postgresql"
+def sql(statement):
+    return subprocess.check_output(
+        ["sudo", "-u", "xotero", "psql", "-v", "ON_ERROR_STOP=1", "-At",
+         "-d", database, "-c", statement], text=True).strip()
+subprocess.run(["sudo", "-u", "xotero", "env", "DATABASE_URL=" + url,
+                "sqlx", "migrate", "run", "--source", "/etc/xotero-test/v13-migrations"], check=True)
+payload = b"checkpoint11 shared bare bytes"
+digest = hashlib.md5(payload).hexdigest()
+sql("insert into library (id, version, kind) values (22, 17, 'personal'), (23, 19, 'personal')")
+sql("insert into users (id, username, display_name) values (202, 'historical22', 'Historical22'), (203, 'historical23', 'Historical23')")
+sql("insert into personal_libraries (user_id, library_id) values (202, 22), (203, 23)")
+sql("insert into users (id,username,display_name) values (101,'alice','Alice'); insert into personal_libraries (user_id,library_id) values (101,1)")
+for library, user in [(22, 202), (23, 203)]:
+    token = "checkpoint11key" + str(user)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    sql(f"""with inserted as (
+            insert into api_keys (token_hash, user_id, name)
+            values (decode('{token_hash}', 'hex'), {user}, 'historical') returning id)
+            insert into api_key_user_permissions (api_key_id, library, notes, write, files)
+            select id, true, true, true, true from inserted""")
+    sql(f"""insert into object (library_id, kind, key, version, data)
+            values ({library}, 'item', 'SHAREB22', 11,
+                    '{{"key":"SHAREB22","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"shared.bin","title":"preserved"}}');
+            insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version)
+            values ({library},'SHAREB22','{digest}','{digest}','libraries/{library}/SHAREB22','shared.bin',{len(payload)},1700000000011,11)""")
+subprocess.run(["mc", "pipe", "s3/zotero/SHAREB22"], input=payload, check=True)
+for key, pointer in [
+    ("PREFXK22", "libraries/22/PREFXK22"),
+    ("WRNGFX22", "libraries/22/WRNGFX22"),
+    ("CANDBL22", "libraries/22/uploads/checkpoint11"),
+    ("BAREKY22", "BAREKY22"),
+    ("CUSTMK22", "checkpoint11/custom"),
+    ("uploads/checkpoint11", "libraries/22/uploads/checkpoint11-collision"),
+]:
+    if key.startswith("uploads/"):
+        pointer = "libraries/22/" + key
+    sql(f"""insert into object (library_id,kind,key,version,data)
+            values (22,'item','{key}',11,
+                    '{{"key":"{key}","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"preserved.bin"}}');
+            insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version)
+            values (22,'{key}','{digest}','{digest}','{pointer}','preserved.bin',{len(payload)},1700000000011,11)""")
+for key in ["PREFXK22", "WRNGFX22"]:
+    subprocess.run(["mc", "pipe", "s3/zotero/" + key], input=payload, check=True)
+    subprocess.run(["mc", "pipe", "s3/zotero/libraries/22/" + key],
+                   input=payload if key == "PREFXK22" else b"x" * len(payload), check=True)
+# More than one descriptor page exercises whole-pass lock acquisition, rather
+# than accidentally proving only a single-page ordering.
+page_keys = ["PAGE" + "".join("23456789"[(index // (8 ** power)) % 8]
+                            for power in [3,2,1,0]) for index in range(33)]
+for key in page_keys:
+    sql(f"""insert into object (library_id,kind,key,version,data)
+            values (22,'item','{key}',11,
+                    '{{"key":"{key}","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"page.bin"}}');
+            insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version)
+            values (22,'{key}','{digest}','{digest}','libraries/22/{key}','page.bin',{len(payload)},1700000000011,11)""")
+    subprocess.run(["mc","pipe","s3/zotero/libraries/22/"+key],input=payload,check=True)
+archive = io.BytesIO()
+with zipfile.ZipFile(archive,"w",compression=zipfile.ZIP_DEFLATED) as zipped:
+    member = zipfile.ZipInfo("shared.bin",date_time=(2026,1,1,0,0,0))
+    member.compress_type = zipfile.ZIP_DEFLATED
+    zipped.writestr(member,payload)
+compressed_bytes = archive.getvalue()
+compressed_hash = hashlib.md5(compressed_bytes).hexdigest().upper()
+sql(f"""insert into object (library_id,kind,key,version,data)
+        values (22,'item','CMPRSS22',11,
+                '{{"key":"CMPRSS22","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"shared.bin"}}');
+        insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version,compressed)
+        values (22,'CMPRSS22','{digest}','{compressed_hash}','libraries/22/CMPRSS22','shared.bin',{len(compressed_bytes)},1700000000011,11,true)""")
+subprocess.run(["mc","pipe","s3/zotero/CMPRSS22"],input=compressed_bytes,check=True)
+# Untouched compressed candidate has distinct logical and byte integrity domains.
+sql("update file set md5 = repeat('a',32), compressed = true where item_key = 'CANDBL22'")
+sql("""insert into setting (library_id,key,version,value) values (22,'historical',13,'{"preserved":true}');
+       insert into deletion (library_id,kind,key,version) values (22,'item','DELETED2',12);
+       insert into fulltext (library_id,item_key,content,indexed_chars,total_chars,indexed_pages,total_pages,version)
+       values (22,'SHAREB22','preserved text',14,14,1,1,11);
+       insert into login_sessions (token_hash,client_type,expires_at)
+       values (decode(repeat('ab',32),'hex'),'linux','2100-01-01');
+       insert into library (id,version,kind) values (33,23,'group');
+       begin;
+       insert into groups (id,library_id,owner_user_id,name,version)
+       values (303,33,202,'Historical Group',7);
+       insert into group_memberships (group_id,user_id,role) values (303,202,'owner');
+       commit;
+       insert into api_key_group_permissions (api_key_id,user_id,group_id,library,write)
+       select id,202,303,true,true from api_keys where user_id = 202;
+       insert into pending_uploads
+       (token_hash,library_id,authorizer_key_hash,item_key,blob_key,md5,upload_md5,filename,filesize,mtime,state,expires_at)
+       select decode(repeat('cd',32),'hex'),22,token_hash,'CANDBL22','libraries/22/uploads/checkpoint11-pending',
+              repeat('a',32),repeat('b',32),'pending.zip',23,1700000000011,'authorized','2100-01-01'
+       from api_keys where user_id = 202""")
+tables = ["library", "object", "setting", "deletion", "fulltext", "users",
+          "personal_libraries", "api_keys", "api_key_user_permissions", "groups",
+          "group_memberships", "api_key_group_permissions", "login_sessions", "pending_uploads"]
+def durable_snapshot():
+    families = {table: sql(f"select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from {table} t")
+                for table in tables}
+    families["file_metadata"] = sql("""select jsonb_agg(to_jsonb(f) - 'blob_key' order by library_id,item_key) from file f""")
+    families["old_checksums"] = sql("select jsonb_agg(row(version,checksum) order by version) from _sqlx_migrations where version <= 13")
+    return families
+snapshot = durable_snapshot()
+subprocess.run(["sudo", "-u", "postgres", "createdb", "-O", "xotero",
+                "-T", database, "checkpoint11_template"], check=True)
+subprocess.run(["sudo", "-u", "xotero", "env", "DATABASE_URL=" + url,
+                "sqlx", "migrate", "run", "--source", "/etc/xotero-test/current-migrations"], check=True)
+# An unrelated bare tombstone cannot invalidate a proven current prefix.
+sql("""insert into blob_retirements (blob_key,not_before,state,deleted_at)
+       values ('PREFXK22',clock_timestamp(),'deleted',clock_timestamp())""")
+assert sql("select count(*) from legacy_blob_reconciliation") == "38"
+assert sql("select count(*) from legacy_blob_reconciliation where item_key in ('CANDBL22','BAREKY22','CUSTMK22','uploads/checkpoint11')") == "0"
+environment = os.environ | {
+    "XOTERO_DATABASE_URL": url, "XOTERO_BIND": "127.0.0.1:8191",
+    "XOTERO_USER_ID": "101", "XOTERO_USERNAME": "alice", "XOTERO_DISPLAY_NAME": "Alice",
+    "XOTERO_PUBLIC_URL": "http://localhost:8191",
+    "XOTERO_LOGIN_KDF_KEY_FILE": "/etc/xotero-test/checkpoint11-kdf",
+    "XOTERO_S3_ENDPOINT": "http://localhost:9000",
+    "XOTERO_S3_REGION": "us-east-1", "XOTERO_S3_BUCKET": "zotero",
+    "XOTERO_S3_ACCESS_KEY": "rustfsadmin", "XOTERO_S3_SECRET_KEY": "rustfsadmin",
+    "XOTERO_UPLOAD_TIMEOUT": "10",
+}
+process = subprocess.Popen(["sudo", "-u", "xotero", "env",
+                           *[key + "=" + value for key, value in environment.items()
+                             if key.startswith("XOTERO_")], "xotero"], stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=False)
+print("CHECKPOINT11_SERVER_PID=" + str(process.pid), flush=True)
+try:
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + 30
+    output = b""
+    while b"xotero listening" not in output:
+        ready = selector.select(max(0, deadline - time.monotonic()))
+        assert ready, ("startup deadline", output.decode())
+        chunk = os.read(process.stdout.fileno(), 4096)
+        assert chunk, ("startup exited", output.decode())
+        output += chunk
+    selector.close()
+    for user in [202, 203]:
+        initial = subprocess.check_output(
+            ["curl", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "10",
+             "-H", "Zotero-API-Key: checkpoint11key" + str(user),
+             "http://localhost:8191/users/" + str(user) + "/items/SHAREB22/file"], text=True)
+        assert initial == "302", initial
+        result = subprocess.run(
+            ["curl", "-sSfL", "--max-time", "10", "-H", "Zotero-API-Key: checkpoint11key" + str(user),
+             "http://localhost:8191/users/" + str(user) + "/items/SHAREB22/file"],
+            capture_output=True)
+        assert result.returncode == 0 and result.stdout == payload, (
+            "checkpoint11 actual shared bare resolution failed", user,
+            result.returncode, result.stderr.decode(), result.stdout)
+    assert sql("select string_agg(blob_key, ',' order by library_id) from file where item_key='SHAREB22'") == "SHAREB22,SHAREB22"
+    assert sql("select blob_key from file where item_key='PREFXK22'") == "libraries/22/PREFXK22"
+    assert sql("select blob_key from file where item_key='WRNGFX22'") == "WRNGFX22"
+    assert sql("select count(*) from file where item_key like 'PAGE%' and blob_key='libraries/22/'||item_key") == "33"
+    assert sql("select blob_key from file where item_key='CMPRSS22'") == "CMPRSS22"
+    compressed_download = subprocess.check_output(
+        ["curl","-sSfL","--max-time","10","-H","Zotero-API-Key: checkpoint11key202",
+         "http://localhost:8191/users/202/items/CMPRSS22/file"])
+    assert compressed_download == compressed_bytes
+    compressed_headers = subprocess.check_output(
+        ["curl","-sS","-D","-","-o","/dev/null","--max-time","10","-H",
+         "Zotero-API-Key: checkpoint11key202","http://localhost:8191/users/202/items/CMPRSS22/file"],text=True)
+    assert "zotero-file-compressed: Yes" in compressed_headers
+    assert "zotero-file-md5: "+compressed_hash in compressed_headers
+    for key, pointer in [("CANDBL22","libraries/22/uploads/checkpoint11"),
+                         ("BAREKY22","BAREKY22"), ("CUSTMK22","checkpoint11/custom"),
+                         ("uploads/checkpoint11","libraries/22/uploads/checkpoint11")]:
+        assert sql(f"select blob_key from file where item_key='{key}'") == pointer
+    assert durable_snapshot() == snapshot
+    assert sql("select count(*) from legacy_blob_reconciliation") == "0"
+    assert sql("select count(*) from blob_retirements where blob_key='libraries/22/PREFXK22'") == "0"
+    assert sql("select count(*) from blob_retirements where blob_key='libraries/22/WRNGFX22' and state='queued' and not_before > clock_timestamp()") == "1"
+    assert subprocess.check_output(["mc","cat","s3/zotero/libraries/22/WRNGFX22"]) == b"x" * len(payload)
+    assert subprocess.check_output(["mc","cat","s3/zotero/SHAREB22"]) == payload
+    print("CHECKPOINT11_SHARED_BARE_HTTP=" + json.dumps({"libraries": [22,23], "bytes": len(payload), "md5": digest}), flush=True)
+    print("CHECKPOINT11_PRESERVATION=" + json.dumps({"families": sorted(snapshot), "initial_status":302, "prefixed_kept":True, "wrong_prefix_retired_not_deleted":True, "untouched_classes":4, "candidate_rows":38, "descriptor_pages":2, "valid_prefix_with_bare_tombstone":True, "compressed_blob_md5_not_logical":True}), flush=True)
+finally:
+    process.terminate()
+    process.wait(timeout=10)
+    process.stdout.close()
+# Restart is a no-op: no markers remain and no retirement grace is shortened.
+restart_before = sql("select jsonb_agg(b order by blob_key) from blob_retirements b")
+restart = subprocess.Popen(["sudo","-u","xotero","env",
+    *[key+"="+value for key,value in environment.items() if key.startswith("XOTERO_")],
+    "xotero"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+print("CHECKPOINT11_RESTART_PID=" + str(restart.pid), flush=True)
+try:
+    with selectors.DefaultSelector() as selector:
+        selector.register(restart.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic()+30
+        output = b""
+        while b"xotero listening" not in output:
+            assert selector.select(max(0,deadline-time.monotonic())), output
+            chunk = os.read(restart.stdout.fileno(),4096)
+            assert chunk, output
+            output += chunk
+    assert durable_snapshot() == snapshot
+    assert sql("select jsonb_agg(b order by blob_key) from blob_retirements b") == restart_before
+finally:
+    restart.terminate()
+    restart.wait(timeout=10)
+    restart.stdout.close()
+print("CHECKPOINT11_RESTART=no-op", flush=True)
+
+for label in ["wrong-hash", "missing", "wrong-size", "malformed-hash", "negative-size", "malformed-key",
+              "provider403", "provider404-bucket", "unsupported-schema",
+              "provider404-malformed", "provider404-proxy", "provider500", "provider-truncated-body",
+              "claimed-target", "deleted-target", "claimed-current",
+              "stale-pointer", "stale-hash", "stale-size", "stale-compression",
+              "candidate-limit"]:
+    database = "checkpoint11_" + label.replace("-", "_")
+    subprocess.run(["sudo","-u","postgres","createdb","-O","xotero",
+                    "-T","checkpoint11_template",database],check=True)
+    match label:
+        case "wrong-hash":
+            sql("update file set blob_md5 = repeat('e',32) where library_id=23 and item_key='SHAREB22'")
+        case "missing":
+            sql("update file set item_key='MISSNG22',blob_key='libraries/'||library_id||'/MISSNG22' where item_key='SHAREB22'")
+        case "wrong-size":
+            sql("update file set filesize=1 where item_key='SHAREB22'")
+        case "malformed-hash":
+            sql("update file set blob_md5='not-md5' where item_key='SHAREB22'")
+        case "negative-size":
+            sql("update file set filesize=-1 where item_key='SHAREB22'")
+        case "malformed-key":
+            sql("update file set item_key='',blob_key='libraries/'||library_id||'/' where item_key='SHAREB22'")
+        case "provider403" | "provider404-bucket" | "provider404-malformed" | "provider404-proxy" | "provider500" | "provider-truncated-body":
+            pass
+        case "unsupported-schema":
+            sql("alter table file drop column blob_md5")
+        case "claimed-target" | "deleted-target" | "claimed-current" | "stale-pointer" | "stale-hash" | "stale-size" | "stale-compression" | "candidate-limit":
+            case_url = "postgresql://xotero@localhost/"+database+"?host=/run/postgresql"
+            subprocess.run(["sudo","-u","xotero","env","DATABASE_URL="+case_url,
+                            "sqlx","migrate","run","--source","/etc/xotero-test/current-migrations"],check=True)
+            if label in ["claimed-target", "deleted-target", "claimed-current"]:
+                state = "deleted" if label == "deleted-target" else "claimed"
+                pointer = "libraries/22/SHAREB22" if label == "claimed-current" else "SHAREB22"
+                deleted = "clock_timestamp()" if state == "deleted" else "null"
+                sql(f"""insert into blob_retirements (blob_key,not_before,state,deleted_at)
+                        values ('{pointer}',clock_timestamp(),'{state}',{deleted})""")
+            if label.startswith("stale-"):
+                column, value = {
+                    "stale-pointer": ("blob_key", "'checkpoint11/replaced'"),
+                    "stale-hash": ("blob_md5", "repeat('f',32)"),
+                    "stale-size": ("filesize", "99"),
+                    "stale-compression": ("compressed", "true"),
+                }[label]
+                sql(f"update file set {column}={value} where library_id=23 and item_key='SHAREB22'")
+            if label == "candidate-limit":
+                sql("""insert into legacy_blob_reconciliation
+                       (library_id,item_key,blob_key,blob_md5,filesize,compressed)
+                       select 22,'limit-'||n,'limit-'||n,repeat('a',32),1,false
+                       from generate_series(1,4097) n""")
+        case _:
+            raise AssertionError(label)
+    before = sql("select jsonb_agg(f order by library_id,item_key) from file f")
+    before_objects = sql("select jsonb_agg(o order by library_id,kind,key) from object o")
+    case_environment = environment | {"XOTERO_DATABASE_URL":
+        "postgresql://xotero@localhost/"+database+"?host=/run/postgresql"}
+    if label == "provider403":
+        case_environment["XOTERO_S3_SECRET_KEY"] = "incorrect-checkpoint11-secret"
+    if label == "provider404-bucket":
+        case_environment["XOTERO_S3_BUCKET"] = "checkpoint11-no-such-bucket"
+    fault_server = None
+    fault_thread = None
+    requests = []
+    if label in ["provider404-malformed", "provider404-proxy", "provider500", "provider-truncated-body"]:
+        class FaultProvider(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                requests.append((self.command,self.path))
+                if not self.path.startswith("/zotero/libraries/"):
+                    self.send_response(200)
+                    self.send_header("Content-Length",str(len(payload)))
+                    self.end_headers()
+                    self.wfile.write(payload)
+                    return
+                status, body, declared = {
+                    "provider404-malformed": (404,b"<Error><Code>NoSuchKey</Code><Message></Error>",None),
+                    "provider404-proxy": (404,b"not found",None),
+                    "provider500": (500,b"unavailable",None),
+                    "provider-truncated-body": (200,b"he",len(payload)),
+                }[label]
+                self.send_response(status)
+                self.send_header("Content-Length",str(len(body) if declared is None else declared))
+                self.end_headers()
+                self.wfile.write(body)
+                self.close_connection = True
+            do_POST = do_GET
+            do_PUT = do_GET
+            do_DELETE = do_GET
+            def log_message(self, format, *args):
+                return
+        fault_server = http.server.HTTPServer(("127.0.0.1",0),FaultProvider)
+        print("CHECKPOINT11_FAULT_PROVIDER="+json.dumps({"pid":os.getpid(),"port":fault_server.server_port,"case":label}),flush=True)
+        fault_thread = threading.Thread(target=fault_server.serve_forever)
+        fault_thread.start()
+        case_environment["XOTERO_S3_ENDPOINT"] = "http://127.0.0.1:"+str(fault_server.server_port)
+    try:
+        result = subprocess.run(["sudo","-u","xotero","env",
+            *[key+"="+value for key,value in case_environment.items() if key.startswith("XOTERO_")],
+            "xotero"],capture_output=True,timeout=30)
+    finally:
+        if fault_server is not None:
+            fault_server.shutdown()
+            fault_thread.join(timeout=10)
+            assert not fault_thread.is_alive()
+            fault_server.server_close()
+    assert result.returncode != 0, label
+    assert b"xotero listening" not in result.stdout, (label,result.stdout)
+    expected_error = {
+        "wrong-hash": "neither current nor bare object verifies",
+        "missing": "neither current nor bare object verifies",
+        "wrong-size": "neither current nor bare object verifies",
+        "malformed-hash": "invalid recorded byte size or blob MD5",
+        "negative-size": "invalid recorded byte size or blob MD5",
+        "malformed-key": "unsupported recorded legacy item key",
+        "provider403": "403",
+        "provider404-bucket": "not a complete NoSuchKey error document",
+        "provider404-malformed": "not a complete NoSuchKey error document",
+        "provider404-proxy": "not a complete NoSuchKey error document",
+        "provider500": "500",
+        "provider-truncated-body": "legacy reconciliation storage",
+        "unsupported-schema": "blob_md5",
+        "claimed-target": "bare object is claimed or deleted",
+        "deleted-target": "bare object is claimed or deleted",
+        "claimed-current": "current object is claimed or deleted",
+        "stale-pointer": "recorded file descriptor changed",
+        "stale-hash": "recorded file descriptor changed",
+        "stale-size": "recorded file descriptor changed",
+        "stale-compression": "recorded file descriptor changed",
+        "candidate-limit": "candidate count exceeds bounded startup limit",
+    }[label]
+    failure_output = (result.stdout + result.stderr).decode()
+    assert expected_error in failure_output, (label,failure_output)
+    if label == "unsupported-schema":
+        assert "does not exist" in failure_output, failure_output
+    assert sql("select jsonb_agg(f order by library_id,item_key) from file f") == before, label
+    assert sql("select jsonb_agg(o order by library_id,kind,key) from object o") == before_objects, label
+    if fault_server is not None:
+        assert requests and all(method=="GET" and path.startswith("/zotero/libraries/")
+                                for method,path in requests), (label,requests)
+    print("CHECKPOINT11_FAILURE="+json.dumps({"case":label,"exit":result.returncode,
+          "pointers_unchanged":True,"objects_unchanged":True,"listener_started":False,
+          "fault_requests":requests,
+          "error":failure_output.strip()}),flush=True)
+
+# Subscribe to exact PostgreSQL lock state before releasing a competing writer.
+database = "checkpoint11_lock_race"
+subprocess.run(["sudo","-u","postgres","createdb","-O","xotero",
+                "-T","checkpoint11_template",database],check=True)
+case_url = "postgresql://xotero@localhost/"+database+"?host=/run/postgresql"
+subprocess.run(["sudo","-u","xotero","env","DATABASE_URL="+case_url,
+                "sqlx","migrate","run","--source","/etc/xotero-test/current-migrations"],check=True)
+blocker = subprocess.Popen(["sudo","-u","xotero","psql","-v","ON_ERROR_STOP=1","-At","-d",database],
+                           stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+print("CHECKPOINT11_LOCK_WRITER_PID="+str(blocker.pid),flush=True)
+race = None
+try:
+    blocker.stdin.write(b"begin; select id from library where id=23 for update;\n\\echo CHECKPOINT11_LOCKED\n")
+    blocker.stdin.flush()
+    with selectors.DefaultSelector() as selector:
+        selector.register(blocker.stdout,selectors.EVENT_READ)
+        output = b""
+        deadline = time.monotonic()+10
+        while b"CHECKPOINT11_LOCKED" not in output:
+            assert selector.select(max(0,deadline-time.monotonic())),output
+            chunk = os.read(blocker.stdout.fileno(),4096)
+            assert chunk,output
+            output += chunk
+    race_environment = environment | {"XOTERO_DATABASE_URL":case_url+"&application_name=checkpoint11_race"}
+    race = subprocess.Popen(["sudo","-u","xotero","env",
+        *[key+"="+value for key,value in race_environment.items() if key.startswith("XOTERO_")],
+        "xotero"],stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
+    print("CHECKPOINT11_RACE_SERVER_PID="+str(race.pid),flush=True)
+    sql("""set statement_timeout='10s'; do $$ begin loop
+           perform pg_stat_clear_snapshot();
+           exit when exists (select 1 from pg_stat_activity
+             where application_name='checkpoint11_race' and wait_event_type='Lock'
+             and query like 'select l.id from library l where exists%');
+           end loop; end $$""")
+    assert sql("""select count(*) from pg_locks l join pg_stat_activity a using(pid)
+                  where a.application_name='checkpoint11_race'
+                  and l.locktype='advisory' and l.classid=1481593922""") == "0"
+    blocker.stdin.write(b"update file set blob_md5=repeat('d',32) where library_id=23 and item_key='SHAREB22'; commit;\n\\q\n")
+    blocker.stdin.flush()
+    blocker.wait(timeout=10)
+    assert blocker.returncode == 0
+    before = sql("select jsonb_agg(f order by library_id,item_key) from file f")
+    output,_ = race.communicate(timeout=30)
+    assert race.returncode != 0 and b"recorded file descriptor changed" in output,output
+    assert b"xotero listening" not in output,output
+    assert sql("select jsonb_agg(f order by library_id,item_key) from file f") == before
+    print("CHECKPOINT11_LOCK_RACE="+json.dumps({"observed_library_wait":True,
+          "blob_locks_before_all_libraries":0,"fresh_descriptor_rejected":True,
+          "whole_pass_rollback":True}),flush=True)
+finally:
+    if blocker.poll() is None:
+        blocker.terminate()
+        blocker.wait(timeout=10)
+    blocker.stdin.close()
+    blocker.stdout.close()
+    if race is not None:
+        if race.poll() is None:
+            race.terminate()
+            race.wait(timeout=10)
+        race.stdout.close()
+'''
+    machine.succeed(
+        "printf 0123456789abcdef0123456789abcdef "
+        "> /etc/xotero-test/checkpoint11-kdf"
+    )
+    machine.succeed(f"python3 -c {shlex.quote(upgrade_script)}")
+
 # Recreate the exact pre-identity schema and populate every durable data family.
 machine.succeed(
     "sudo -u xotero env "
@@ -386,7 +816,7 @@ machine.wait_for_open_port(8189)
 with subtest("populated v7 data survives the identity migration"):
     assert (
         psql("select string_agg(version::text, ',' order by version) from _sqlx_migrations")
-        == "1,2,3,4,5,6,7,8,9,10,11,12,13,14"
+        == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
     )
     assert psql("select count(*) from pending_uploads") == "0"
     assert psql("select bool_and(not compressed) from file") == "t"

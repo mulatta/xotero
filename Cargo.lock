@@ -2877,6 +2877,7 @@ dependencies = [
  "futures-util",
  "hmac",
  "md-5",
+ "quick-xml",
  "rust-s3",
  "serde_json",
  "serde_urlencoded",

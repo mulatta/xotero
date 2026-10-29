@@ -142,6 +142,251 @@ impl Storage {
     pub async fn presign_get(&self, key: &str) -> Result<String, S3Error> {
         self.bucket.presign_get(key, self.presign_ttl, None).await
     }
+
+    /// Verify exact stored bytes, never ETag or expanded attachment content.
+    /// Only a canonical NoSuchKey response or proven byte mismatch is absence
+    /// of valid bytes; provider, framing and transport failures remain errors.
+    pub async fn verify_object(
+        &self,
+        key: &str,
+        size: u64,
+        md5: &str,
+        timeout: std::time::Duration,
+    ) -> Result<bool, S3Error> {
+        use md5::{Digest, Md5};
+        use tokio::io::AsyncReadExt;
+
+        let verify = async {
+            let mut response = self.bucket.get_object_stream(key).await?;
+            let status = response.status_code;
+            if status != 200 {
+                if status != 404 {
+                    return Err(S3Error::HttpFailWithBody(
+                        status,
+                        "legacy object verification failed".into(),
+                    ));
+                }
+                // Error documents have a separate fixed cap. Never turn a
+                // missing bucket, proxy 404, malformed or truncated XML into
+                // permission to publish a different object pointer.
+                let mut document = [0u8; 8193];
+                let mut length = 0;
+                while length < document.len() {
+                    let read = response.read(&mut document[length..]).await?;
+                    if read == 0 {
+                        break;
+                    }
+                    length += read;
+                }
+                if length <= 8192 && no_such_key(&document[..length]) {
+                    return Ok(false);
+                }
+                return Err(S3Error::HttpFailWithBody(
+                    status,
+                    "not a complete NoSuchKey error document".into(),
+                ));
+            }
+            let mut hash = Md5::new();
+            let mut read_bytes = 0u64;
+            let mut buffer = [0u8; 64 * 1024];
+            loop {
+                // At most expected size + 1 bytes are consumed. That extra
+                // byte proves mismatch without downloading an oversized blob.
+                let remaining = size.saturating_sub(read_bytes).saturating_add(1);
+                let limit = usize::try_from(remaining.min(64 * 1024))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let read = response.read(&mut buffer[..limit]).await?;
+                if read == 0 {
+                    return Ok(read_bytes == size
+                        && format!("{:x}", hash.finalize()).eq_ignore_ascii_case(md5));
+                }
+                read_bytes = read_bytes
+                    .checked_add(u64::try_from(read).map_err(std::io::Error::other)?)
+                    .ok_or_else(|| std::io::Error::other("object length overflow"))?;
+                if read_bytes > size {
+                    return Ok(false);
+                }
+                hash.update(&buffer[..read]);
+            }
+        };
+        tokio::time::timeout(timeout, verify).await.map_err(|_| {
+            S3Error::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "legacy object verification timed out",
+            ))
+        })?
+    }
+}
+
+// quick-xml checks markup matching but not XML 1.0's Name productions.
+fn xml_name(name: &[u8]) -> bool {
+    let Ok(name) = std::str::from_utf8(name) else {
+        return false;
+    };
+    let start = |character| {
+        matches!(character,
+            ':' | 'A'..='Z' | '_' | 'a'..='z'
+            | '\u{c0}'..='\u{d6}' | '\u{d8}'..='\u{f6}' | '\u{f8}'..='\u{2ff}'
+            | '\u{370}'..='\u{37d}' | '\u{37f}'..='\u{1fff}'
+            | '\u{200c}'..='\u{200d}' | '\u{2070}'..='\u{218f}'
+            | '\u{2c00}'..='\u{2fef}' | '\u{3001}'..='\u{d7ff}'
+            | '\u{f900}'..='\u{fdcf}' | '\u{fdf0}'..='\u{fffd}'
+            | '\u{10000}'..='\u{effff}')
+    };
+    let mut characters = name.chars();
+    characters.next().is_some_and(start)
+        && characters.all(|character| {
+            start(character)
+                || matches!(character,
+                    '-' | '.' | '0'..='9' | '\u{b7}'
+                    | '\u{300}'..='\u{36f}' | '\u{203f}'..='\u{2040}')
+        })
+}
+
+fn no_such_key(document: &[u8]) -> bool {
+    use quick_xml::events::{BytesStart, Event};
+    use quick_xml::Reader;
+
+    let Ok(text) = std::str::from_utf8(document) else {
+        return false;
+    };
+    let xml_character = |character| {
+        matches!(character, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}'
+            | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')
+    };
+    if !text.chars().all(xml_character) {
+        return false;
+    }
+    // A declaration cannot follow even otherwise legal prolog whitespace.
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().enable_all_checks(true);
+    let mut depth = 0usize;
+    let mut root_seen = false;
+    let mut declaration_seen = false;
+    let mut code_seen = false;
+    let mut in_code = false;
+    let mut code = String::new();
+    loop {
+        let event_start = reader.buffer_position();
+        let Ok(event) = reader.read_event() else {
+            return false;
+        };
+        match event {
+            Event::Start(ref start) | Event::Empty(ref start) => {
+                let empty = matches!(&event, Event::Empty(_));
+                if !xml_name(start.name().as_ref()) {
+                    return false;
+                }
+                if start.attributes().any(|attribute| match attribute {
+                    Ok(attribute) => {
+                        !xml_name(attribute.key.as_ref())
+                            || attribute.value.contains(&b'<')
+                            || attribute
+                                .decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Explicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_or(true, |value| !value.chars().all(xml_character))
+                    }
+                    Err(_) => true,
+                }) {
+                    return false;
+                }
+                if depth == 0 {
+                    if root_seen || empty || start.name().as_ref() != b"Error" {
+                        return false;
+                    }
+                    root_seen = true;
+                } else if start.name().as_ref() == b"Code" {
+                    if depth != 1 || code_seen || empty {
+                        return false;
+                    }
+                    code_seen = true;
+                    in_code = true;
+                } else if in_code {
+                    return false;
+                }
+                if !empty {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                if in_code {
+                    in_code = false;
+                }
+                let Some(parent) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = parent;
+            }
+            Event::Text(value) => {
+                let Ok(value) = value.decode() else {
+                    return false;
+                };
+                if value.contains("]]>")
+                    || (depth == 0
+                        && !value
+                            .bytes()
+                            .all(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n')))
+                {
+                    return false;
+                }
+                if in_code {
+                    code.push_str(&value);
+                }
+            }
+            Event::GeneralRef(reference) => {
+                if depth == 0 || in_code {
+                    return false;
+                }
+                match reference.resolve_char_ref() {
+                    Ok(Some(character)) if xml_character(character) => {}
+                    Ok(Some(_)) => return false,
+                    Ok(None) => {
+                        let Ok(name) = reference.decode() else {
+                            return false;
+                        };
+                        if quick_xml::escape::resolve_predefined_entity(&name).is_none() {
+                            return false;
+                        }
+                    }
+                    Err(_) => return false,
+                }
+            }
+            Event::Decl(declaration) => {
+                if event_start != 0
+                    || root_seen
+                    || declaration_seen
+                    || declaration.version().is_err()
+                {
+                    return false;
+                }
+                declaration_seen = true;
+                let Ok(content) = std::str::from_utf8(&declaration) else {
+                    return false;
+                };
+                let start = BytesStart::from_content(content, 3);
+                let mut previous = 0;
+                for attribute in start.attributes() {
+                    let Ok(attribute) = attribute else {
+                        return false;
+                    };
+                    let order = match (attribute.key.as_ref(), attribute.value.as_ref()) {
+                        (b"version", b"1.0") => 1,
+                        (b"encoding", value) if value.eq_ignore_ascii_case(b"utf-8") => 2,
+                        (b"standalone", b"yes" | b"no") => 3,
+                        _ => return false,
+                    };
+                    if order <= previous {
+                        return false;
+                    }
+                    previous = order;
+                }
+            }
+            Event::Eof => return root_seen && depth == 0 && code_seen && code == "NoSuchKey",
+            Event::CData(_) | Event::Comment(_) | Event::PI(_) | Event::DocType(_) => return false,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -155,6 +400,255 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn verification_distinguishes_missing_bytes_from_provider_failures() {
+        // Given: actual SDK requests against deterministic provider responses.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let observed = Arc::clone(&requests);
+        let provider = Router::new().fallback(any(move |method: Method, uri: Uri| {
+            observed.lock().unwrap().push((method.clone(), uri.clone()));
+            async move {
+                assert_eq!(method, Method::GET);
+                match uri.path() {
+                    "/zotero/valid" => (StatusCode::OK, "hello"),
+                    "/zotero/wrong" => (StatusCode::OK, "world"),
+                    "/zotero/oversized" => (StatusCode::OK, "hello!"),
+                    "/zotero/missing" => (
+                        StatusCode::NOT_FOUND,
+                        "<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code>\
+                         <Message>Missing key</Message></Error>",
+                    ),
+                    "/zotero/bucket" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchBucket</Code></Error>",
+                    ),
+                    "/zotero/proxy" => (StatusCode::NOT_FOUND, "not found"),
+                    "/zotero/truncated" => (StatusCode::NOT_FOUND, "<Error><Code>NoSuchKey</Code>"),
+                    "/zotero/malformed" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><Message></Error>",
+                    ),
+                    "/zotero/declaration" => (
+                        StatusCode::NOT_FOUND,
+                        "<?xml nonsense?><Error><Code>NoSuchKey</Code></Error>",
+                    ),
+                    "/zotero/leading-declaration" => (
+                        StatusCode::NOT_FOUND,
+                        " \n<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>",
+                    ),
+                    "/zotero/bad-element-start" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><1bad/></Error>",
+                    ),
+                    "/zotero/bad-element-tail" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><bad!/></Error>",
+                    ),
+                    "/zotero/bad-attribute-start" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><Message 1bad=\"x\"/></Error>",
+                    ),
+                    "/zotero/bad-attribute-tail" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><Message bad!=\"x\"/></Error>",
+                    ),
+                    "/zotero/valid-whitespace" => (
+                        StatusCode::NOT_FOUND,
+                        " \n<Error><Code>NoSuchKey</Code></Error>\n ",
+                    ),
+                    "/zotero/valid-unicode-name" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code>\
+                         <\u{00c9}l\u{00e9}ment attribut\u{00e9}=\"x\"/></Error>",
+                    ),
+                    "/zotero/bom-declaration" => (
+                        StatusCode::NOT_FOUND,
+                        "\u{feff}<?xml version=\"1.0\"?><Error><Code>NoSuchKey</Code></Error>",
+                    ),
+                    "/zotero/bad-prolog-whitespace" => (
+                        StatusCode::NOT_FOUND,
+                        "\u{00a0}<Error><Code>NoSuchKey</Code></Error>",
+                    ),
+                    "/zotero/bad-text-delimiter" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><Message>]]></Message></Error>",
+                    ),
+                    "/zotero/duplicate" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code><Code>NoSuchBucket</Code></Error>",
+                    ),
+                    "/zotero/nested" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Message><Code>NoSuchKey</Code></Message></Error>",
+                    ),
+                    "/zotero/extra-root" => (
+                        StatusCode::NOT_FOUND,
+                        "<Error><Code>NoSuchKey</Code></Error><Error></Error>",
+                    ),
+                    "/zotero/forbidden" => (StatusCode::FORBIDDEN, "denied"),
+                    "/zotero/unavailable" => (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+                    _ => panic!("unexpected request {uri}"),
+                }
+            }
+        }));
+        let mut servers = tokio::task::JoinSet::new();
+        servers.spawn(async move { axum::serve(listener, provider).await });
+        let storage = Storage::new(&Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "zotero".into(),
+            access_key: "test".into(),
+            secret_key: "test".into(),
+            path_style: true,
+            presign_ttl: 120,
+        })
+        .unwrap();
+        // When: each exact object is verified by size and actual body MD5.
+        let mut violations = Vec::new();
+        for (key, expected) in [
+            ("valid", Some(true)),
+            ("wrong", Some(false)),
+            ("oversized", Some(false)),
+            ("missing", Some(false)),
+            ("bucket", None),
+            ("proxy", None),
+            ("truncated", None),
+            ("malformed", None),
+            ("declaration", None),
+            ("leading-declaration", None),
+            ("bad-element-start", None),
+            ("bad-element-tail", None),
+            ("bad-attribute-start", None),
+            ("bad-attribute-tail", None),
+            ("valid-whitespace", Some(false)),
+            ("valid-unicode-name", Some(false)),
+            ("bom-declaration", Some(false)),
+            ("bad-prolog-whitespace", None),
+            ("bad-text-delimiter", None),
+            ("duplicate", None),
+            ("nested", None),
+            ("extra-root", None),
+            ("forbidden", None),
+            ("unavailable", None),
+        ] {
+            let result = storage
+                .verify_object(
+                    key,
+                    5,
+                    "5D41402ABC4B2A76B9719D911017C592",
+                    Duration::from_secs(5),
+                )
+                .await;
+            // Then: only missing objects/completed integrity proofs permit
+            // considering another key. No mutation or enumeration is issued.
+            match expected {
+                Some(valid) => {
+                    if !matches!(result, Ok(actual) if actual == valid) {
+                        violations.push(format!("{key}: {result:?}"));
+                    }
+                }
+                None => {
+                    if result.is_ok() {
+                        violations.push(format!("{key}: {result:?}"));
+                    }
+                }
+            }
+        }
+        {
+            let observed = requests.lock().unwrap();
+            assert_eq!(observed.len(), 24);
+            assert!(observed
+                .iter()
+                .all(|(method, uri)| *method == Method::GET && uri.query().is_none()));
+        }
+        servers.abort_all();
+        while let Some(result) = servers.join_next().await {
+            assert!(result.unwrap_err().is_cancelled());
+        }
+        assert!(violations.is_empty(), "{violations:?}");
+    }
+
+    #[tokio::test]
+    async fn verification_bounds_reads_and_rejects_truncated_or_stalled_bodies() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for (length, body, hold, mismatch) in [
+            (1_048_576, "hello!", true, true),
+            (5, "he", false, false),
+            (5, "he", true, false),
+        ] {
+            // Given: real wire framing, including unfinished response bodies.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("http://{}", listener.local_addr().unwrap());
+            let (sent, received) = tokio::sync::oneshot::channel();
+            let (release, held) = tokio::sync::oneshot::channel();
+            let mut servers = tokio::task::JoinSet::new();
+            servers.spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(read, 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    assert!(request.len() <= 8192);
+                }
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\
+                             Connection: close\r\n\r\n{body}"
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                sent.send(()).unwrap();
+                if hold {
+                    held.await.unwrap();
+                }
+            });
+            let storage = Storage::new(&Config {
+                endpoint,
+                region: "us-east-1".into(),
+                bucket: "zotero".into(),
+                access_key: "test".into(),
+                secret_key: "test".into(),
+                path_style: true,
+                presign_ttl: 120,
+            })
+            .unwrap();
+            // When: verifying size five without waiting for oversized EOF.
+            let verification = storage.verify_object(
+                "wire",
+                5,
+                "5d41402abc4b2a76b9719d911017c592",
+                Duration::from_secs(1),
+            );
+            let (result, ()) = tokio::join!(verification, async {
+                tokio::time::timeout(Duration::from_secs(5), received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            });
+            // Then: size+1 proves mismatch, but truncated framing and a
+            // response deadline are provider errors, never missing objects.
+            if mismatch {
+                assert!(!result.unwrap());
+            } else {
+                assert!(result.is_err(), "{result:?}");
+            }
+            if hold {
+                release.send(()).unwrap();
+            }
+            while let Some(result) = servers.join_next().await {
+                result.unwrap();
+            }
+        }
+    }
 
     #[tokio::test]
     async fn stream_backpressure_bounds_source_and_dropped_future_needs_cleanup() {
