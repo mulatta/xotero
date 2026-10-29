@@ -14,6 +14,7 @@ pub(crate) struct Config {
     pub(crate) user_id: UserId,
     pub(crate) username: String,
     pub(crate) display_name: String,
+    pub(crate) bootstrap_instance_admin: bool,
     /// Migration 0001 creates one legacy personal library with ID 1. Keeping its
     /// scope in application state makes every storage call explicit.
     pub(crate) library_id: LibraryId,
@@ -58,6 +59,13 @@ impl Config {
             user_id,
             username,
             display_name,
+            bootstrap_instance_admin: match std::env::var("XOTERO_BOOTSTRAP_INSTANCE_ADMIN")
+                .as_deref()
+            {
+                Ok("true") => true,
+                Ok("false") | Err(std::env::VarError::NotPresent) => false,
+                _ => panic!("XOTERO_BOOTSTRAP_INSTANCE_ADMIN must be true or false"),
+            },
             library_id,
             public_url: std::env::var("XOTERO_PUBLIC_URL")
                 .unwrap_or_else(|_| format!("http://{bind}")),

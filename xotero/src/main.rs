@@ -84,26 +84,28 @@ async fn main() {
         tracing::error!(%error, "reconcile legacy blob pointers before serving");
         std::process::exit(1);
     }
+    let bootstrap_oidc_issuer = std::env::var("XOTERO_BOOTSTRAP_OIDC_ISSUER").ok();
+    let bootstrap_oidc_subject = std::env::var("XOTERO_BOOTSTRAP_OIDC_SUBJECT").ok();
+    let external_identity = match (&bootstrap_oidc_issuer, &bootstrap_oidc_subject) {
+        (Some(issuer), Some(subject))
+            if !issuer.trim().is_empty() && !subject.trim().is_empty() =>
+        {
+            Some((issuer.as_str(), subject.as_str()))
+        }
+        (None, None) => None,
+        _ => panic!("bootstrap OIDC issuer and subject must both be nonempty"),
+    };
     store::bootstrap_identity(
         &pool,
         config.user_id,
         &config.username,
         &config.display_name,
         config.library_id,
+        config.bootstrap_instance_admin,
+        external_identity,
     )
     .await
     .expect("bootstrap identity");
-    let bootstrap_oidc_issuer = std::env::var("XOTERO_BOOTSTRAP_OIDC_ISSUER").ok();
-    let bootstrap_oidc_subject = std::env::var("XOTERO_BOOTSTRAP_OIDC_SUBJECT").ok();
-    match (bootstrap_oidc_issuer, bootstrap_oidc_subject) {
-        (Some(issuer), Some(subject)) if !issuer.is_empty() && !subject.is_empty() => {
-            store::bootstrap_external_identity(&pool, &issuer, &subject, config.user_id)
-                .await
-                .expect("bootstrap external identity");
-        }
-        (None, None) => {}
-        _ => panic!("bootstrap OIDC issuer and subject must both be nonempty"),
-    }
     let state = AppState {
         uploads: Arc::new(tokio::sync::Semaphore::new(config.upload_concurrency)),
         config,

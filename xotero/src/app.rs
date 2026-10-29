@@ -232,6 +232,7 @@ mod body_tests {
             user_id: crate::domain::UserId::new(1).unwrap(),
             username: "test".into(),
             display_name: "test".into(),
+            bootstrap_instance_admin: false,
             library_id: crate::domain::LibraryId::new(1).unwrap(),
             bind: "127.0.0.1:8189".into(),
             public_url: "http://localhost:8189".into(),

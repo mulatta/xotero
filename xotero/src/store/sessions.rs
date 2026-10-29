@@ -123,24 +123,88 @@ pub async fn complete_login_session(
     if session.get::<bool, _>("expired") {
         return Ok(LoginSessionChange::Expired);
     }
-    // Resolve and lock identity ownership inside key-creation transaction.
-    // Relinking or disabling cannot race approval and mint for a stale user.
-    let mapped_user_id = sqlx::query_scalar::<_, i64>(
-        "select u.id \
+    // Discovery grants no authority. Separate statements establish the same
+    // library -> user -> ownership -> identity order as authority mutations.
+    let candidate = sqlx::query(
+        "select u.id as user_id, pl.library_id \
          from external_identities e \
          join users u on u.id = e.user_id and u.disabled_at is null \
          join personal_libraries pl on pl.user_id = u.id \
          join library l on l.id = pl.library_id and l.kind = 'personal' \
-         where e.issuer = $1 and e.subject = $2 \
-         for share of e, u, pl, l",
+         where e.issuer = $1 and e.subject = $2",
     )
     .bind(issuer)
     .bind(subject)
     .fetch_optional(&mut *tx)
     .await?;
-    let Some(mapped_user_id) = mapped_user_id else {
+    let Some(candidate) = candidate else {
         return Ok(LoginSessionChange::UserUnavailable);
     };
+    let mapped_user_id: i64 = candidate.get("user_id");
+    let library_id: i64 = candidate.get("library_id");
+    for (query, id) in [
+        (
+            "select id from library where id=$1 and kind='personal' for share",
+            library_id,
+        ),
+        (
+            "select id from users where id=$1 and disabled_at is null for share",
+            mapped_user_id,
+        ),
+    ] {
+        if sqlx::query(query)
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+        {
+            return Ok(LoginSessionChange::UserUnavailable);
+        }
+    }
+    if sqlx::query(
+        "select user_id from personal_libraries \
+         where user_id=$1 and library_id=$2 and library_kind='personal' for share",
+    )
+    .bind(mapped_user_id)
+    .bind(library_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_none()
+    {
+        return Ok(LoginSessionChange::UserUnavailable);
+    }
+    if sqlx::query(
+        "select user_id from external_identities \
+         where issuer=$1 and subject=$2 and user_id=$3 for share",
+    )
+    .bind(issuer)
+    .bind(subject)
+    .bind(mapped_user_id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .is_none()
+    {
+        return Ok(LoginSessionChange::UserUnavailable);
+    }
+    // Every positive row is now protected. Never chase a new owner/library
+    // discovered after a wait: doing so would acquire an earlier lock late.
+    let valid: bool = sqlx::query_scalar(
+        "select exists(select 1 from users u \
+         join personal_libraries p on p.user_id=u.id \
+         join library l on l.id=p.library_id and l.kind=p.library_kind \
+         join external_identities e on e.user_id=u.id \
+         where u.id=$1 and u.disabled_at is null and p.library_id=$2 \
+           and l.kind='personal' and e.issuer=$3 and e.subject=$4)",
+    )
+    .bind(mapped_user_id)
+    .bind(library_id)
+    .bind(issuer)
+    .bind(subject)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !valid {
+        return Ok(LoginSessionChange::UserUnavailable);
+    }
     let user_id = UserId::new(mapped_user_id)
         .ok_or_else(|| sqlx::Error::Protocol(format!("invalid mapped user ID {mapped_user_id}")))?;
     let client_type: String = session.get("client_type");

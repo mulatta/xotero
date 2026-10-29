@@ -52,10 +52,20 @@ in
       description = "Stable local user ID owning the legacy personal library.";
     };
 
+    bootstrapInstanceAdmin = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Explicitly create the first enabled OIDC instance administrator once.
+        Durable completion prevents role or identity repair on later starts,
+        even when this option remains enabled.
+      '';
+    };
+
     bootstrapUsername = lib.mkOption {
       type = lib.types.str;
       default = "xotero";
-      description = "Stable username for the bootstrap personal-library owner.";
+      description = "Initial username for the bootstrap personal-library owner.";
     };
 
     bootstrapDisplayName = lib.mkOption {
@@ -85,7 +95,7 @@ in
       description = ''
         Stable OIDC issuer for the bootstrap user's external identity. Reverse
         proxy must overwrite `X-Xotero-OIDC-Issuer` from its verified claim.
-        Changing this adds a mapping; remove retired mappings explicitly.
+        Used only for initial setup; later starts never repair removed mappings.
       '';
     };
 
@@ -272,6 +282,7 @@ in
         XOTERO_USER_ID = toString cfg.bootstrapUserId;
         XOTERO_USERNAME = cfg.bootstrapUsername;
         XOTERO_DISPLAY_NAME = cfg.bootstrapDisplayName;
+        XOTERO_BOOTSTRAP_INSTANCE_ADMIN = lib.boolToString cfg.bootstrapInstanceAdmin;
         XOTERO_BOOTSTRAP_OIDC_ISSUER = cfg.bootstrapOidcIssuer;
         XOTERO_BOOTSTRAP_OIDC_SUBJECT = cfg.bootstrapOidcSubject;
         XOTERO_S3_ENDPOINT = cfg.s3.endpoint;

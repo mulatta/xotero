@@ -815,7 +815,7 @@ machine.wait_for_open_port(8189)
 with subtest("populated v7 data survives the identity migration"):
     assert (
         psql("select string_agg(version::text, ',' order by version) from _sqlx_migrations")
-        == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+        == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16"
     )
     assert psql("select count(*) from pending_uploads") == "0"
     assert psql("select bool_and(not compressed) from file") == "t"
@@ -2615,21 +2615,16 @@ with subtest("database stores only fixed-length key digests"):
     assert psql("select count(*) from api_keys where octet_length(token_hash) = 32") == "9"
     assert psql("select count(*) from api_keys where encode(token_hash, 'escape') like '%token%'") == "0"
 
-with subtest("bootstrap OIDC ownership conflict fails startup closed"):
+with subtest("completed bootstrap never rewrites changed OIDC ownership"):
     machine.succeed("systemctl stop xotero.service")
     psql(
         f"""update external_identities
             set user_id = 202
             where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
     )
-    machine.succeed(
-        "mkdir -p /run/systemd/system/xotero.service.d && "
-        "printf '[Service]\\nRestart=no\\n' "
-        "> /run/systemd/system/xotero.service.d/test-no-restart.conf && "
-        "systemctl daemon-reload"
-    )
-    machine.succeed("systemctl start xotero.service >/dev/null 2>&1 || true")
-    machine.wait_until_succeeds("systemctl is-failed --quiet xotero.service")
+    machine.succeed("systemctl start xotero.service")
+    machine.wait_for_unit("xotero.service")
+    machine.wait_for_open_port(8189)
     assert (
         psql(
             f"""select user_id
@@ -2643,10 +2638,6 @@ with subtest("bootstrap OIDC ownership conflict fails startup closed"):
         f"""update external_identities
             set user_id = 101
             where issuer = '{oidc_issuer}' and subject = '{oidc_subject}'"""
-    )
-    machine.succeed(
-        "rm /run/systemd/system/xotero.service.d/test-no-restart.conf && "
-        "systemctl daemon-reload"
     )
     machine.succeed("systemctl reset-failed xotero.service")
     machine.succeed("systemctl start xotero.service")
@@ -2681,6 +2672,7 @@ with subtest("explicit recovery roles and pending digest authorization survive r
         f"where token_hash = decode('{sha256_hex(pending)}', 'hex')"
     ) == "t"
     override = "/run/systemd/system/xotero.service.d/test-recovery.conf"
+    machine.succeed("mkdir -p /run/systemd/system/xotero.service.d")
     try:
         for mode, setting in (
             ("removed", "UnsetEnvironment=XOTERO_KEYS XOTERO_API_KEY_FILE XOTERO_API_KEY"),

@@ -18,79 +18,181 @@ pub(super) fn principal_from_row(row: &PgRow) -> sqlx::Result<Principal> {
     })
 }
 
-/// Bind the populated-v7 library to one configured bootstrap user.
-///
-/// Startup takes a transaction-scoped advisory lock and validates existing
-/// rows after conflict-tolerant inserts. A changed user tuple or ownership
-/// mapping therefore fails closed instead of silently rewriting identity data.
+/// Initialize recovery ownership once, or explicitly bootstrap instance
+/// authority once. Completion never depends on continued role/mapping existence.
 pub async fn bootstrap_identity(
     pool: &PgPool,
     user_id: UserId,
     username: &str,
     display_name: &str,
     library_id: LibraryId,
+    instance_admin: bool,
+    external_identity: Option<(&str, &str)>,
 ) -> sqlx::Result<()> {
+    use super::audit::{append, AuditOutcome, BootstrapAction};
+
     let mut tx = pool.begin().await?;
-    sqlx::query("select pg_advisory_xact_lock($1)")
-        .bind(0x007a_686f_7374_i64)
+    sqlx::query("select xotero_lock_instance_authority()")
         .fetch_one(&mut *tx)
         .await?;
+    let (marker, action) = if instance_admin {
+        ("instance-admin", BootstrapAction::InstanceAdmin)
+    } else {
+        ("identity", BootstrapAction::Identity)
+    };
+    let complete: bool =
+        sqlx::query_scalar("select exists(select 1 from bootstrap_state where name=$1)")
+            .bind(marker)
+            .fetch_one(&mut *tx)
+            .await?;
+    if complete {
+        append(&mut tx, user_id, &action, AuditOutcome::Noop).await?;
+        return tx.commit().await;
+    }
+    // Expected denials roll back just the proposed setup. Audit is deliberately
+    // outside that savepoint and is committed even though startup fails closed.
+    sqlx::query("savepoint bootstrap_setup")
+        .execute(&mut *tx)
+        .await?;
+    let setup = bootstrap_setup(
+        &mut tx,
+        user_id,
+        username,
+        display_name,
+        library_id,
+        instance_admin,
+        external_identity,
+    )
+    .await;
+    match setup {
+        Ok(()) => {
+            sqlx::query("insert into bootstrap_state(name) values($1) on conflict do nothing")
+                .bind("identity")
+                .execute(&mut *tx)
+                .await?;
+            if instance_admin {
+                sqlx::query("insert into bootstrap_state(name) values('instance-admin')")
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            append(&mut tx, user_id, &action, AuditOutcome::Success).await?;
+            tx.commit().await
+        }
+        Err(_) => {
+            sqlx::query("rollback to savepoint bootstrap_setup")
+                .execute(&mut *tx)
+                .await?;
+            append(&mut tx, user_id, &action, AuditOutcome::Denied).await?;
+            tx.commit().await?;
+            // SQL errors can include failing row values, including OIDC claims.
+            // Only the sanitized outcome crosses the startup/logging boundary.
+            Err(sqlx::Error::Protocol("bootstrap setup denied".into()))
+        }
+    }
+}
 
-    let library_kind: String = sqlx::query("select kind from library where id = $1 for update")
-        .bind(library_id.get())
-        .fetch_one(&mut *tx)
-        .await?
-        .get("kind");
+async fn bootstrap_setup(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: UserId,
+    username: &str,
+    display_name: &str,
+    library_id: LibraryId,
+    instance_admin: bool,
+    external_identity: Option<(&str, &str)>,
+) -> sqlx::Result<()> {
+    let initialized: bool =
+        sqlx::query_scalar("select exists(select 1 from bootstrap_state where name='identity')")
+            .fetch_one(&mut **tx)
+            .await?;
+    let library_kind: String =
+        sqlx::query_scalar("select kind from library where id = $1 for share")
+            .bind(library_id.get())
+            .fetch_one(&mut **tx)
+            .await?;
     if library_kind != "personal" {
-        return Err(sqlx::Error::Protocol(format!(
-            "bootstrap library {} is {library_kind}, not personal",
-            library_id.get()
-        )));
+        return Err(sqlx::Error::Protocol("bootstrap ownership conflict".into()));
     }
-
-    sqlx::query(
-        "insert into users (id, username, display_name) values ($1, $2, $3) \
-         on conflict (id) do nothing",
-    )
-    .bind(user_id.get())
-    .bind(username)
-    .bind(display_name)
-    .execute(&mut *tx)
-    .await?;
-
-    let user = sqlx::query("select username, display_name from users where id = $1 for update")
+    if !initialized {
+        sqlx::query(
+            "insert into users (id, username, display_name) values ($1, $2, $3) \
+             on conflict (id) do nothing",
+        )
         .bind(user_id.get())
-        .fetch_one(&mut *tx)
+        .bind(username)
+        .bind(display_name)
+        .execute(&mut **tx)
         .await?;
-    let stored_username = user.get::<String, _>("username");
-    let stored_display_name = user.get::<String, _>("display_name");
-    if stored_username != username || stored_display_name != display_name {
-        return Err(sqlx::Error::Protocol(format!(
-            "bootstrap user {} does not match configured identity",
-            user_id.get()
-        )));
     }
-
-    sqlx::query(
-        "insert into personal_libraries (user_id, library_id) values ($1, $2) \
-         on conflict (user_id) do nothing",
-    )
-    .bind(user_id.get())
-    .bind(library_id.get())
-    .execute(&mut *tx)
-    .await?;
-
+    let disabled: bool =
+        sqlx::query_scalar("select disabled_at is not null from users where id=$1 for update")
+            .bind(user_id.get())
+            .fetch_one(&mut **tx)
+            .await?;
+    if instance_admin && disabled {
+        return Err(sqlx::Error::Protocol("bootstrap user unavailable".into()));
+    }
+    if instance_admin {
+        sqlx::query("insert into instance_admins(user_id) values($1) on conflict do nothing")
+            .bind(user_id.get())
+            .execute(&mut **tx)
+            .await?;
+    }
+    if !initialized {
+        sqlx::query(
+            "insert into personal_libraries (user_id, library_id) values ($1, $2) \
+             on conflict (user_id) do nothing",
+        )
+        .bind(user_id.get())
+        .bind(library_id.get())
+        .execute(&mut **tx)
+        .await?;
+    }
     let mapped_library_id: i64 =
         sqlx::query("select library_id from personal_libraries where user_id = $1 for update")
             .bind(user_id.get())
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
             .get("library_id");
     if mapped_library_id != library_id.get() {
-        return Err(sqlx::Error::Protocol(format!(
-            "bootstrap user {} already owns library {mapped_library_id}",
-            user_id.get()
-        )));
+        return Err(sqlx::Error::Protocol("bootstrap ownership conflict".into()));
+    }
+    match external_identity {
+        Some((issuer, subject)) => {
+            sqlx::query(
+                "insert into external_identities(issuer,subject,user_id) values($1,$2,$3) \
+                 on conflict(issuer,subject) do nothing",
+            )
+            .bind(issuer)
+            .bind(subject)
+            .bind(user_id.get())
+            .execute(&mut **tx)
+            .await?;
+            let mapped: i64 = sqlx::query_scalar(
+                "select user_id from external_identities where issuer=$1 and subject=$2 for update",
+            )
+            .bind(issuer)
+            .bind(subject)
+            .fetch_one(&mut **tx)
+            .await?;
+            if mapped != user_id.get() {
+                return Err(sqlx::Error::Protocol("bootstrap identity conflict".into()));
+            }
+        }
+        None if instance_admin => {
+            return Err(sqlx::Error::Protocol("bootstrap identity required".into()));
+        }
+        None => {}
+    }
+    if instance_admin {
+        let reachable: bool = sqlx::query_scalar(
+            "select exists(select 1 from xotero_reachable_admins() where user_id=$1)",
+        )
+        .bind(user_id.get())
+        .fetch_one(&mut **tx)
+        .await?;
+        if !reachable {
+            return Err(sqlx::Error::Protocol("bootstrap user unavailable".into()));
+        }
     }
 
     // Explicit bootstrap IDs do not advance an identity sequence. Never move a
@@ -105,44 +207,9 @@ pub async fn bootstrap_identity(
              true \
          )",
     )
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
-
-    tx.commit().await
-}
-
-/// Add one externally authenticated identity to the configured bootstrap user.
-/// Existing tuple ownership is never rewritten. A new configured tuple adds a
-/// mapping; removing an old provider identity remains an explicit DB operation.
-pub async fn bootstrap_external_identity(
-    pool: &PgPool,
-    issuer: &str,
-    subject: &str,
-    user_id: UserId,
-) -> sqlx::Result<()> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "insert into external_identities (issuer, subject, user_id) \
-         values ($1, $2, $3) on conflict (issuer, subject) do nothing",
-    )
-    .bind(issuer)
-    .bind(subject)
-    .bind(user_id.get())
-    .execute(&mut *tx)
-    .await?;
-    let mapped_user_id: i64 = sqlx::query_scalar(
-        "select user_id from external_identities where issuer = $1 and subject = $2 for update",
-    )
-    .bind(issuer)
-    .bind(subject)
-    .fetch_one(&mut *tx)
-    .await?;
-    if mapped_user_id != user_id.get() {
-        return Err(sqlx::Error::Protocol(format!(
-            "external identity ({issuer}, {subject}) already belongs to user {mapped_user_id}"
-        )));
-    }
-    tx.commit().await
+    Ok(())
 }
 
 /// Resolve the bootstrap principal on every static-key request so disabling the

@@ -10,6 +10,7 @@ use sqlx::{PgPool, Row};
 
 use crate::domain::LibraryId;
 
+mod audit;
 mod files;
 mod fulltext;
 mod groups;
@@ -32,9 +33,7 @@ pub use groups::{
     active_user_exists, api_key_group_grants, group_for_user, groups_for_user,
     resolve_group_library, GroupGrant, GroupLibraryResolution, GroupMetadata,
 };
-pub use identity::{
-    authenticate_api_key, bootstrap_external_identity, bootstrap_identity, bootstrap_principal,
-};
+pub use identity::{authenticate_api_key, bootstrap_identity, bootstrap_principal};
 pub use objects::{delete, item_keys, objects, query_items, write, ObjectMutation};
 pub use sessions::{
     cancel_login_session, complete_login_session, create_login_session, login_session,
