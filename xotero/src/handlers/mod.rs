@@ -6,3 +6,4 @@ pub(crate) mod login;
 pub(crate) mod objects;
 pub(crate) mod settings;
 pub(crate) mod tags;
+pub(crate) mod web_session;

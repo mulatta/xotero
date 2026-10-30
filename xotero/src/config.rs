@@ -23,6 +23,7 @@ pub(crate) struct Config {
     /// login and upload URLs handed to the client, which must be reachable by it
     /// — not the internal bind address. (Downloads use a pre-signed bucket URL.)
     pub(crate) public_url: String,
+    pub(crate) web_origin: String,
     pub(crate) database_url: String,
     pub(crate) s3: s3::Config,
     pub(crate) upload_concurrency: usize,
@@ -53,6 +54,10 @@ impl Config {
         let username = std::env::var("XOTERO_USERNAME").unwrap_or_else(|_| "xotero".into());
         let display_name = std::env::var("XOTERO_DISPLAY_NAME").unwrap_or_else(|_| "xotero".into());
         let library_id = LibraryId::new(1).expect("legacy library ID is positive");
+        let public_url =
+            std::env::var("XOTERO_PUBLIC_URL").unwrap_or_else(|_| format!("http://{bind}"));
+        let web_origin =
+            configured_web_origin(&public_url).unwrap_or_else(|error| panic!("{error}"));
         Self {
             keys,
             login_kdf_key: load_login_kdf_key(),
@@ -67,8 +72,8 @@ impl Config {
                 _ => panic!("XOTERO_BOOTSTRAP_INSTANCE_ADMIN must be true or false"),
             },
             library_id,
-            public_url: std::env::var("XOTERO_PUBLIC_URL")
-                .unwrap_or_else(|_| format!("http://{bind}")),
+            public_url,
+            web_origin,
             bind,
             database_url: std::env::var("XOTERO_DATABASE_URL")
                 .or_else(|_| std::env::var("DATABASE_URL"))
@@ -82,6 +87,85 @@ impl Config {
                 300,
             )),
         }
+    }
+}
+
+fn configured_web_origin(value: &str) -> Result<String, &'static str> {
+    let uri: axum::http::Uri = value.parse().map_err(|_| "invalid XOTERO_PUBLIC_URL")?;
+    let scheme = uri
+        .scheme_str()
+        .ok_or("XOTERO_PUBLIC_URL needs a scheme")?
+        .to_ascii_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https") {
+        return Err("XOTERO_PUBLIC_URL needs HTTP(S)");
+    }
+    let authority = uri
+        .authority()
+        .ok_or("XOTERO_PUBLIC_URL needs an authority")?;
+    if authority.as_str().contains('@') {
+        return Err("XOTERO_PUBLIC_URL cannot contain credentials");
+    }
+    let host = authority.host();
+    let suffix = authority
+        .as_str()
+        .strip_prefix(host)
+        .ok_or("invalid XOTERO_PUBLIC_URL authority")?;
+    let port = if suffix.is_empty() {
+        None
+    } else {
+        let digits = suffix
+            .strip_prefix(':')
+            .filter(|digits| !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()))
+            .ok_or("invalid XOTERO_PUBLIC_URL port")?;
+        Some(
+            digits
+                .parse::<u16>()
+                .map_err(|_| "invalid XOTERO_PUBLIC_URL port")?,
+        )
+    };
+    let host = if let Some(literal) = host.strip_prefix('[').and_then(|v| v.strip_suffix(']')) {
+        let address = literal
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|_| "XOTERO_PUBLIC_URL needs a valid IPv6 literal")?;
+        if address.to_ipv4_mapped().is_some() {
+            // Browser URL serialization uses hexadecimal even for mapped IPv4;
+            // std Display instead emits a dotted-decimal tail for this case.
+            let segments = address.segments();
+            format!("[::ffff:{:x}:{:x}]", segments[6], segments[7])
+        } else {
+            format!("[{address}]")
+        }
+    } else {
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return Err("XOTERO_PUBLIC_URL needs an ASCII hostname or IP literal");
+        }
+        let host = host.to_ascii_lowercase();
+        match host.parse::<std::net::Ipv4Addr>() {
+            Ok(address) => address.to_string(),
+            Err(_) => {
+                let last = host
+                    .trim_end_matches('.')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or_default();
+                if last.bytes().all(|b| b.is_ascii_digit())
+                    || last
+                        .strip_prefix("0x")
+                        .is_some_and(|digits| digits.bytes().all(|b| b.is_ascii_hexdigit()))
+                {
+                    return Err("XOTERO_PUBLIC_URL IPv4 must use canonical dotted decimal");
+                }
+                host
+            }
+        }
+    };
+    match (scheme.as_str(), port) {
+        ("http", Some(80)) | ("https", Some(443)) | (_, None) => Ok(format!("{scheme}://{host}")),
+        (_, Some(port)) => Ok(format!("{scheme}://{host}:{port}")),
     }
 }
 
@@ -232,6 +316,66 @@ fn load_s3() -> s3::Config {
 mod tests {
     use super::*;
     use std::process::{Command, Output};
+
+    #[test]
+    fn web_origin_matches_browser_serialization() {
+        for (configured, expected) in [
+            (
+                "https://LIBRARY.EXAMPLE.TEST:443/library/",
+                "https://library.example.test",
+            ),
+            (
+                "http://LIBRARY.EXAMPLE.TEST:80/",
+                "http://library.example.test",
+            ),
+            (
+                "https://library.example.test",
+                "https://library.example.test",
+            ),
+            (
+                "https://LIBRARY.EXAMPLE.TEST:8443/path",
+                "https://library.example.test:8443",
+            ),
+            (
+                "https://[2001:0DB8:0:0:0:0:0:1]:443/path",
+                "https://[2001:db8::1]",
+            ),
+            ("http://[2001:db8::1]:80/", "http://[2001:db8::1]"),
+            ("https://[2001:db8::1]:8443/", "https://[2001:db8::1]:8443"),
+            (
+                "https://[::ffff:192.0.2.1]:443/",
+                "https://[::ffff:c000:201]",
+            ),
+            ("https://[::192.0.2.1]/", "https://[::c000:201]"),
+            ("http://127.0.0.1:80/", "http://127.0.0.1"),
+            ("https://127.0.0.1:8189/", "https://127.0.0.1:8189"),
+        ] {
+            assert_eq!(
+                configured_web_origin(configured),
+                Ok(expected.to_owned()),
+                "{configured}"
+            );
+        }
+    }
+
+    #[test]
+    fn web_origin_rejects_unsupported_authority() {
+        for value in [
+            "https://user:secret@example.test/",
+            "https://example.test:/",
+            "https://example.test:abc/",
+            "https://example.test:65536/",
+            "https://[not-ipv6]/",
+            "https://[fe80::1%25eth0]/",
+            "https://example.test:+443/",
+            "https://example%2etest/",
+            "https://127.1/",
+            "https://0x7f000001/",
+            "https://0177.0.0.1/",
+        ] {
+            assert!(configured_web_origin(value).is_err(), "{value}");
+        }
+    }
 
     fn key_loader_child(input: Option<(&str, &std::ffi::OsStr)>) -> Output {
         let mut command = Command::new(std::env::current_exe().unwrap());

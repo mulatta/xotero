@@ -20,6 +20,7 @@ mod sessions;
 mod settings;
 mod tags;
 mod versions;
+mod web_sessions;
 pub use files::{
     claim_pending_upload, claim_pending_upload_garbage, claim_retired_blob, create_pending_upload,
     delete_pending_upload_garbage, discard_pending_upload, due_blob_keys, file_for_signing,
@@ -43,6 +44,10 @@ pub use settings::{delete_settings, settings, write_settings};
 pub use tags::{delete_tags, tags};
 pub(super) use versions::version_map;
 pub use versions::{current_version, deleted, top_versions, versions};
+pub use web_sessions::{
+    complete_web_login, create_web_challenge, deny_web_session, logout_web_session, WebLogin,
+    WebSessionAction,
+};
 
 pub enum Outcome<T> {
     Done(T),

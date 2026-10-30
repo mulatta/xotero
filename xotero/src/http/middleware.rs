@@ -168,6 +168,14 @@ pub(crate) async fn log_and_auth(
         if_unmod = %header("if-unmodified-since-version"),
         "request"
     );
+    // These handlers use request parts only. Dispatch before any body polling;
+    // Origin, browser binding, claims and CSRF are checked at their boundary.
+    if (path == "/xotero/web/session"
+        && matches!(method, axum::http::Method::GET | axum::http::Method::POST))
+        || (path == "/xotero/web/session/logout" && method == axum::http::Method::POST)
+    {
+        return next.run(Request::from_parts(parts, body)).await;
+    }
 
     let mut selected_access = None;
     let segments: Vec<_> = path.split('/').collect();

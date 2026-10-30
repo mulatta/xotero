@@ -67,6 +67,14 @@ pub(crate) fn router(state: AppState) -> Router {
             )
     };
     Router::new()
+        .route(
+            "/xotero/web/session",
+            get(crate::handlers::web_session::challenge).post(crate::handlers::web_session::login),
+        )
+        .route(
+            "/xotero/web/session/logout",
+            post(crate::handlers::web_session::logout),
+        )
         .route("/keys/current", get(key_current))
         .route("/keys/sessions", post(create_session))
         .route(
@@ -227,6 +235,7 @@ mod body_tests {
             presign_ttl: 300,
         };
         let config = Config {
+            web_origin: "https://library.example.test".into(),
             keys: HashMap::new(),
             login_kdf_key: vec![0; 32],
             user_id: crate::domain::UserId::new(1).unwrap(),

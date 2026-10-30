@@ -385,3 +385,486 @@ finally:
                                               "root_removed":not root.exists()}), flush=True)
 '''
 print(machine.succeed("python3 -u -c " + shlex.quote(script)))
+
+web_script = r'''
+import concurrent.futures
+import contextlib
+import hashlib
+import http.client
+import http.server
+import json
+import os
+import selectors
+import signal
+import subprocess
+import threading
+
+import psycopg
+
+database = "checkpoint14_web"
+print("CHECKPOINT14_RESOURCES "+json.dumps({"database":database,"pid":os.getpid()}),flush=True)
+server = None
+proxy = None
+receipts = {}
+secrets = []
+origin = "https://library.example.test"
+
+def connect(**kwargs):
+    return psycopg.connect(host="127.0.0.1",user="xotero",dbname=database,
+        options="-c statement_timeout=20000 -c lock_timeout=15000",**kwargs)
+
+def sql(statement,params=None):
+    with connect(autocommit=True) as connection:
+        cursor=connection.execute(statement,params)
+        return cursor.fetchall() if cursor.description is not None else []
+
+def wait_edge(blocker,count=1):
+    with connect(autocommit=True) as observer:
+        observer.execute("""do $$declare deadline timestamptz:=clock_timestamp()+interval '10 seconds';
+            begin loop
+              exit when (select count(*) from pg_stat_activity where
+                """+str(blocker)+"""=any(pg_blocking_pids(pid)))="""+str(count)+""";
+              if clock_timestamp()>deadline then raise exception 'missing exact lock edge'; end if;
+              perform pg_stat_clear_snapshot();
+            end loop; end$$""")
+
+class Proxy(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.forward()
+    def do_POST(self):
+        self.forward()
+    def log_message(self,*args):
+        pass
+    def forward(self):
+        # Stand-in for verified local OIDC authentication. Caller identity
+        # headers never reach the trusted backend, including duplicate copies.
+        identity = {
+            "Bearer fixture-owner-auth": "owner",
+            "Bearer fixture-second-auth": "second",
+            "Bearer fixture-disabled-auth": "disabled",
+            "Bearer fixture-unknown-auth": "unknown",
+        }.get(self.headers.get("Authorization"))
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=20)) as backend:
+            backend.putrequest(self.command,self.path)
+            for name,value in self.headers.items():
+                if name.lower() not in ("host","connection","content-length","authorization",
+                    "x-xotero-oidc-issuer","x-xotero-oidc-subject"):
+                    backend.putheader(name,value)
+            if identity is not None:
+                backend.putheader("X-Xotero-OIDC-Issuer","https://id.example.test")
+                backend.putheader("X-Xotero-OIDC-Subject",identity)
+            backend.endheaders()
+            response=backend.getresponse()
+            body=response.read()
+            self.send_response(response.status)
+            for name,value in response.getheaders():
+                if name.lower() not in ("connection","transfer-encoding","content-length"):
+                    self.send_header(name,value)
+            self.send_header("Content-Length",str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+def request(method,path,cookies=None,csrf=None,user="owner",request_origin=origin,extra=()):
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1",proxy.server_port,timeout=25)) as client:
+        client.putrequest(method,path)
+        if cookies:
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in cookies.items()))
+        if request_origin is not None:
+            client.putheader("Origin",request_origin)
+        if csrf is not None:
+            client.putheader("X-Xotero-CSRF",csrf)
+        if user is not None:
+            client.putheader("Authorization","Bearer fixture-"+user+"-auth")
+        for name,value in extra:
+            client.putheader(name,value)
+        client.endheaders()
+        response=client.getresponse()
+        body=response.read()
+        return response.status,body,response.headers
+
+def challenge(cookies=None):
+    status,body,headers=request("GET","/xotero/web/session",cookies)
+    assert status==200,("web challenge GET",status,body)
+    result=json.loads(body)
+    assert set(result)=={"csrfToken"},result
+    assert len(result["csrfToken"])==64
+    secrets.append(result["csrfToken"])
+    values=headers.get_all("Set-Cookie")
+    assert len(values)==1 and values[0].startswith("__Host-xotero-browser="),values
+    assert "HttpOnly" in values[0] and "Secure" in values[0] and "Path=/" in values[0]
+    jar=dict(cookies or {})
+    name,value=values[0].split(";",1)[0].split("=",1)
+    jar[name]=value
+    secrets.append(value)
+    assert headers["Cache-Control"]=="no-store"
+    return jar,result["csrfToken"]
+
+def login(cookies=None):
+    jar,csrf=challenge(cookies)
+    status,body,headers=request("POST","/xotero/web/session",jar,csrf)
+    assert status==200,(status,body)
+    result=json.loads(body)
+    assert set(result)=={"csrfToken","userID"} and result["userID"]==101,result
+    values=headers.get_all("Set-Cookie")
+    assert len(values)==2,values
+    assert {value.split("=",1)[0] for value in values}=={"__Host-xotero-session","__Host-xotero-browser"},values
+    for value in values:
+        for attribute in ("Secure","HttpOnly","SameSite=Lax","Path=/","Max-Age=28800"):
+            assert attribute in value,values
+        name,token=value.split(";",1)[0].split("=",1)
+        jar[name]=token
+        secrets.append(token)
+    secrets.append(result["csrfToken"])
+    return jar,result["csrfToken"]
+
+def token_hash(jar):
+    return hashlib.sha256(jar["__Host-xotero-session"].encode()).digest()
+
+def family_lock(connection,jar):
+    family=int.from_bytes(hashlib.sha256(jar["__Host-xotero-browser"].encode()).digest()[:4],
+                          "big",signed=True)
+    connection.execute("select pg_advisory_xact_lock(146415674,%s)",(family,))
+
+def logout(jar,csrf):
+    return request("POST","/xotero/web/session/logout",jar,csrf)[0]
+
+try:
+    subprocess.run(["sudo","-u","postgres","createdb","-O","xotero",database],check=True)
+    subprocess.run(["env","DATABASE_URL=postgres://xotero@127.0.0.1/"+database,
+        "sqlx","migrate","run","--source","/etc/xotero-test/v16-migrations"],check=True)
+    preserved_key="23456789ABCDEFGHJKLMNPQR"
+    secrets.append(preserved_key)
+    sql("insert into users(id,username,display_name) values(101,'owner','Owner')")
+    sql("insert into personal_libraries(user_id,library_id) values(101,1)")
+    sql("""insert into external_identities(issuer,subject,user_id)
+        values('https://id.example.test','owner',101)""")
+    sql("insert into instance_admins(user_id) values(101)")
+    sql("insert into bootstrap_state(name) values('identity'),('instance-admin')")
+    sql("""select xotero_append_audit(101,101,'bootstrap.instance-admin','success',
+        '11111111-1111-4111-8111-111111111111')""")
+    sql("""insert into api_keys(id,user_id,name,token_hash) values(401,101,'Preserved v16 credential',%s)""",
+        (hashlib.sha256(preserved_key.encode()).digest(),))
+    sql("""insert into api_key_user_permissions(api_key_id,library,notes,write,files)
+        values(401,true,true,true,true)""")
+    v16_snapshot="""select jsonb_build_array(
+        (select jsonb_agg(to_jsonb(u) order by id) from users u),
+        (select jsonb_agg(to_jsonb(e) order by issuer,subject) from external_identities e),
+        (select jsonb_agg(to_jsonb(p) order by user_id) from personal_libraries p),
+        (select jsonb_agg(to_jsonb(a) order by user_id) from instance_admins a),
+        (select jsonb_agg(to_jsonb(b) order by name) from bootstrap_state b),
+        (select jsonb_agg(to_jsonb(a) order by id) from audit_events a where id<=1),
+        (select jsonb_agg(to_jsonb(k) order by id) from api_keys k),
+        (select jsonb_agg(to_jsonb(p) order by api_key_id) from api_key_user_permissions p))"""
+    preserved=sql(v16_snapshot)
+    v16_checksums=sql("select version,checksum from _sqlx_migrations order by version")
+    environment = os.environ | {
+        "XOTERO_DATABASE_URL":"postgres://xotero@127.0.0.1/"+database,
+        "XOTERO_BIND":"127.0.0.1:8189",
+        "XOTERO_PUBLIC_URL":"https://library.example.test",
+        "XOTERO_USER_ID":"101","XOTERO_USERNAME":"owner","XOTERO_DISPLAY_NAME":"Owner",
+        "XOTERO_BOOTSTRAP_OIDC_ISSUER":"https://id.example.test",
+        "XOTERO_BOOTSTRAP_OIDC_SUBJECT":"owner","XOTERO_BOOTSTRAP_INSTANCE_ADMIN":"true",
+        "XOTERO_LOGIN_KDF_KEY_FILE":"/etc/xotero-test/kdf",
+        "XOTERO_S3_ENDPOINT":"http://127.0.0.1:9000",
+        "XOTERO_S3_ACCESS_KEY":"rustfsadmin","XOTERO_S3_SECRET_KEY":"rustfsadmin",
+    }
+    server=subprocess.Popen(["xotero"],env=environment,stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,bufsize=0)
+    with selectors.DefaultSelector() as observer:
+        observer.register(server.stdout,selectors.EVENT_READ)
+        while True:
+            assert observer.select(45),"startup timeout"
+            line=server.stdout.readline()
+            assert line,server.poll()
+            if b"xotero listening" in line:
+                break
+    proxy=http.server.ThreadingHTTPServer(("127.0.0.1",0),Proxy)
+    proxy_thread=threading.Thread(target=proxy.serve_forever)
+    proxy_thread.start()
+    print("CHECKPOINT14_PROXY "+json.dumps({"port":proxy.server_port,"backend":8189}),flush=True)
+    assert sql(v16_snapshot)==preserved
+    assert sql("select version,checksum from _sqlx_migrations where version<=16 order by version")==v16_checksums
+    assert sql("select max(version) from _sqlx_migrations")==[(17,)]
+    assert request("GET","/keys/current",extra=[("Zotero-API-Key",preserved_key)])[0]==200
+    receipts["populated_v16_authority_audit_key_upgrade_preserved"]=True
+    sql("insert into users(id,username,display_name) values(202,'second','Second'),(303,'disabled','Disabled')")
+    sql("insert into library(id,version,kind) values(22,0,'personal'),(33,0,'personal')")
+    sql("insert into personal_libraries(user_id,library_id) values(202,22),(303,33)")
+    sql("""insert into external_identities(issuer,subject,user_id) values
+        ('https://id.example.test','second',202),('https://id.example.test','disabled',303)""")
+    sql("update users set disabled_at=clock_timestamp() where id=303")
+    jar,csrf=challenge()
+    assert sql("select count(*) from web_sessions")==[(0,)]
+    assert sql("select count(*) from api_keys")==[(1,)]
+    receipts["challenge_only"]=True
+    for supplied_origin in (None,"null","https://evil.example","https://library.example.test/"):
+        assert request("POST","/xotero/web/session",jar,csrf,request_origin=supplied_origin)[0]==403
+    for extra in [
+        [("Origin",origin)],
+        [("X-Xotero-CSRF",csrf)],
+        [("X-Forwarded-Host","evil.example"),("Origin","https://evil.example")],
+    ]:
+        assert request("POST","/xotero/web/session",jar,csrf,extra=extra)[0]==403
+    for user in ("unknown","disabled",None):
+        assert request("POST","/xotero/web/session",jar,csrf,user=user,
+            extra=[("X-Xotero-OIDC-Issuer","https://id.example.test"),
+                   ("X-Xotero-OIDC-Subject","owner")])[0]==403
+    # Overwriting spoofed claims with a different authenticated identity must
+    # select that user's exact personal library, never caller's claimed owner.
+    status,body,headers=request("POST","/xotero/web/session",jar,csrf,user="second",
+        extra=[("X-Xotero-OIDC-Issuer","forged"),("X-Xotero-OIDC-Subject","owner")])
+    assert status==200 and json.loads(body)["userID"]==202,(status,body)
+    assert sql("select user_id,library_id from web_sessions")==[(202,22)]
+    receipts["proxy_overwrite_unknown_disabled_origin"]=True
+    jar,csrf=challenge()
+    alien,unused=challenge()
+    assert request("POST","/xotero/web/session",alien,csrf)[0]==403
+    assert request("POST","/xotero/web/session",jar,"0"*64)[0]==403
+    before=sql("select count(*) from api_keys")[0][0]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with connect() as blocker:
+            family_lock(blocker,jar)
+            futures=[executor.submit(request,"POST","/xotero/web/session",jar,csrf) for _ in range(2)]
+            wait_edge(blocker.info.backend_pid,2)
+            blocker.commit()
+            outcomes=[future.result()[0] for future in futures]
+    assert sorted(outcomes)==[200,403],outcomes
+    assert sql("select count(*) from api_keys")[0][0]==before+1
+    receipts["one_use_browser_bound_concurrent"]=True
+    jar,csrf=login()
+    old=dict(jar)
+    old_csrf=csrf
+    old_key=sql("select api_key_id from web_sessions where token_hash=%s",(token_hash(old),))[0][0]
+    jar,csrf=login(jar)
+    assert jar["__Host-xotero-session"]!=old["__Host-xotero-session"]
+    assert sql("select revoked_at is not null from api_keys where id=%s",(old_key,))==[(True,)]
+    assert logout(old,old_csrf)==403
+    for path in ("/keys/current","/users/101/items","/groups/303/items"):
+        assert request("GET",path,jar,csrf)[0]==403
+    for supplied_origin in (None,"null","https://evil.example"):
+        assert request("POST","/xotero/web/session/logout",jar,csrf,request_origin=supplied_origin)[0]==403
+    assert logout(jar,"0"*64)==403
+    key=sql("select api_key_id from web_sessions where token_hash=%s",(token_hash(jar),))[0][0]
+    assert logout(jar,csrf)==204
+    assert logout(jar,csrf)==403
+    assert sql("select revoked_at is not null from api_keys where id=%s",(key,))==[(True,)]
+    receipts["rotation_logout_key_cookie_isolation"]=True
+    jar,csrf=login()
+    one,c1=challenge(jar)
+    two,c2=challenge(jar)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with connect() as blocker:
+            family_lock(blocker,jar)
+            futures=[executor.submit(request,"POST","/xotero/web/session",j,c)
+                     for j,c in ((one,c1),(two,c2))]
+            wait_edge(blocker.info.backend_pid,2)
+            blocker.commit()
+            outcomes=[future.result()[0] for future in futures]
+    assert sorted(outcomes)==[200,403],outcomes
+    assert sql("select count(*) from web_sessions where browser_hash=%s and revoked_at is null",
+        (hashlib.sha256(jar["__Host-xotero-browser"].encode()).digest(),))==[(1,)]
+    receipts["same_old_session_single_rotation"]=True
+    jar,csrf=login()
+    rotating,challenge_csrf=challenge(jar)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with connect() as blocker:
+            family_lock(blocker,jar)
+            rotating_future=executor.submit(request,"POST","/xotero/web/session",rotating,challenge_csrf)
+            logout_future=executor.submit(logout,jar,csrf)
+            wait_edge(blocker.info.backend_pid,2)
+            blocker.commit()
+            outcomes=[rotating_future.result()[0],logout_future.result()]
+    assert sorted(outcomes) in ([200,403],[204,403]),outcomes
+    receipts["logout_rotation_single_winner"]=True
+    # An unfinished body must not postpone boundary rejection. Direct backend
+    # probes test parsing only; arbitrary local processes are trusted here.
+    for extras in (
+        [("Content-Length","1048576")],
+        [("Origin",origin),("Origin",origin),("Content-Length","1048576")],
+        [("Origin",origin),("X-Xotero-OIDC-Issuer","https://id.example.test"),
+         ("X-Xotero-OIDC-Issuer","https://id.example.test"),
+         ("X-Xotero-OIDC-Subject","owner"),("Content-Length","1048576")],
+    ):
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=5)) as client:
+            client.putrequest("POST","/xotero/web/session")
+            for name,value in extras:
+                client.putheader(name,value)
+            client.endheaders()
+            response=client.getresponse()
+            assert response.status==403,response.status
+            response.read()
+    receipts["prebody_singleton_boundary"]=True
+    # Both operations must encounter their live expiry/revocation/identity
+    # after an observed authority-row wait, not transaction-start now().
+    for mutation in ("expiry","key","disabled","mapping"):
+        jar,csrf=login()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with connect() as blocker:
+                blocker.execute("select id from library where id=1 for update")
+                future=executor.submit(logout,jar,csrf)
+                wait_edge(blocker.info.backend_pid)
+                if mutation=="expiry":
+                    blocker.execute("""update web_sessions set created_at=clock_timestamp()-interval '9 hours',
+                        expires_at=clock_timestamp()-interval '1 hour' where token_hash=%s""",(token_hash(jar),))
+                elif mutation=="key":
+                    blocker.execute("""update api_keys set revoked_at=clock_timestamp() where id=
+                        (select api_key_id from web_sessions where token_hash=%s)""",(token_hash(jar),))
+                elif mutation=="disabled":
+                    blocker.execute("update users set disabled_at=clock_timestamp() where id=101")
+                else:
+                    blocker.execute("update external_identities set user_id=202 where subject='owner'")
+                blocker.commit()
+                assert future.result(timeout=25)==403,mutation
+        sql("update users set disabled_at=null where id=101")
+        sql("update external_identities set user_id=101 where subject='owner'")
+    receipts["live_expiry_key_disabled_mapping_after_wait"]=True
+    for mutation in ("disabled","mapping","challenge-expiry"):
+        jar,csrf=challenge()
+        before=sql("select count(*) from api_keys")[0][0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with connect() as blocker:
+                if mutation=="challenge-expiry":
+                    family_lock(blocker,jar)
+                else:
+                    blocker.execute("select id from library where id=1 for update")
+                future=executor.submit(request,"POST","/xotero/web/session",jar,csrf)
+                wait_edge(blocker.info.backend_pid)
+                if mutation=="disabled":
+                    blocker.execute("update users set disabled_at=clock_timestamp() where id=101")
+                elif mutation=="mapping":
+                    blocker.execute("update external_identities set user_id=202 where subject='owner'")
+                else:
+                    blocker.execute("""update web_challenges set expires_at=clock_timestamp()-interval '1 hour'
+                        where token_hash=%s""",(hashlib.sha256(csrf.encode()).digest(),))
+                blocker.commit()
+                assert future.result(timeout=25)[0]==403,mutation
+        assert sql("select count(*) from api_keys")[0][0]==before
+        sql("update users set disabled_at=null where id=101")
+        sql("update external_identities set user_id=101 where subject='owner'")
+    receipts["login_stale_discovery_no_mint"]=True
+    jar,csrf=login()
+    jar,challenge_csrf=challenge(jar)
+    before=sql("select count(*) from api_keys")[0][0]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=1 for update")
+            future=executor.submit(request,"POST","/xotero/web/session",jar,challenge_csrf)
+            wait_edge(blocker.info.backend_pid)
+            blocker.execute("""update api_keys set revoked_at=clock_timestamp() where id=
+                (select api_key_id from web_sessions where token_hash=%s)""",(token_hash(jar),))
+            blocker.commit()
+            assert future.result(timeout=25)[0]==403
+    assert sql("select count(*) from api_keys")[0][0]==before
+    receipts["rotation_revoked_credential_after_discovery_no_mint"]=True
+    # Failed session insert cannot leave an orphan credential or consume the
+    # challenge. A failed revoke must preserve both session and credential.
+    with connect(autocommit=True) as ddl:
+        ddl.execute("""create function checkpoint14_fail() returns trigger language plpgsql as
+            $$begin raise exception 'fixture constraint failure'; end$$""")
+        ddl.execute("create trigger checkpoint14_fail before insert on web_sessions for each row execute function checkpoint14_fail()")
+    jar,csrf=challenge()
+    before=sql("select count(*) from api_keys")[0][0]
+    assert request("POST","/xotero/web/session",jar,csrf)[0]==500
+    assert sql("select count(*) from api_keys")[0][0]==before
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint14_fail on web_sessions")
+    status,body,headers=request("POST","/xotero/web/session",jar,csrf)
+    assert status==200,(status,body)
+    jar["__Host-xotero-session"]=headers["Set-Cookie"].split(";",1)[0].split("=",1)[1]
+    csrf=json.loads(body)["csrfToken"]
+    with connect(autocommit=True) as ddl:
+        ddl.execute("create trigger checkpoint14_fail before update on web_sessions for each row execute function checkpoint14_fail()")
+    assert logout(jar,csrf)==500
+    assert sql("""select k.revoked_at,s.revoked_at from web_sessions s join api_keys k on k.id=s.api_key_id
+        where s.token_hash=%s""",(token_hash(jar),))==[(None,None)]
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint14_fail on web_sessions")
+        ddl.execute("drop function checkpoint14_fail()")
+    assert logout(jar,csrf)==204
+    receipts["atomic_issue_revoke_rollback"]=True
+    raw=sql("select row_to_json(s)::text from web_sessions s")+sql("select row_to_json(k)::text from api_keys k")
+    for secret in secrets:
+        assert all(secret not in row[0] for row in raw)
+    assert sql("select bool_and(extract(epoch from expires_at-created_at) between 28799 and 28801) from web_sessions where created_at>clock_timestamp()-interval '1 hour'")==[(True,)]
+    receipts["hash_only_absolute_eight_hours"]=True
+    jar,csrf=login()
+    old_hash=token_hash(jar)
+    before=sql("select expires_at from web_sessions where token_hash=%s",(old_hash,))
+    jar,unused=challenge(jar)
+    assert sql("select expires_at from web_sessions where token_hash=%s",(old_hash,))==before
+    sql("""update web_sessions set created_at=clock_timestamp()-interval '9 hours',
+        expires_at=clock_timestamp()-interval '1 hour' where token_hash=%s""",(old_hash,))
+    del jar["__Host-xotero-session"]
+    jar,csrf=login(jar)
+    assert sql("""select s.revoked_at is not null,k.revoked_at is not null from web_sessions s
+        join api_keys k on k.id=s.api_key_id where s.token_hash=%s""",(old_hash,))==[(True,True)]
+    assert logout(jar,csrf)==204
+    receipts["expired_cookie_retained_browser_relogin"]=True
+    jar,csrf=login()
+    retained={k:v for k,v in jar.items() if k!="__Host-xotero-session"}
+    retained,challenge_csrf=challenge(retained)
+    before=sql("select count(*) from api_keys")[0][0]
+    assert request("POST","/xotero/web/session",retained,challenge_csrf)[0]==403
+    assert sql("select count(*) from api_keys")[0][0]==before
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=1 for update")
+            future=executor.submit(request,"POST","/xotero/web/session",retained,challenge_csrf)
+            wait_edge(blocker.info.backend_pid)
+            blocker.execute("""update web_sessions set created_at=clock_timestamp()-interval '9 hours',
+                expires_at=clock_timestamp()-interval '1 hour' where token_hash=%s""",(token_hash(jar),))
+            blocker.commit()
+            assert future.result(timeout=25)[0]==200
+    receipts["live_cookie_required_expiry_after_wait_relogin"]=True
+    # UUIDs are generated server-side and correlate exact safe durable events.
+    jar,csrf=challenge()
+    baseline=sql("select coalesce(max(id),0) from audit_events")[0][0]
+    assert request("POST","/xotero/web/session",jar,csrf,user="unknown")[0]==403
+    denied=sql("""select actor_user_id,subject_user_id,action::text,outcome::text,
+        request_id::text,occurred_at is not null from audit_events where id>%s""",(baseline,))
+    assert len(denied)==1 and denied[0][:4]==(None,None,"web.login","denied") and denied[0][5]
+    status,body,headers=request("POST","/xotero/web/session",jar,csrf)
+    assert status==200
+    issued=sql("""select actor_user_id,subject_user_id,action::text,outcome::text,
+        request_id::text from audit_events where id>%s order by id""",(baseline,))
+    assert issued[1][:4]==(101,101,"web.login","success") and issued[0][4]!=issued[1][4]
+    jar["__Host-xotero-session"]=headers["Set-Cookie"].split(";",1)[0].split("=",1)[1]
+    csrf=json.loads(body)["csrfToken"]
+    with connect(autocommit=True) as ddl:
+        ddl.execute("""create function checkpoint14_audit_fail() returns trigger language plpgsql as
+            $$begin raise exception 'private-audit-failure-must-not-log'; end$$""")
+        ddl.execute("create trigger checkpoint14_audit_fail before insert on audit_events for each row execute function checkpoint14_audit_fail()")
+    assert logout(jar,csrf)==500
+    assert sql("""select s.revoked_at,k.revoked_at from web_sessions s join api_keys k on k.id=s.api_key_id
+        where s.token_hash=%s""",(token_hash(jar),))==[(None,None)]
+    failed_jar,failed_csrf=challenge()
+    before=sql("select count(*) from api_keys")[0][0]
+    assert request("POST","/xotero/web/session",failed_jar,failed_csrf)[0]==500
+    assert sql("select count(*) from api_keys")[0][0]==before
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint14_audit_fail on audit_events")
+        ddl.execute("drop function checkpoint14_audit_fail()")
+    assert logout(jar,csrf)==204
+    events=sql("""select actor_user_id,subject_user_id,action::text,outcome::text,request_id::text
+        from audit_events where id>%s order by id""",(baseline,))
+    assert events[-1][:4]==(101,101,"web.logout","success")
+    assert len({row[4] for row in events})==len(events)
+    secrets.append("private-audit-failure-must-not-log")
+    receipts["uuid_bound_safe_audit_atomic_failure"]=True
+    print("CHECKPOINT14_SESSIONS "+json.dumps(receipts,sort_keys=True),flush=True)
+finally:
+    if proxy is not None:
+        proxy.shutdown()
+        proxy.server_close()
+        proxy_thread.join(timeout=10)
+        assert not proxy_thread.is_alive()
+    if server is not None:
+        if server.poll() is None:
+            server.send_signal(signal.SIGINT)
+        assert server.wait(timeout=15)==0
+        logs=server.stdout.read().decode()
+        assert all(secret not in logs for secret in secrets)
+    subprocess.run(["sudo","-u","postgres","dropdb",database],check=True)
+    print("CHECKPOINT14_CLEANUP "+json.dumps({"database":database,"server":None if server is None else server.pid}),flush=True)
+'''
+print(machine.succeed("python3 -u -c " + shlex.quote(web_script)))
