@@ -292,6 +292,9 @@ pub enum GroupAction {
     Create,
     Update,
     Delete,
+    SetMember,
+    RemoveMember,
+    TransferOwner,
 }
 
 impl GroupAction {
@@ -302,11 +305,42 @@ impl GroupAction {
             Self::Create => "groups.create",
             Self::Update => "groups.update",
             Self::Delete => "groups.delete",
+            Self::SetMember => "groups.set-member",
+            Self::RemoveMember => "groups.remove-member",
+            Self::TransferOwner => "groups.transfer-owner",
         }
     }
 
     pub fn mutation(self) -> bool {
-        matches!(self, Self::Create | Self::Update | Self::Delete)
+        !matches!(self, Self::List | Self::Read)
+    }
+}
+
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(try_from = "String")]
+pub enum GroupRole {
+    Member,
+    Admin,
+}
+
+impl TryFrom<String> for GroupRole {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        match value.as_str() {
+            "member" => Ok(Self::Member),
+            "admin" => Ok(Self::Admin),
+            _ => Err("member or admin string required"),
+        }
+    }
+}
+
+impl GroupRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Member => "member",
+            Self::Admin => "admin",
+        }
     }
 }
 
@@ -367,6 +401,8 @@ pub struct GroupTarget {
     pub action: GroupAction,
     pub id: Option<GroupId>,
     pub owner: Option<UserId>,
+    pub member: Option<UserId>,
+    pub role: Option<GroupRole>,
     pub expected: Option<i64>,
 }
 

@@ -13,7 +13,7 @@ use crate::error::server_error;
 use crate::http::headers::{header_value, version_headers};
 use crate::{store, AppState};
 
-use crate::domain::{GroupAction, GroupChanges, GroupTarget};
+use crate::domain::{GroupAction, GroupChanges, GroupRole, GroupTarget};
 
 fn management_failure() -> Response {
     // SQL errors may contain request values or failed rows.
@@ -72,6 +72,19 @@ struct GroupCreation {
     owner: Option<i64>,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipChange {
+    role: GroupRole,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OwnershipChange {
+    #[serde(rename = "ownerUserID")]
+    owner: i64,
+}
+
 fn group_input(
     action: GroupAction,
     admin: bool,
@@ -121,7 +134,11 @@ fn group_input(
             }
             return Ok((GroupChanges::default(), None));
         }
-        GroupAction::List | GroupAction::Read => return Err(invalid()),
+        GroupAction::List
+        | GroupAction::Read
+        | GroupAction::SetMember
+        | GroupAction::RemoveMember
+        | GroupAction::TransferOwner => return Err(invalid()),
     };
     if !changes.valid() {
         return Err(invalid());
@@ -145,19 +162,20 @@ async fn manage_request(state: &AppState, request: axum::extract::Request) -> Re
     use axum::http::Method;
     let (parts, body) = request.into_parts();
     let segments: Vec<_> = parts.uri.path().split('/').collect();
-    let (admin, raw_id) = match segments.as_slice() {
-        ["", "xotero", "groups"] => (false, None),
-        ["", "xotero", "groups", id] => (false, Some(*id)),
-        ["", "xotero", "admin", "groups"] => (true, None),
-        ["", "xotero", "admin", "groups", id] => (true, Some(*id)),
+    let (admin, route) = match segments.as_slice() {
+        ["", "xotero", "groups", rest @ ..] => (false, rest),
+        ["", "xotero", "admin", "groups", rest @ ..] => (true, rest),
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let action = match (&parts.method, raw_id) {
-        (&Method::GET, None) => GroupAction::List,
-        (&Method::GET, Some(_)) => GroupAction::Read,
-        (&Method::POST, None) => GroupAction::Create,
-        (&Method::PATCH, Some(_)) => GroupAction::Update,
-        (&Method::DELETE, Some(_)) => GroupAction::Delete,
+    let action = match (&parts.method, route) {
+        (&Method::GET, []) => GroupAction::List,
+        (&Method::GET, [_]) => GroupAction::Read,
+        (&Method::POST, []) => GroupAction::Create,
+        (&Method::PATCH, [_]) => GroupAction::Update,
+        (&Method::DELETE, [_]) => GroupAction::Delete,
+        (&Method::PUT, [_, "members", _]) => GroupAction::SetMember,
+        (&Method::DELETE, [_, "members", _]) => GroupAction::RemoveMember,
+        (&Method::POST, [_, "owner"]) => GroupAction::TransferOwner,
         _ => return StatusCode::METHOD_NOT_ALLOWED.into_response(),
     };
     let mut audit = match store::admin_audit(&state.pool).await {
@@ -169,11 +187,19 @@ async fn manage_request(state: &AppState, request: axum::extract::Request) -> Re
         action,
         id: None,
         owner: None,
+        member: None,
+        role: None,
         expected: None,
     };
-    if let Some(raw_id) = raw_id {
+    if let Some(raw_id) = route.first() {
         target.id = raw_id.parse().ok().and_then(GroupId::new);
         if target.id.is_none() {
+            return deny_management(state, &audit, target, StatusCode::BAD_REQUEST).await;
+        }
+    }
+    if let [_, "members", raw_user] = route {
+        target.member = raw_user.parse().ok().and_then(UserId::new);
+        if target.member.is_none() {
             return deny_management(state, &audit, target, StatusCode::BAD_REQUEST).await;
         }
     }
@@ -185,7 +211,7 @@ async fn manage_request(state: &AppState, request: axum::extract::Request) -> Re
         Ok(proof) => proof,
         Err(status) => return deny_management(state, &audit, target, status).await,
     };
-    if matches!(action, GroupAction::Update | GroupAction::Delete) {
+    if action.mutation() && !matches!(action, GroupAction::Create) {
         target.expected = match metadata_version(&parts.headers) {
             Ok(version) => Some(version),
             Err(status) => return deny_management(state, &audit, target, status).await,
@@ -212,9 +238,12 @@ async fn manage_request(state: &AppState, request: axum::extract::Request) -> Re
                     headers.insert("total-results", header_value(&groups.len().to_string()));
                     (headers, Json(groups)).into_response()
                 }
-                GroupAction::Create | GroupAction::Update | GroupAction::Delete => {
-                    management_failure()
-                }
+                GroupAction::Create
+                | GroupAction::Update
+                | GroupAction::Delete
+                | GroupAction::SetMember
+                | GroupAction::RemoveMember
+                | GroupAction::TransferOwner => management_failure(),
             },
             Err(_) => management_failure(),
         };
@@ -227,11 +256,42 @@ async fn manage_request(state: &AppState, request: axum::extract::Request) -> Re
             Ok(bytes) => bytes,
             Err(status) => return deny_management(state, &audit, target, status).await,
         };
-    let (changes, owner) = match group_input(action, admin, &bytes) {
-        Ok(input) => input,
-        Err(status) => return deny_management(state, &audit, target, status).await,
+    let changes = match action {
+        GroupAction::SetMember => {
+            let Ok(input) = serde_json::from_slice::<MembershipChange>(&bytes) else {
+                return deny_management(state, &audit, target, StatusCode::BAD_REQUEST).await;
+            };
+            target.role = Some(input.role);
+            GroupChanges::default()
+        }
+        GroupAction::TransferOwner => {
+            let Ok(input) = serde_json::from_slice::<OwnershipChange>(&bytes) else {
+                return deny_management(state, &audit, target, StatusCode::BAD_REQUEST).await;
+            };
+            target.owner = UserId::new(input.owner);
+            if target.owner.is_none() {
+                return deny_management(state, &audit, target, StatusCode::BAD_REQUEST).await;
+            }
+            GroupChanges::default()
+        }
+        GroupAction::RemoveMember => {
+            if !bytes.is_empty() {
+                return deny_management(state, &audit, target, StatusCode::BAD_REQUEST).await;
+            }
+            GroupChanges::default()
+        }
+        GroupAction::Create
+        | GroupAction::Update
+        | GroupAction::Delete
+        | GroupAction::List
+        | GroupAction::Read => match group_input(action, admin, &bytes) {
+            Ok((changes, owner)) => {
+                target.owner = owner;
+                changes
+            }
+            Err(status) => return deny_management(state, &audit, target, status).await,
+        },
     };
-    target.owner = owner;
     let guard = match store::group_guard(&state.pool, &proof, &mut audit, target).await {
         Ok(Ok(guard)) => guard,
         Ok(Err(denial)) => return group_denial(denial).into_response(),
@@ -370,6 +430,32 @@ pub(crate) async fn group_get(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn membership_input_rejects_owner_duplicate_and_unknown_roles() {
+        for input in [
+            r#"{"role":{"admin":null}}"#,
+            r#"{"role":{"member":null}}"#,
+            r#"{"role":"owner"}"#,
+            r#"{"role":null}"#,
+            r#"{"role":"admin","role":"member"}"#,
+            r#"{"role":"admin","userID":2}"#,
+            r#"{"role":"ADMIN"}"#,
+        ] {
+            assert!(serde_json::from_str::<MembershipChange>(input).is_err());
+        }
+        for input in [r#"{"role":"member"}"#, r#"{"role":"admin"}"#] {
+            assert!(serde_json::from_str::<MembershipChange>(input).is_ok());
+        }
+        for input in [
+            r#"{"ownerUserID":true}"#,
+            r#"{"ownerUserID":null}"#,
+            r#"{"ownerUserID":2,"ownerUserID":3}"#,
+            r#"{"ownerUserID":2,"role":"owner"}"#,
+        ] {
+            assert!(serde_json::from_str::<OwnershipChange>(input).is_err());
+        }
+    }
 
     #[test]
     fn metadata_precondition_rejects_weak_multiple_and_nonpositive_versions() {

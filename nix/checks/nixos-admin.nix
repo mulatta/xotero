@@ -20,6 +20,7 @@ let
   v16Migrations = migrationsThrough "0016";
   v18Migrations = migrationsThrough "0018";
   v19Migrations = migrationsThrough "0019";
+  v20Migrations = migrationsThrough "0020";
 in
 testPkgs.testers.runNixOSTest {
   name = "xotero-admin";
@@ -55,6 +56,7 @@ testPkgs.testers.runNixOSTest {
     environment.etc."xotero-test/v16-migrations".source = v16Migrations;
     environment.etc."xotero-test/v18-migrations".source = v18Migrations;
     environment.etc."xotero-test/v19-migrations".source = v19Migrations;
+    environment.etc."xotero-test/v20-migrations".source = v20Migrations;
     environment.etc."xotero-test/current-migrations".source = ../../xotero/migrations;
     environment.etc."xotero-test/kdf".text = "0123456789abcdef0123456789abcdef";
     environment.systemPackages = [

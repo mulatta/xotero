@@ -88,6 +88,22 @@ pub(crate) fn router(state: AppState) -> Router {
                 .patch(crate::handlers::groups::manage)
                 .delete(crate::handlers::groups::manage),
         )
+        .route(
+            "/xotero/groups/{id}/members/{userId}",
+            put(crate::handlers::groups::manage).delete(crate::handlers::groups::manage),
+        )
+        .route(
+            "/xotero/admin/groups/{id}/members/{userId}",
+            put(crate::handlers::groups::manage).delete(crate::handlers::groups::manage),
+        )
+        .route(
+            "/xotero/groups/{id}/owner",
+            post(crate::handlers::groups::manage),
+        )
+        .route(
+            "/xotero/admin/groups/{id}/owner",
+            post(crate::handlers::groups::manage),
+        )
         .route("/xotero/me/keys", get(manage).post(manage))
         .route("/xotero/me/keys/{id}", route_delete(manage))
         .route("/xotero/admin/users/{id}/keys", get(manage))

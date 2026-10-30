@@ -410,8 +410,8 @@ try:
     assert sql(upgrade18,snapshot18)==saved18
     assert sql(upgrade18,"select version,checksum from _sqlx_migrations where version<=18 order by version")==checksums18
     assert sql(upgrade18,"select policy_limited from api_key_group_permissions")==[(False,)]
-    assert sql(upgrade18,"select max(version) from _sqlx_migrations")==[(20,)]
-    print("CHECKPOINT16_UPGRADE "+json.dumps({"from":18,"to":20,"preserved_keys":2,
+    assert sql(upgrade18,"select max(version) from _sqlx_migrations")==[(21,)]
+    print("CHECKPOINT16_UPGRADE "+json.dumps({"from":18,"to":21,"preserved_keys":2,
         "preserved_sessions":1,"preserved_personal_permissions":2,
         "preserved_all_group_permissions":1,"preserved_explicit_permissions":1,
         "legacy_explicit_policy_limited":False,"checksums_preserved":True}),flush=True)
@@ -452,9 +452,38 @@ try:
     assert sql(upgrade19,"select policy_limited from api_key_group_permissions")==[(True,)]
     assert sql(upgrade19,"select version,checksum from _sqlx_migrations where version<=19 order by version")==checksums19
     assert sql(upgrade19,"select nextval(pg_get_serial_sequence('groups','id'))")==[(1901,)]
-    print("CHECKPOINT17_UPGRADE "+json.dumps({"from":19,"to":20,"all_old_fields_preserved":True,
+    print("CHECKPOINT17_UPGRADE "+json.dumps({"from":19,"to":21,"all_old_fields_preserved":True,
         "pending_uploaded_receipt_preserved":True,"sequence_high_water_preserved":True,
         "new_audit_subject_default":None,"checksums_preserved":True}),flush=True)
+    upgrade20=database("transitions_upgrade20")
+    subprocess.run(["env","DATABASE_URL=postgres://xotero@127.0.0.1/"+upgrade20,
+        "sqlx","migrate","run","--source","/etc/xotero-test/v20-migrations"],check=True)
+    with connect(upgrade20) as fixture:
+        fixture.execute("insert into users(id,username,display_name) values(101,'owner','Owner'),(202,'member','Member')")
+        fixture.execute("insert into personal_libraries(user_id,library_id) values(101,1)")
+        fixture.execute("insert into external_identities(issuer,subject,user_id) values('https://id.example.test','owner',101)")
+        fixture.execute("insert into bootstrap_state(name) values('identity'),('instance-admin')")
+        fixture.execute("insert into instance_admins(user_id) values(101)")
+        fixture.execute("insert into library(id,version,kind) values(92,27,'group')")
+        fixture.execute("insert into groups(id,library_id,owner_user_id,name,version) values(902,92,101,'Preserved twenty',19)")
+        fixture.execute("insert into group_memberships(group_id,user_id,role) values(902,101,'owner'),(902,202,'member')")
+        fixture.execute("insert into api_keys(id,user_id,name,token_hash) values(402,202,'Twenty key',decode(repeat('45',32),'hex'))")
+        fixture.execute("insert into api_key_group_permissions(api_key_id,user_id,group_id,library,write,policy_limited) values(402,202,902,true,true,true)")
+        fixture.execute("insert into api_key_all_groups_permissions(api_key_id,library,write) values(402,true,true)")
+        fixture.execute("select xotero_append_audit(101,202,'groups.update','success',gen_random_uuid())")
+    tables20=(*tables19,"api_key_all_groups_permissions")
+    saved20={table:sql(upgrade20,"select jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text) from "+table+" t")
+        for table in tables20}
+    last_audit20=sql(upgrade20,"select max(id) from audit_events")[0][0]
+    checksums20=sql(upgrade20,"select version,checksum from _sqlx_migrations order by version")
+    start(upgrade20)
+    for table in tables20:
+        old_rows=" where id<="+str(last_audit20) if table=="audit_events" else ""
+        assert sql(upgrade20,"select jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text) from "+table+" t"+old_rows)==saved20[table],table
+    assert sql(upgrade20,"select version,checksum from _sqlx_migrations where version<=20 order by version")==checksums20
+    assert sql(upgrade20,"select max(version) from _sqlx_migrations")==[(21,)]
+    print("CHECKPOINT18_UPGRADE "+json.dumps({"from":20,"to":21,"all_populated_rows_preserved":True,
+        "checksums_preserved":True,"owner_fk_and_unique_index_unchanged":True}),flush=True)
     print("CHECKPOINT13_BOOTSTRAP " + json.dumps(receipts, sort_keys=True), flush=True)
 finally:
     for process in processes:
@@ -692,7 +721,7 @@ try:
     print("CHECKPOINT14_PROXY "+json.dumps({"port":proxy.server_port,"backend":8189}),flush=True)
     assert sql(v16_snapshot)==preserved
     assert sql("select version,checksum from _sqlx_migrations where version<=16 order by version")==v16_checksums
-    assert sql("select max(version) from _sqlx_migrations")==[(20,)]
+    assert sql("select max(version) from _sqlx_migrations")==[(21,)]
     assert request("GET","/keys/current",extra=[("Zotero-API-Key",preserved_key)])[0]==200
     receipts["populated_v16_authority_audit_key_upgrade_preserved"]=True
     sql("insert into users(id,username,display_name) values(202,'second','Second'),(303,'disabled','Disabled')")
@@ -1248,6 +1277,354 @@ try:
         "--user","rustfsadmin:rustfsadmin","-X","PUT","http://127.0.0.1:9000/zotero"],
         check=True)
     group_owner,group_owner_csrf=login(user="provisioned",user_id=target)
+    status,body,_=request("POST","/xotero/groups",group_owner,group_owner_csrf,
+        body={"name":"Membership transitions"})
+    assert status==201,(status,body)
+    transition_group=json.loads(body)
+    transition_path="/xotero/groups/"+str(transition_group["groupID"])
+    status,body,_=request("PUT",transition_path+"/members/202",group_owner,group_owner_csrf,
+        body={"role":"member"},extra=[("If-Match",'"1"')])
+    assert status==204,("checkpoint18 supported membership PUT",status,body)
+    assert sql("select user_id,role from group_memberships where group_id=%s order by user_id",
+        (transition_group["groupID"],))==sorted([(target,"owner"),(202,"member")])
+    transition_gid=transition_group["groupID"]
+    transition_lib=transition_group["libraryID"]
+    transition_admin="/xotero/admin/groups/"+str(transition_gid)
+    transition_member,transition_csrf=login(user="second",user_id=202)
+    transition_roles=[]
+    transition_races=[]
+
+    # No request body byte is sent for these boundary denials.
+    for cookies,token,supplied_origin,expected in (
+        ({},None,origin,401),(transition_member,transition_csrf,origin,403),
+        (group_owner,group_owner_csrf,None,403),(group_owner,"0"*64,origin,403),
+    ):
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=5)) as client:
+            client.putrequest("PUT",transition_path+"/members/202")
+            client.putheader("Content-Length","1048576")
+            client.putheader("If-Match",'"2"')
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in cookies.items()))
+            if supplied_origin is not None:
+                client.putheader("Origin",supplied_origin)
+            if token is not None:
+                client.putheader("X-Xotero-CSRF",token)
+            client.endheaders()
+            response=client.getresponse()
+            assert response.status==expected,(response.status,expected)
+            response.read()
+    transition_races.append({"race":"prebody session role origin CSRF denials","statuses":[401,403,403,403]})
+
+    def transition(method,suffix,payload=None,cookies=group_owner,token=group_owner_csrf,
+                   expected=204,version=None,administrative=False):
+        if version is None:
+            version=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+        before=sql("select version from library where id=%s",(transition_lib,))
+        metadata_before=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+        baseline=sql("select coalesce(max(id),0) from audit_events")[0][0]
+        path=(transition_admin if administrative else transition_path)+suffix
+        status,body,_=request(method,path,cookies,token,body=payload,
+            extra=[("If-Match",'"'+str(version)+'"')])
+        assert status==expected,(method,path,payload,status,expected,body)
+        assert sql("select version from library where id=%s",(transition_lib,))==before
+        events=sql("""select action::text,outcome::text,subject_user_id,subject_group_id
+            from audit_events where id>%s order by id""",(baseline,))
+        assert len(events)==1 and events[0][3]==transition_gid,events
+        metadata_after=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+        assert metadata_after in (metadata_before,metadata_before+1)
+        if status!=204:
+            assert metadata_after==metadata_before
+        expected_subject=None
+        if suffix.startswith("/members/"):
+            expected_subject=int(suffix.rsplit("/",1)[1])
+        elif (status not in (401,403,412) and payload is not None and set(payload)=={"ownerUserID"}
+                and type(payload["ownerUserID"]) is int and payload["ownerUserID"]>0):
+            expected_subject=payload["ownerUserID"]
+        expected_action="groups.transfer-owner" if suffix=="/owner" else (
+            "groups.set-member" if method=="PUT" else "groups.remove-member")
+        expected_outcome="denied" if status!=204 else (
+            "noop" if metadata_after==metadata_before else "success")
+        assert events[0]==(expected_action,expected_outcome,expected_subject,transition_gid),events
+        transition_roles.append({"method":method,"path":path,"status":status,
+            "audit":events[0],"metadata":sql("select version from groups where id=%s",(transition_gid,))[0][0]})
+        return status
+
+    # Strict role and owner input cannot alter membership or metadata.
+    for payload in ({"role":{"admin":None}},{"role":{"member":None}},
+                    {},{"role":None},{"role":"owner"},{"role":"ADMIN"},
+                    {"role":"member","extra":True}):
+        transition("PUT","/members/202",payload,expected=400)
+    for payload in ({},{"ownerUserID":None},{"ownerUserID":0},{"ownerUserID":True},
+                    {"ownerUserID":"202"},{"ownerUserID":202,"role":"owner"}):
+        transition("POST","/owner",payload,expected=400)
+    transition("DELETE","/members/202",{},expected=400)
+    transition("PUT","/members/202",{"role":"member"})
+    assert sql("select version from groups where id=%s",(transition_gid,))==[(2,)]
+    transition("PUT","/members/202",{"role":"admin"},version=1,expected=412)
+    transition("PUT","/members/"+str(target),{"role":"admin"},expected=409)
+    transition("DELETE","/members/"+str(target),expected=409)
+    transition("POST","/owner",{"ownerUserID":target})
+    transition("POST","/owner",{"ownerUserID":101},expected=409)
+    transition("PUT","/members/999999",{"role":"member"},expected=404)
+    transition("POST","/owner",{"ownerUserID":999999},expected=404)
+    for method,suffix,payload in (
+        ("PUT","/members/101",{"role":"member"}),("DELETE","/members/202",None),
+        ("POST","/owner",{"ownerUserID":202}),
+    ):
+        transition(method,suffix,payload,transition_member,transition_csrf,expected=403)
+        transition(method,suffix,payload,jar,csrf,expected=403)
+    transition("PUT","/members/202",{"role":"admin"})
+    # Group administrator metadata authority is not membership authority.
+    transition("PUT","/members/101",{"role":"member"},transition_member,transition_csrf,expected=403)
+    transition("POST","/owner",{"ownerUserID":202},transition_member,transition_csrf,expected=403)
+    transition("DELETE","/members/202",cookies=transition_member,token=transition_csrf,expected=403)
+    sql("update users set disabled_at=clock_timestamp() where id=202")
+    transition("PUT","/members/202",{"role":"member"},expected=409)
+    transition("POST","/owner",{"ownerUserID":202},expected=409)
+    sql("update users set disabled_at=null where id=202")
+    transition("POST","/owner",{"ownerUserID":202})
+    assert sql("select owner_user_id from groups where id=%s",(transition_gid,))==[(202,)]
+    assert sql("select user_id,role from group_memberships where group_id=%s order by user_id",
+        (transition_gid,))==sorted([(target,"admin"),(202,"owner")])
+    transition("DELETE","/members/202",expected=403)
+    transition("POST","/owner",{"ownerUserID":target},jar,csrf,administrative=True)
+    transition("PUT","/members/202",{"role":"member"},jar,csrf,administrative=True)
+    transition("DELETE","/members/101")
+    transition("PUT","/members/101",{"role":"member"},jar,csrf,administrative=True)
+    transition("DELETE","/members/101",cookies=jar,token=csrf,administrative=True)
+    assert request("GET","/groups/"+str(transition_gid)+"/items",
+        extra=[("Zotero-API-Key","fixture-admin-recovery")])[0]==403
+
+    # An audit failure must roll back role and metadata together.
+    before=sql("select version from groups where id=%s",(transition_gid,))
+    with connect(autocommit=True) as ddl:
+        ddl.execute("""create function checkpoint18_audit_fail() returns trigger language plpgsql as
+            $$begin raise exception 'private-transition-audit-failure'; end$$""")
+        ddl.execute("create trigger checkpoint18_audit_fail before insert on audit_events for each row execute function checkpoint18_audit_fail()")
+    assert request("POST",transition_path+"/owner",group_owner,group_owner_csrf,
+        body={"ownerUserID":202},extra=[("If-Match",'"'+str(before[0][0])+'"')])[0]==500
+    assert sql("select version from groups where id=%s",(transition_gid,))==before
+    assert sql("select owner_user_id from groups where id=%s",(transition_gid,))==[(target,)]
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint18_audit_fail on audit_events")
+        ddl.execute("drop function checkpoint18_audit_fail()")
+    secrets.append("private-transition-audit-failure")
+
+    # Competing transitions observe the exact same group lock; only one stale
+    # precondition can win, and the deferred owner FK holds at commit.
+    version=before[0][0]
+    race_audit=sql("select coalesce(max(id),0) from audit_events")[0][0]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=%s for update",(transition_lib,))
+            futures=[
+                executor.submit(request,"POST",transition_path+"/owner",group_owner,group_owner_csrf,
+                    body={"ownerUserID":202},extra=[("If-Match",'"'+str(version)+'"')]),
+                executor.submit(request,"DELETE",transition_path+"/members/202",group_owner,group_owner_csrf,
+                    extra=[("If-Match",'"'+str(version)+'"')]),
+            ]
+            # PostgreSQL's tuple queue may place the second waiter behind the
+            # first. Both must be observed in the exact blocker's lock graph.
+            graph=f"""with recursive waiters(pid) as (
+                select pid from pg_stat_activity where {blocker.info.backend_pid}=any(pg_blocking_pids(pid))
+                union select a.pid from pg_stat_activity a join waiters w
+                    on w.pid=any(pg_blocking_pids(a.pid))
+                ) select a.pid,pg_blocking_pids(a.pid),a.query,a.wait_event_type
+                from pg_stat_activity a join waiters w on a.pid=w.pid
+                where a.datname=current_database()"""
+            try:
+                with connect(autocommit=True) as observer:
+                    observer.execute("""do $$declare deadline timestamptz:=clock_timestamp()+interval '10 seconds';
+                        begin loop
+                        exit when (select count(*) from ("""+graph+""") edges
+                            where query='select id from library where id=$1 for update' and wait_event_type='Lock')=2;
+                        if clock_timestamp()>deadline then raise exception 'missing two transition library waiters'; end if;
+                        perform pg_stat_clear_snapshot();
+                        end loop; end$$""")
+            finally:
+                transition_edges=sql(graph)
+                print("CHECKPOINT18_LOCK_GRAPH "+json.dumps({"blocker":blocker.info.backend_pid,
+                    "library":transition_lib,"edges":transition_edges}),flush=True)
+            assert len(transition_edges)==2,transition_edges
+            blocker.commit()
+            statuses=[future.result(timeout=25)[0] for future in futures]
+    assert statuses.count(204)==1 and all(status in (204,409,412,403) for status in statuses),statuses
+    assert sql("select version from groups where id=%s",(transition_gid,))==[(version+1,)]
+    race_events=sql("""select action::text,outcome::text,subject_user_id,subject_group_id
+        from audit_events where id>%s order by id""",(race_audit,))
+    assert len(race_events)==2 and sorted(row[1] for row in race_events)==["denied","success"],race_events
+    assert sql("""select count(*) from groups g join group_memberships m on m.group_id=g.id
+        and m.user_id=g.owner_user_id and m.role='owner' join users u on u.id=m.user_id
+        and u.disabled_at is null where g.id=%s""",(transition_gid,))==[(1,)]
+    transition_races.append({"race":"transfer versus removal","statuses":statuses,
+        "enabled_owners":1,"edges":transition_edges,"audit":race_events,"metadata":version+1})
+    if sql("select owner_user_id from groups where id=%s",(transition_gid,))==[(202,)]:
+        transition("POST","/owner",{"ownerUserID":target},jar,csrf,administrative=True)
+    transition("PUT","/members/202",{"role":"member"})
+
+    # Target disablement committed while add/transfer awaits the user's positive
+    # SHARE lock wins; no timing or body-admission assumption.
+    for method,suffix,payload in (
+        ("PUT","/members/202",{"role":"admin"}),("POST","/owner",{"ownerUserID":202}),
+    ):
+        version=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with connect() as blocker:
+                blocker.execute("select id from users where id=202 for update")
+                future=executor.submit(request,method,transition_path+suffix,group_owner,group_owner_csrf,
+                    body=payload,extra=[("If-Match",'"'+str(version)+'"')])
+                wait_edge(blocker.info.backend_pid)
+                blocker.execute("update users set disabled_at=clock_timestamp() where id=202")
+                blocker.commit()
+                assert future.result(timeout=25)[0]==409
+        sql("update users set disabled_at=null where id=202")
+        transition_races.append({"race":"target disablement","method":method,"status":409})
+
+    # Removing one group must not revoke personal or other-group authority.
+    transition_key=mint(wildcard,cookies=transition_member,token=transition_csrf)
+    mixed18=json.loads(json.dumps(empty))
+    mixed18["user"]={"library":True,"notes":False,"write":False,"files":False}
+    mixed18["groups"]["individual"]=[
+        {"groupID":transition_gid,"library":True,"write":True},
+        {"groupID":707,"library":True,"write":True},
+    ]
+    explicit18=mint(mixed18,cookies=transition_member,token=transition_csrf)
+    owner18=mint(wildcard,cookies=group_owner,token=group_owner_csrf)
+    other_grant=sql("select to_jsonb(p) from api_key_group_permissions p where api_key_id=%s and group_id=707",
+        (explicit18["id"],))
+    def transition_data(method,suffix,body=b"",credential=owner18["token"],headers=None):
+        fields={"Zotero-API-Key":credential,"Content-Type":"application/x-www-form-urlencoded"}
+        fields.update(headers or {})
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=25)) as client:
+            client.request(method,f"/groups/{transition_gid}/"+suffix,body,fields)
+            response=client.getresponse()
+            return response.status,response.read()
+
+    status,body=transition_data("POST","items",
+        json.dumps([{"key":"MEMBER22","itemType":"attachment","linkMode":"imported_file"}]),
+        headers={"Content-Type":"application/json","If-Unmodified-Since-Version":"0"})
+    assert status==200 and not json.loads(body)["failed"],(status,body)
+    content=b"member original authorizer"
+    status,body=transition_data("POST","items/MEMBER22/file",urllib.parse.urlencode({
+        "md5":hashlib.md5(content).hexdigest(),"filename":"member.txt","filesize":len(content),"mtime":1}),
+        explicit18["token"],{"If-None-Match":"*"})
+    assert status==200,(status,body)
+    upload18=json.loads(body)["uploadKey"]
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=25)) as client:
+        client.request("POST","/uploads/"+upload18,content)
+        response=client.getresponse()
+        assert response.status==201,response.read()
+        response.read()
+    transition("DELETE","/members/202")
+    for credential in (explicit18["token"],transition_key["token"]):
+        assert transition_data("GET","items",credential=credential)[0]==403
+    before=sql("select version from library where id=%s",(transition_lib,))
+    assert transition_data("POST","items/MEMBER22/file",urllib.parse.urlencode({"upload":upload18}))[0]==403
+    assert sql("select version from library where id=%s",(transition_lib,))==before
+    assert sql("select count(*) from file where library_id=%s",(transition_lib,))==[(0,)]
+    assert sql("select count(*) from api_key_group_permissions where api_key_id=%s and group_id=%s",
+        (explicit18["id"],transition_gid))==[(0,)]
+    assert sql("select to_jsonb(p) from api_key_group_permissions p where api_key_id=%s and group_id=707",
+        (explicit18["id"],))==other_grant
+    assert key_api("GET","/groups/707/items",credential=explicit18["token"])[0]==200
+    assert key_api("GET","/users/202/items",credential=explicit18["token"])[0]==200
+    assert sql("select revoked_at from api_keys where id=any(%s) order by id",
+        ([explicit18["id"],transition_key["id"]],))==[(None,),(None,)]
+    transition("PUT","/members/202",{"role":"member"})
+    assert transition_data("GET","items",credential=explicit18["token"])[0]==403
+    assert transition_data("GET","items",credential=transition_key["token"])[0]==200
+    assert transition_data("POST","items/MEMBER22/file",urllib.parse.urlencode({"upload":upload18}))[0]==403
+    transition_races.append({"race":"original explicit authorizer removed before alternate registration",
+        "removed_registration":403,"readded_registration":403,"wildcard_readded":200,
+        "explicit_readded":403,"mixed_other_scope":200,"file_rows":0})
+
+    # Exact backend100 proves ordinary key admission happened before supported
+    # removal. The shared MutationProof still denies the withheld write.
+    payload=b'[{"key":"STALE822","itemType":"book","title":"Must not persist"}]'
+    with socket.create_connection(("127.0.0.1",8189),timeout=20) as stream:
+        stream.sendall((
+            f"POST /groups/{transition_gid}/items HTTP/1.1\r\nHost: localhost\r\n"
+            f"Zotero-API-Key: {transition_key['token']}\r\n"
+            f"If-Unmodified-Since-Version: {before[0][0]}\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            "Expect: 100-continue\r\nConnection: close\r\n\r\n").encode())
+        interim=b""
+        while not interim.endswith(b"\r\n\r\n"):
+            chunk=stream.recv(1)
+            assert chunk,"connection ended before admission"
+            interim+=chunk
+        assert interim.startswith(b"HTTP/1.1 100 "),interim
+        transition("DELETE","/members/202")
+        stream.sendall(payload)
+        response=http.client.HTTPResponse(stream)
+        response.begin()
+        assert response.status==403,response.status
+        response.read()
+    assert sql("select version from library where id=%s",(transition_lib,))==before
+    assert sql("select count(*) from object where library_id=%s and key='STALE822'",(transition_lib,))==[(0,)]
+    transition_races.append({"race":"ordinary write admission then supported member removal","admission":100,"status":403})
+    transition("PUT","/members/202",{"role":"member"})
+
+    # Revoke the session while the target membership lock is held. Its final
+    # session read must follow that wait, not trust prebody admission.
+    race_owner,race_token=login(user="provisioned",user_id=target)
+    version=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+    payload=b'{"role":"admin"}'
+    with socket.create_connection(("127.0.0.1",8189),timeout=20) as stream:
+        stream.sendall((
+            f"PUT {transition_path}/members/202 HTTP/1.1\r\nHost: localhost\r\n"
+            f"Cookie: {'; '.join(k+'='+v for k,v in race_owner.items())}\r\n"
+            f"Origin: {origin}\r\nX-Xotero-CSRF: {race_token}\r\nIf-Match: \"{version}\"\r\n"
+            f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+            "Expect: 100-continue\r\nConnection: close\r\n\r\n").encode())
+        interim=b""
+        while not interim.endswith(b"\r\n\r\n"):
+            chunk=stream.recv(1)
+            assert chunk,"connection ended before management admission"
+            interim+=chunk
+        assert interim.startswith(b"HTTP/1.1 100 "),interim
+        with connect() as blocker:
+            blocker.execute("select user_id from group_memberships where group_id=%s and user_id=202 for update",
+                (transition_gid,))
+            stream.sendall(payload)
+            wait_edge(blocker.info.backend_pid)
+            blocker.execute("update web_sessions set revoked_at=clock_timestamp() where token_hash=%s",
+                (token_hash(race_owner),))
+            blocker.commit()
+        response=http.client.HTTPResponse(stream)
+        response.begin()
+        assert response.status==401,response.status
+        response.read()
+    assert sql("select role from group_memberships where group_id=%s and user_id=202",(transition_gid,))==[("member",)]
+    assert sql("select version from groups where id=%s",(transition_gid,))==[(version,)]
+    transition_races.append({"race":"session revoked during postbody membership wait","admission":100,"status":401})
+
+    # Cancel the exact blocked operation, not the service or another test's
+    # connection. A clean retry uses the unchanged metadata precondition.
+    version=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with connect() as blocker:
+            blocker.execute("select user_id from group_memberships where group_id=%s and user_id=202 for update",
+                (transition_gid,))
+            future=executor.submit(request,"PUT",transition_path+"/members/202",group_owner,group_owner_csrf,
+                body={"role":"admin"},extra=[("If-Match",'"'+str(version)+'"')])
+            wait_edge(blocker.info.backend_pid)
+            blocked=sql("select pid from pg_stat_activity where %s=any(pg_blocking_pids(pid))",
+                (blocker.info.backend_pid,))
+            assert len(blocked)==1,blocked
+            assert sql("select pg_cancel_backend(%s)",(blocked[0][0],))==[(True,)]
+            assert future.result(timeout=25)[0]==500
+            blocker.commit()
+    assert sql("select role from group_memberships where group_id=%s and user_id=202",(transition_gid,))==[("member",)]
+    assert sql("select version from groups where id=%s",(transition_gid,))==[(version,)]
+    transition("PUT","/members/202",{"role":"admin"},version=version)
+    transition_races.append({"race":"cancel exact blocked backend then resume","backend":blocked[0][0],
+        "cancelled":500,"retry":204,"partial_mutation":False})
+
+    print("CHECKPOINT18_ROLES "+json.dumps(transition_roles,sort_keys=True),flush=True)
+    print("CHECKPOINT18_RACES "+json.dumps(transition_races,sort_keys=True),flush=True)
+    version=sql("select version from groups where id=%s",(transition_gid,))[0][0]
+    assert request("DELETE",transition_path,group_owner,group_owner_csrf,
+        extra=[("If-Match",'"'+str(version)+'"')])[0]==204
     status,body,headers=request("POST","/xotero/groups",group_owner,group_owner_csrf,
         body={"name":"Managed private group"})
     assert status==201,("checkpoint17 supported group create",status,body)

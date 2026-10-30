@@ -123,6 +123,7 @@ pub async fn group_guard<'a>(
     let mut users = vec![session.user()];
     users.extend(groups.iter().map(|g| g.owner));
     users.extend(target.owner.map(UserId::get));
+    users.extend(target.member.map(UserId::get));
     users.sort_unstable();
     users.dedup();
     // Missing requested owners are handled as404 after authenticating. Missing
@@ -166,7 +167,13 @@ pub async fn group_guard<'a>(
         role_locked,
     };
     for group in &mut guard.groups {
-        let query = if matches!(target.action, GroupAction::Delete) {
+        let query = if matches!(
+            target.action,
+            GroupAction::Delete
+                | GroupAction::SetMember
+                | GroupAction::RemoveMember
+                | GroupAction::TransferOwner
+        ) {
             "select user_id from group_memberships where group_id=$1 order by user_id for update"
         } else {
             "select user_id from group_memberships where group_id=$1 order by user_id for share"
@@ -178,12 +185,17 @@ pub async fn group_guard<'a>(
         group.membership = members.contains(&guard.session.user());
         complete &= members.contains(&group.owner);
     }
-    if matches!(target.action, GroupAction::Delete) {
+    if matches!(
+        target.action,
+        GroupAction::Delete | GroupAction::RemoveMember
+    ) {
         sqlx::query(
             "select api_key_id from api_key_group_permissions \
-             where group_id=$1 order by api_key_id for update",
+             where group_id=$1 and ($2::bigint is null or user_id=$2) \
+             order by api_key_id for update",
         )
         .bind(target.id.map(GroupId::get))
+        .bind(target.member.map(UserId::get))
         .fetch_all(&mut *guard.tx)
         .await?;
     }
@@ -200,6 +212,7 @@ pub async fn group_guard<'a>(
         Err(GroupDenial::Conflict)
     } else if target
         .owner
+        .or(target.member)
         .is_some_and(|owner| !locked_users.contains(&owner.get()))
     {
         Err(GroupDenial::Missing)
@@ -221,7 +234,11 @@ impl GroupGuard<'_> {
         if self.target.id.is_some() && self.groups.is_empty() {
             return Ok(Err(GroupDenial::Missing));
         }
-        if let Some(owner) = self.target.owner {
+        if let Some(owner) = self.target.owner.or(self
+            .target
+            .member
+            .filter(|_| matches!(self.target.action, GroupAction::SetMember)))
+        {
             let enabled: Option<bool> =
                 sqlx::query_scalar("select disabled_at is null from users where id=$1")
                     .bind(owner.get())
@@ -260,7 +277,10 @@ impl GroupGuard<'_> {
                         GroupAction::Update => {
                             matches!(role.as_deref(), Some("owner" | "admin"))
                         }
-                        GroupAction::Delete => role.as_deref() == Some("owner"),
+                        GroupAction::Delete
+                        | GroupAction::SetMember
+                        | GroupAction::RemoveMember
+                        | GroupAction::TransferOwner => role.as_deref() == Some("owner"),
                         GroupAction::Create => false,
                     };
                 if !allowed {
@@ -273,6 +293,27 @@ impl GroupGuard<'_> {
                 .is_some_and(|expected| expected != current.get::<i64, _>("version"))
             {
                 return Ok(Err(GroupDenial::Stale));
+            }
+            if self
+                .target
+                .member
+                .is_some_and(|member| member.get() == group.owner)
+            {
+                return Ok(Err(GroupDenial::Conflict));
+            }
+            if matches!(self.target.action, GroupAction::TransferOwner) {
+                if let Some(owner) = self.target.owner {
+                    let member: bool = sqlx::query_scalar(
+                        "select exists(select 1 from group_memberships where group_id=$1 and user_id=$2)",
+                    )
+                    .bind(group.id)
+                    .bind(owner.get())
+                    .fetch_one(&mut *self.tx)
+                    .await?;
+                    if !member {
+                        return Ok(Err(GroupDenial::Conflict));
+                    }
+                }
             }
         }
         Ok(Ok(()))
@@ -367,7 +408,13 @@ impl GroupGuard<'_> {
         };
         // Allocation may wait on an explicit-ID uniqueness contender. New rows
         // remain private until this final clock-sensitive proof and audit commit.
-        if matches!(self.target.action, GroupAction::Create) {
+        if matches!(
+            self.target.action,
+            GroupAction::Create
+                | GroupAction::SetMember
+                | GroupAction::RemoveMember
+                | GroupAction::TransferOwner
+        ) {
             if let Err(denial) = self
                 .session
                 .validate_locked(&mut self.tx, proof, &mut self.audit)
@@ -376,7 +423,9 @@ impl GroupGuard<'_> {
                 sqlx::query("rollback to savepoint group_mutation")
                     .execute(&mut *self.tx)
                     .await?;
-                self.target.id = None;
+                if matches!(self.target.action, GroupAction::Create) {
+                    self.target.id = None;
+                }
                 self.finish(AuditOutcome::Denied).await?;
                 return Ok(Err(denial.into()));
             }
@@ -500,6 +549,94 @@ impl GroupGuard<'_> {
                     .execute(&mut *self.tx)
                     .await?;
                 (None, AuditOutcome::Success)
+            }
+            GroupAction::SetMember | GroupAction::RemoveMember | GroupAction::TransferOwner => {
+                let group = &self.groups[0];
+                let changed = match self.target.action {
+                    GroupAction::SetMember => {
+                        let role = self.target.role.ok_or_else(|| {
+                            sqlx::Error::Protocol("membership role required".into())
+                        })?;
+                        sqlx::query(
+                            "insert into group_memberships(group_id,user_id,role) values($1,$2,$3) \
+                             on conflict(group_id,user_id) do update set role=excluded.role \
+                             where group_memberships.role is distinct from excluded.role",
+                        )
+                        .bind(group.id)
+                        .bind(self.target.member.map(UserId::get))
+                        .bind(role.as_str())
+                        .execute(&mut *self.tx)
+                        .await?
+                        .rows_affected() != 0
+                    }
+                    GroupAction::RemoveMember => {
+                        // Membership FK cascades only this user's explicit group
+                        // grants. Never revoke the key or its unrelated scopes.
+                        sqlx::query(
+                            "delete from group_memberships where group_id=$1 and user_id=$2",
+                        )
+                        .bind(group.id)
+                        .bind(self.target.member.map(UserId::get))
+                        .execute(&mut *self.tx)
+                        .await?
+                        .rows_affected()
+                            != 0
+                    }
+                    GroupAction::TransferOwner => {
+                        let owner = self.target.owner.ok_or_else(|| {
+                            sqlx::Error::Protocol("transfer owner required".into())
+                        })?;
+                        if owner.get() == group.owner {
+                            false
+                        } else {
+                            // The one-owner index is immediate; the owner FK is
+                            // deferred. Demote before promotion, in one transaction.
+                            sqlx::query(
+                                "update group_memberships set role='admin' where group_id=$1 and user_id=$2",
+                            )
+                            .bind(group.id)
+                            .bind(group.owner)
+                            .execute(&mut *self.tx)
+                            .await?;
+                            sqlx::query(
+                                "update group_memberships set role='owner' where group_id=$1 and user_id=$2",
+                            )
+                            .bind(group.id)
+                            .bind(owner.get())
+                            .execute(&mut *self.tx)
+                            .await?;
+                            sqlx::query("update groups set owner_user_id=$2 where id=$1")
+                                .bind(group.id)
+                                .bind(owner.get())
+                                .execute(&mut *self.tx)
+                                .await?;
+                            true
+                        }
+                    }
+                    GroupAction::List
+                    | GroupAction::Read
+                    | GroupAction::Create
+                    | GroupAction::Update
+                    | GroupAction::Delete => {
+                        return Err(sqlx::Error::Protocol("unexpected transition".into()));
+                    }
+                };
+                if changed {
+                    sqlx::query(
+                        "update groups set version=version+1,updated_at=clock_timestamp() where id=$1",
+                    )
+                    .bind(group.id)
+                    .execute(&mut *self.tx)
+                    .await?;
+                }
+                (
+                    None,
+                    if changed {
+                        AuditOutcome::Success
+                    } else {
+                        AuditOutcome::Noop
+                    },
+                )
             }
             GroupAction::List | GroupAction::Read => {
                 return Err(sqlx::Error::Protocol("unexpected group mutation".into()));

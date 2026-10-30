@@ -40,7 +40,7 @@ pub(super) async fn append_group(
          values($1,$2,$3,$4::audit_action,$5::audit_outcome,$6::uuid)",
     )
     .bind(audit.actor.map(UserId::get))
-    .bind(target.owner.map(UserId::get))
+    .bind(target.member.or(target.owner).map(UserId::get))
     .bind(target.id.map(crate::domain::GroupId::get))
     .bind(target.action.as_str())
     .bind(outcome)
