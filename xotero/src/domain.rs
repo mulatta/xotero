@@ -285,6 +285,91 @@ pub struct AdminAudit {
     pub subject: Option<UserId>,
 }
 
+#[derive(Clone, Copy)]
+pub enum GroupAction {
+    List,
+    Read,
+    Create,
+    Update,
+    Delete,
+}
+
+impl GroupAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "groups.list",
+            Self::Read => "groups.read",
+            Self::Create => "groups.create",
+            Self::Update => "groups.update",
+            Self::Delete => "groups.delete",
+        }
+    }
+
+    pub fn mutation(self) -> bool {
+        matches!(self, Self::Create | Self::Update | Self::Delete)
+    }
+}
+
+/// Extension metadata only. Ownership and membership transitions have separate
+/// contracts and cannot be smuggled into a metadata patch.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GroupChanges {
+    #[serde(default, deserialize_with = "optional_admin_text")]
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "group_text")]
+    pub description: Option<String>,
+    #[serde(default, deserialize_with = "group_text")]
+    pub url: Option<String>,
+    #[serde(default, deserialize_with = "optional_admin_text")]
+    pub library_editing: Option<String>,
+    #[serde(default, deserialize_with = "optional_admin_text")]
+    pub file_editing: Option<String>,
+}
+
+fn group_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    if value.contains('\0') {
+        return Err(serde::de::Error::custom("invalid text"));
+    }
+    Ok(Some(value))
+}
+
+impl GroupChanges {
+    pub fn valid(&self) -> bool {
+        self.name.as_ref().is_none_or(|name| name.len() <= 255)
+            && self
+                .description
+                .as_ref()
+                .is_none_or(|text| text.chars().count() <= 1024)
+            && self.url.as_ref().is_none_or(|text| text.len() <= 2048)
+            && self
+                .library_editing
+                .as_deref()
+                .is_none_or(|value| matches!(value, "members" | "admins"))
+            && self
+                .file_editing
+                .as_deref()
+                .is_none_or(|value| matches!(value, "members" | "admins" | "none"))
+            && (self.name.is_some()
+                || self.description.is_some()
+                || self.url.is_some()
+                || self.library_editing.is_some()
+                || self.file_editing.is_some())
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct GroupTarget {
+    pub admin: bool,
+    pub action: GroupAction,
+    pub id: Option<GroupId>,
+    pub owner: Option<UserId>,
+    pub expected: Option<i64>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ApiKeyId, GroupId, LibraryId, Permissions, UserId};

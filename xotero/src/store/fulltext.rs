@@ -55,20 +55,29 @@ pub async fn fulltext_item(
 /// value carries the item `key` the client matches against to mark it synced.
 pub async fn write_fulltext(
     pool: &PgPool,
-    library_id: LibraryId,
+    proof: super::MutationProof<'_>,
     batch: Vec<Value>,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<(i64, Value)>> {
+    let library_id = proof.access.library_id;
+    let mut tx = pool.begin().await?;
+    if super::mutation_authority::lock_mutation_authority(&mut tx, &proof)
+        .await?
+        .is_none()
+    {
+        return Ok(Outcome::Denied);
+    }
     if batch.is_empty() {
-        return Ok(match no_change(pool, library_id, expected).await? {
+        return Ok(match no_change(&mut tx, library_id, expected).await? {
             Outcome::Done(version) => Outcome::Done((version, Value::Object(Map::new()))),
             Outcome::Conflict(current) => Outcome::Conflict(current),
+            Outcome::Denied => Outcome::Denied,
         });
     }
-    let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Denied => return Ok(Outcome::Denied),
     };
     let mut successful = Map::new();
     for (index, item) in batch.into_iter().enumerate() {

@@ -820,7 +820,7 @@ machine.wait_for_open_port(8189)
 with subtest("populated v7 data survives the identity migration"):
     assert (
         psql("select string_agg(version::text, ',' order by version) from _sqlx_migrations")
-         == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
+          == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20"
     )
     assert psql("select count(*) from pending_uploads") == "0"
     assert psql("select bool_and(not compressed) from file") == "t"

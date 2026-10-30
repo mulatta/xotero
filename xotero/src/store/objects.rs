@@ -63,6 +63,7 @@ pub enum ObjectMutation<T> {
     Done(T),
     Conflict(i64),
     FileWriteDenied,
+    Denied,
 }
 
 pub async fn objects(
@@ -243,22 +244,29 @@ pub async fn item_keys(
 /// and corrupt the object. Returns `(new_version, successful_map)` keyed by index.
 pub async fn write(
     pool: &PgPool,
-    library_id: LibraryId,
+    proof: super::MutationProof<'_>,
     kind: &str,
     batch: Vec<Value>,
     expected: Option<i64>,
-    allow_stored_file_write: bool,
 ) -> sqlx::Result<ObjectMutation<(i64, Value)>> {
+    let library_id = proof.access.library_id;
+    let mut tx = pool.begin().await?;
+    let Some(access) = super::mutation_authority::lock_mutation_authority(&mut tx, &proof).await?
+    else {
+        return Ok(ObjectMutation::Denied);
+    };
+    let allow_stored_file_write = access.group_id.is_none() || access.file_write;
     if batch.is_empty() {
-        return Ok(match no_change(pool, library_id, expected).await? {
+        return Ok(match no_change(&mut tx, library_id, expected).await? {
             Outcome::Done(version) => ObjectMutation::Done((version, Value::Object(Map::new()))),
             Outcome::Conflict(current) => ObjectMutation::Conflict(current),
+            Outcome::Denied => ObjectMutation::Denied,
         });
     }
-    let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(ObjectMutation::Conflict(current)),
+        Outcome::Denied => return Ok(ObjectMutation::Denied),
     };
 
     let batch: Vec<(String, Value)> = batch
@@ -347,22 +355,29 @@ pub async fn write(
 /// Delete objects of `kind`, recording them in the deletion log.
 pub async fn delete(
     pool: &PgPool,
-    library_id: LibraryId,
+    proof: super::MutationProof<'_>,
     kind: &str,
     keys: &[String],
     expected: Option<i64>,
-    allow_stored_file_write: bool,
 ) -> sqlx::Result<ObjectMutation<i64>> {
+    let library_id = proof.access.library_id;
+    let mut tx = pool.begin().await?;
+    let Some(access) = super::mutation_authority::lock_mutation_authority(&mut tx, &proof).await?
+    else {
+        return Ok(ObjectMutation::Denied);
+    };
+    let allow_stored_file_write = access.group_id.is_none() || access.file_write;
     if keys.is_empty() {
-        return Ok(match no_change(pool, library_id, expected).await? {
+        return Ok(match no_change(&mut tx, library_id, expected).await? {
             Outcome::Done(version) => ObjectMutation::Done(version),
             Outcome::Conflict(current) => ObjectMutation::Conflict(current),
+            Outcome::Denied => ObjectMutation::Denied,
         });
     }
-    let mut tx = pool.begin().await?;
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(ObjectMutation::Conflict(current)),
+        Outcome::Denied => return Ok(ObjectMutation::Denied),
     };
     if kind == "item" {
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();

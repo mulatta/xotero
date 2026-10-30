@@ -422,6 +422,17 @@ impl SessionCandidate {
             .bind(proof.token.as_slice())
             .fetch_optional(&mut *conn)
             .await?;
+        self.validate_locked(conn, proof, audit).await
+    }
+
+    /// Recheck clock-sensitive proof after later object/blob waits without
+    /// requesting a session lock out of order. Caller already holds its SHARE.
+    pub(super) async fn validate_locked(
+        &self,
+        conn: &mut PgConnection,
+        proof: &crate::domain::WebSessionProof,
+        audit: &mut crate::domain::AdminAudit,
+    ) -> sqlx::Result<Result<(), AdminDenial>> {
         // Fresh READ COMMITTED statement after the last possible authority wait.
         // No discovery rebinding or additional earlier lock is allowed here.
         let live: bool = sqlx::query_scalar(

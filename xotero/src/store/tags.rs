@@ -41,17 +41,25 @@ pub async fn tags(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Value> {
 /// Returns the new library version or a conflict.
 pub async fn delete_tags(
     pool: &PgPool,
-    library_id: LibraryId,
+    proof: super::MutationProof<'_>,
     tags: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
-    if tags.is_empty() {
-        return no_change(pool, library_id, expected).await;
-    }
+    let library_id = proof.access.library_id;
     let mut tx = pool.begin().await?;
+    if super::mutation_authority::lock_mutation_authority(&mut tx, &proof)
+        .await?
+        .is_none()
+    {
+        return Ok(Outcome::Denied);
+    }
+    if tags.is_empty() {
+        return no_change(&mut tx, library_id, expected).await;
+    }
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Denied => return Ok(Outcome::Denied),
     };
     for tag in tags {
         // Drop the matching entry from each item's data.tags array; the

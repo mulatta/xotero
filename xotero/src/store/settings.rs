@@ -24,17 +24,30 @@ pub async fn settings(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Valu
 /// Store a `{key: {value}}` settings object.
 pub async fn write_settings(
     pool: &PgPool,
-    library_id: LibraryId,
+    proof: super::MutationProof<'_>,
     body: Value,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
-    if body.as_object().is_none_or(|m| m.is_empty()) {
-        return no_change(pool, library_id, expected).await;
-    }
+    let library_id = proof.access.library_id;
     let mut tx = pool.begin().await?;
+    let Some(access) = super::mutation_authority::lock_mutation_authority(&mut tx, &proof).await?
+    else {
+        return Ok(Outcome::Denied);
+    };
+    if body.as_object().is_some_and(|entries| {
+        entries
+            .keys()
+            .any(|key| super::mutation_authority::protected_setting(access, key))
+    }) {
+        return Ok(Outcome::Denied);
+    }
+    if body.as_object().is_none_or(|m| m.is_empty()) {
+        return no_change(&mut tx, library_id, expected).await;
+    }
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Denied => return Ok(Outcome::Denied),
     };
     if let Value::Object(entries) = body {
         for (key, entry) in entries {
@@ -59,17 +72,29 @@ pub async fn write_settings(
 /// can propagate the removal. Returns the new library version or a conflict.
 pub async fn delete_settings(
     pool: &PgPool,
-    library_id: LibraryId,
+    proof: super::MutationProof<'_>,
     keys: &[String],
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
-    if keys.is_empty() {
-        return no_change(pool, library_id, expected).await;
-    }
+    let library_id = proof.access.library_id;
     let mut tx = pool.begin().await?;
+    let Some(access) = super::mutation_authority::lock_mutation_authority(&mut tx, &proof).await?
+    else {
+        return Ok(Outcome::Denied);
+    };
+    if keys
+        .iter()
+        .any(|key| super::mutation_authority::protected_setting(access, key))
+    {
+        return Ok(Outcome::Denied);
+    }
+    if keys.is_empty() {
+        return no_change(&mut tx, library_id, expected).await;
+    }
     let version = match guarded_version(&mut tx, library_id, expected).await? {
         Outcome::Done(version) => version,
         Outcome::Conflict(current) => return Ok(Outcome::Conflict(current)),
+        Outcome::Denied => return Ok(Outcome::Denied),
     };
     for key in keys {
         sqlx::query("delete from setting where library_id = $1 and key = $2")

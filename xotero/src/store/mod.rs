@@ -14,9 +14,11 @@ mod admin;
 mod audit;
 mod files;
 mod fulltext;
+mod group_management;
 mod groups;
 mod identity;
 mod keys;
+mod mutation_authority;
 mod objects;
 mod sessions;
 mod settings;
@@ -33,12 +35,14 @@ pub use files::{
     FileRegistrationOutcome, FileSigningOutcome, PendingUpload, PendingUploadState,
 };
 pub use fulltext::{fulltext_item, fulltext_versions, write_fulltext};
+pub use group_management::{deny_group, group_guard, GroupDenial};
 pub use groups::{
     active_user_exists, api_key_group_grants, group_for_user, groups_for_user,
     resolve_group_library, GroupGrant, GroupLibraryResolution, GroupMetadata,
 };
 pub use identity::{authenticate_api_key, bootstrap_identity, bootstrap_principal};
 pub use keys::{admin_key_guard, deny_key, key_guard, ApiKeyTarget};
+pub use mutation_authority::MutationProof;
 pub use objects::{delete, item_keys, objects, query_items, write, ObjectMutation};
 pub use sessions::{
     cancel_login_session, complete_login_session, create_login_session, login_session,
@@ -56,6 +60,7 @@ pub use web_sessions::{
 pub enum Outcome<T> {
     Done(T),
     Conflict(i64),
+    Denied,
 }
 
 fn is_stored_file_attachment(value: &Value) -> bool {
@@ -66,14 +71,14 @@ fn is_stored_file_attachment(value: &Value) -> bool {
         )
 }
 
-/// Lock the library row, check the client's expected version, and reserve the
-/// next one. Serializing on the row also prevents concurrent writes from racing.
+/// Caller holds the live mutation guard's exclusive library lock. Reserve a
+/// version only after authority validation, without taking earlier locks again.
 pub(super) async fn guarded_version(
     conn: &mut sqlx::PgConnection,
     library_id: LibraryId,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
-    let current: i64 = sqlx::query("select version from library where id = $1 for update")
+    let current: i64 = sqlx::query("select version from library where id = $1")
         .bind(library_id.get())
         .fetch_one(&mut *conn)
         .await?
@@ -101,11 +106,14 @@ pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
 /// without bumping the version — a no-op must not churn the counter and make
 /// every other client think the library changed.
 pub(super) async fn no_change(
-    pool: &PgPool,
+    conn: &mut sqlx::PgConnection,
     library_id: LibraryId,
     expected: Option<i64>,
 ) -> sqlx::Result<Outcome<i64>> {
-    let current = current_version(pool, library_id).await?;
+    let current: i64 = sqlx::query_scalar("select version from library where id=$1")
+        .bind(library_id.get())
+        .fetch_one(conn)
+        .await?;
     Ok(match expected {
         Some(v) if v != current => Outcome::Conflict(current),
         _ => Outcome::Done(current),

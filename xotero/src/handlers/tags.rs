@@ -4,11 +4,11 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 
 use crate::error::server_error;
-use crate::http::access::request_library;
+use crate::http::access::{request_access, request_library};
 use crate::http::headers::{conflict, current_headers, precondition, version_headers};
 use crate::{store, AppState};
 
@@ -30,6 +30,7 @@ pub(crate) async fn tags_get(State(state): State<AppState>) -> Response {
 /// `tag`, so accept either.
 pub(crate) async fn tags_delete(
     State(state): State<AppState>,
+    Extension(context): Extension<crate::domain::RequestContext>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -47,11 +48,23 @@ pub(crate) async fn tags_delete(
                 .collect()
         })
         .unwrap_or_default();
-    match store::delete_tags(&state.pool, request_library(), &tags, Some(expected)).await {
+    match store::delete_tags(
+        &state.pool,
+        store::MutationProof {
+            access: request_access(),
+            context: &context,
+            config: &state.config,
+        },
+        &tags,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
         Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Ok(store::Outcome::Denied) => StatusCode::FORBIDDEN.into_response(),
         Err(error) => server_error("tags delete", error),
     }
 }

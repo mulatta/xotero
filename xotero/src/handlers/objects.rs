@@ -266,6 +266,7 @@ pub(crate) async fn collection_items_top(
 /// fields must be preserved.
 pub(crate) async fn write(
     state: &AppState,
+    context: &crate::domain::RequestContext,
     kind: &str,
     headers: HeaderMap,
     body: Bytes,
@@ -296,14 +297,16 @@ pub(crate) async fn write(
         Err(resp) => return resp,
     };
     let access = request_access();
-    let allow_stored_file_write = access.group_id.is_none() || access.file_write;
     match store::write(
         &state.pool,
-        access.library_id,
+        store::MutationProof {
+            access,
+            context,
+            config: &state.config,
+        },
         kind,
         batch,
         Some(expected),
-        allow_stored_file_write,
     )
     .await
     {
@@ -318,6 +321,7 @@ pub(crate) async fn write(
         )
             .into_response(),
         Ok(store::ObjectMutation::Conflict(current)) => conflict(current),
+        Ok(store::ObjectMutation::Denied) => StatusCode::FORBIDDEN.into_response(),
         Ok(store::ObjectMutation::FileWriteDenied) => {
             (StatusCode::FORBIDDEN, "group file editing denied").into_response()
         }
@@ -327,6 +331,7 @@ pub(crate) async fn write(
 
 pub(crate) async fn delete(
     state: &AppState,
+    context: &crate::domain::RequestContext,
     kind: &str,
     headers: HeaderMap,
     params: HashMap<String, String>,
@@ -337,14 +342,16 @@ pub(crate) async fn delete(
     };
     let keys = csv_of(&params, &format!("{kind}Key"));
     let access = request_access();
-    let allow_stored_file_write = access.group_id.is_none() || access.file_write;
     match store::delete(
         &state.pool,
-        access.library_id,
+        store::MutationProof {
+            access,
+            context,
+            config: &state.config,
+        },
         kind,
         &keys,
         Some(expected),
-        allow_stored_file_write,
     )
     .await
     {
@@ -352,6 +359,7 @@ pub(crate) async fn delete(
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
         Ok(store::ObjectMutation::Conflict(current)) => conflict(current),
+        Ok(store::ObjectMutation::Denied) => StatusCode::FORBIDDEN.into_response(),
         Ok(store::ObjectMutation::FileWriteDenied) => {
             (StatusCode::FORBIDDEN, "group file editing denied").into_response()
         }

@@ -5,12 +5,12 @@ use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde_json::{json, Value};
 
 use crate::error::server_error;
-use crate::http::access::request_library;
+use crate::http::access::{request_access, request_library};
 use crate::http::headers::{conflict, precondition, since_of, version_headers};
 use crate::{store, AppState};
 
@@ -49,6 +49,7 @@ pub(crate) async fn fulltext_item(
 /// result map the client reads to mark each item synced (or `412` if stale).
 pub(crate) async fn fulltext_write(
     State(state): State<AppState>,
+    Extension(context): Extension<crate::domain::RequestContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -63,7 +64,18 @@ pub(crate) async fn fulltext_write(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    match store::write_fulltext(&state.pool, request_library(), batch, Some(expected)).await {
+    match store::write_fulltext(
+        &state.pool,
+        store::MutationProof {
+            access: request_access(),
+            context: &context,
+            config: &state.config,
+        },
+        batch,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done((version, successful))) => (
             version_headers(version),
             Json(json!({
@@ -75,6 +87,7 @@ pub(crate) async fn fulltext_write(
         )
             .into_response(),
         Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Ok(store::Outcome::Denied) => StatusCode::FORBIDDEN.into_response(),
         Err(error) => server_error("fulltext write", error),
     }
 }

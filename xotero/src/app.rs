@@ -7,7 +7,7 @@ use axum::{
     http::HeaderMap,
     middleware,
     routing::{delete as route_delete, get, patch, post, put},
-    Router,
+    Extension, Router,
 };
 use sqlx::PgPool;
 
@@ -49,33 +49,60 @@ pub(crate) fn router(state: AppState) -> Router {
             },
         )
         .post(
-            move |State(state): State<AppState>, headers: HeaderMap, body: Bytes| async move {
-                write(&state, kind, headers, body).await
+            move |State(state): State<AppState>, Extension(context): Extension<crate::domain::RequestContext>, headers: HeaderMap, body: Bytes| async move {
+                write(&state, &context, kind, headers, body).await
             },
         )
         .patch(
-            move |State(state): State<AppState>, headers: HeaderMap, body: Bytes| async move {
-                write(&state, kind, headers, body).await
+            move |State(state): State<AppState>, Extension(context): Extension<crate::domain::RequestContext>, headers: HeaderMap, body: Bytes| async move {
+                write(&state, &context, kind, headers, body).await
             },
         )
             .delete(
                 move |State(state): State<AppState>,
+                      Extension(context): Extension<crate::domain::RequestContext>,
                       headers: HeaderMap,
                       Query(p): Query<HashMap<String, String>>| async move {
-                    delete(&state, kind, headers, p).await
+                    delete(&state, &context, kind, headers, p).await
                 },
             )
     };
     Router::new()
+        .route(
+            "/xotero/groups",
+            get(crate::handlers::groups::manage).post(crate::handlers::groups::manage),
+        )
+        .route(
+            "/xotero/groups/{id}",
+            get(crate::handlers::groups::manage)
+                .patch(crate::handlers::groups::manage)
+                .delete(crate::handlers::groups::manage),
+        )
+        .route(
+            "/xotero/admin/groups",
+            get(crate::handlers::groups::manage).post(crate::handlers::groups::manage),
+        )
+        .route(
+            "/xotero/admin/groups/{id}",
+            get(crate::handlers::groups::manage)
+                .patch(crate::handlers::groups::manage)
+                .delete(crate::handlers::groups::manage),
+        )
         .route("/xotero/me/keys", get(manage).post(manage))
         .route("/xotero/me/keys/{id}", route_delete(manage))
         .route("/xotero/admin/users/{id}/keys", get(manage))
-        .route("/xotero/admin/users/{id}/keys/{keyId}", route_delete(manage))
+        .route(
+            "/xotero/admin/users/{id}/keys/{keyId}",
+            route_delete(manage),
+        )
         .route(
             "/xotero/admin/users",
             get(crate::handlers::admin::users).post(crate::handlers::admin::users),
         )
-        .route("/xotero/admin/users/{id}", patch(crate::handlers::admin::users))
+        .route(
+            "/xotero/admin/users/{id}",
+            patch(crate::handlers::admin::users),
+        )
         .route(
             "/xotero/admin/users/{id}/instance-admin",
             put(crate::handlers::admin::users),
@@ -122,40 +149,37 @@ pub(crate) fn router(state: AppState) -> Router {
             get(items_get)
                 .post(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<crate::domain::RequestContext>,
                           headers: HeaderMap,
                           body: Bytes| async move {
-                        write(&state, "item", headers, body).await
+                        write(&state, &context, "item", headers, body).await
                     },
                 )
                 .patch(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<crate::domain::RequestContext>,
                           headers: HeaderMap,
                           body: Bytes| async move {
-                        write(&state, "item", headers, body).await
+                        write(&state, &context, "item", headers, body).await
                     },
                 )
                 .delete(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<crate::domain::RequestContext>,
                           headers: HeaderMap,
                           Query(params): Query<HashMap<String, String>>| async move {
-                        delete(&state, "item", headers, params).await
+                        delete(&state, &context, "item", headers, params).await
                     },
                 ),
         )
         .route("/groups/{id}/items/top", get(items_top))
         .route("/groups/{id}/items/trash", get(items_trash))
-        .route(
-            "/groups/{id}/tags",
-            get(tags_get).delete(tags_delete),
-        )
+        .route("/groups/{id}/tags", get(tags_get).delete(tags_delete))
         .route(
             "/groups/{id}/fulltext",
             get(fulltext_versions).post(fulltext_write),
         )
-        .route(
-            "/groups/{id}/items/{key}/fulltext",
-            get(fulltext_item),
-        )
+        .route("/groups/{id}/items/{key}/fulltext", get(fulltext_item))
         .route(
             "/groups/{id}/items/{key}/file",
             get(file_get).post(file_post),
@@ -183,23 +207,26 @@ pub(crate) fn router(state: AppState) -> Router {
             get(items_get)
                 .post(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<crate::domain::RequestContext>,
                           headers: HeaderMap,
                           body: Bytes| async move {
-                        write(&state, "item", headers, body).await
+                        write(&state, &context, "item", headers, body).await
                     },
                 )
                 .patch(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<crate::domain::RequestContext>,
                           headers: HeaderMap,
                           body: Bytes| async move {
-                        write(&state, "item", headers, body).await
+                        write(&state, &context, "item", headers, body).await
                     },
                 )
                 .delete(
                     move |State(state): State<AppState>,
+                          Extension(context): Extension<crate::domain::RequestContext>,
                           headers: HeaderMap,
                           Query(p): Query<HashMap<String, String>>| async move {
-                        delete(&state, "item", headers, p).await
+                        delete(&state, &context, "item", headers, p).await
                     },
                 ),
         )
@@ -220,10 +247,7 @@ pub(crate) fn router(state: AppState) -> Router {
         // Attachment uploads exceed the default 2 MiB extractor limit; raise it
         // to MAX_BODY; middleware and the capability handler enforce body bounds.
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(middleware::from_fn_with_state(
-            state.clone(),
-            log_and_auth,
-        ))
+        .layer(middleware::from_fn_with_state(state.clone(), log_and_auth))
         .with_state(state)
 }
 

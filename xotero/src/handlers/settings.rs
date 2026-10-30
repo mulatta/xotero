@@ -5,11 +5,10 @@ use axum::{
     extract::{Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    Json,
+    Extension, Json,
 };
 use serde_json::{json, Value};
 
-use crate::domain::LibraryAccess;
 use crate::error::server_error;
 use crate::http::access::{request_access, request_library};
 use crate::http::headers::{
@@ -39,22 +38,9 @@ pub(crate) async fn settings_read(
     }
 }
 
-fn group_admin_setting_denied<'a>(
-    access: LibraryAccess,
-    keys: impl Iterator<Item = &'a str>,
-) -> bool {
-    const ADMIN_ONLY: [&str; 3] = [
-        "attachmentRenameTemplate",
-        "autoRenameFiles",
-        "autoRenameFilesFileTypes",
-    ];
-    access.group_id.is_some()
-        && !access.is_admin
-        && keys.into_iter().any(|key| ADMIN_ONLY.contains(&key))
-}
-
 pub(crate) async fn settings_write(
     State(state): State<AppState>,
+    Extension(context): Extension<crate::domain::RequestContext>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -63,20 +49,23 @@ pub(crate) async fn settings_write(
         Err(resp) => return resp,
     };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
-    if group_admin_setting_denied(
-        request_access(),
-        value
-            .as_object()
-            .into_iter()
-            .flat_map(|settings| settings.keys().map(String::as_str)),
-    ) {
-        return (StatusCode::FORBIDDEN, "group admin setting denied").into_response();
-    }
-    match store::write_settings(&state.pool, request_library(), value, Some(expected)).await {
+    match store::write_settings(
+        &state.pool,
+        store::MutationProof {
+            access: request_access(),
+            context: &context,
+            config: &state.config,
+        },
+        value,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
         Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Ok(store::Outcome::Denied) => StatusCode::FORBIDDEN.into_response(),
         Err(error) => server_error("settings write", error),
     }
 }
@@ -87,6 +76,7 @@ pub(crate) async fn settings_write(
 /// 204 and the setting persisted.)
 pub(crate) async fn settings_delete(
     State(state): State<AppState>,
+    Extension(context): Extension<crate::domain::RequestContext>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
@@ -95,14 +85,23 @@ pub(crate) async fn settings_delete(
         Err(resp) => return resp,
     };
     let keys = csv_of(&params, "settingKey");
-    if group_admin_setting_denied(request_access(), keys.iter().map(String::as_str)) {
-        return (StatusCode::FORBIDDEN, "group admin setting denied").into_response();
-    }
-    match store::delete_settings(&state.pool, request_library(), &keys, Some(expected)).await {
+    match store::delete_settings(
+        &state.pool,
+        store::MutationProof {
+            access: request_access(),
+            context: &context,
+            config: &state.config,
+        },
+        &keys,
+        Some(expected),
+    )
+    .await
+    {
         Ok(store::Outcome::Done(version)) => {
             (StatusCode::NO_CONTENT, version_headers(version)).into_response()
         }
         Ok(store::Outcome::Conflict(current)) => conflict(current),
+        Ok(store::Outcome::Denied) => StatusCode::FORBIDDEN.into_response(),
         Err(error) => server_error("settings delete", error),
     }
 }

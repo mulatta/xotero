@@ -23,6 +23,33 @@ pub(super) enum AuditOutcome {
     Denied,
 }
 
+pub(super) async fn append_group(
+    tx: &mut Transaction<'_, Postgres>,
+    audit: &AdminAudit,
+    target: crate::domain::GroupTarget,
+    outcome: AuditOutcome,
+) -> sqlx::Result<()> {
+    let outcome = match outcome {
+        AuditOutcome::Success => "success",
+        AuditOutcome::Noop => "noop",
+        AuditOutcome::Denied => "denied",
+    };
+    sqlx::query(
+        "insert into audit_events \
+         (actor_user_id,subject_user_id,subject_group_id,action,outcome,request_id) \
+         values($1,$2,$3,$4::audit_action,$5::audit_outcome,$6::uuid)",
+    )
+    .bind(audit.actor.map(UserId::get))
+    .bind(target.owner.map(UserId::get))
+    .bind(target.id.map(crate::domain::GroupId::get))
+    .bind(target.action.as_str())
+    .bind(outcome)
+    .bind(&audit.request_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 pub(super) async fn append_key(
     tx: &mut Transaction<'_, Postgres>,
     audit: &AdminAudit,

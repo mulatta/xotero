@@ -410,11 +410,51 @@ try:
     assert sql(upgrade18,snapshot18)==saved18
     assert sql(upgrade18,"select version,checksum from _sqlx_migrations where version<=18 order by version")==checksums18
     assert sql(upgrade18,"select policy_limited from api_key_group_permissions")==[(False,)]
-    assert sql(upgrade18,"select max(version) from _sqlx_migrations")==[(19,)]
-    print("CHECKPOINT16_UPGRADE "+json.dumps({"from":18,"to":19,"preserved_keys":2,
+    assert sql(upgrade18,"select max(version) from _sqlx_migrations")==[(20,)]
+    print("CHECKPOINT16_UPGRADE "+json.dumps({"from":18,"to":20,"preserved_keys":2,
         "preserved_sessions":1,"preserved_personal_permissions":2,
         "preserved_all_group_permissions":1,"preserved_explicit_permissions":1,
         "legacy_explicit_policy_limited":False,"checksums_preserved":True}),flush=True)
+    upgrade19=database("groups_upgrade19")
+    subprocess.run(["env","DATABASE_URL=postgres://xotero@127.0.0.1/"+upgrade19,
+        "sqlx","migrate","run","--source","/etc/xotero-test/v19-migrations"],check=True)
+    with connect(upgrade19) as fixture:
+        fixture.execute("insert into users(id,username,display_name) values(101,'owner','Owner')")
+        fixture.execute("insert into personal_libraries(user_id,library_id) values(101,1)")
+        fixture.execute("insert into external_identities(issuer,subject,user_id) values('https://id.example.test','owner',101)")
+        fixture.execute("insert into bootstrap_state(name) values('identity'),('instance-admin')")
+        fixture.execute("insert into instance_admins(user_id) values(101)")
+        fixture.execute("insert into library(id,version,kind) values(91,23,'group')")
+        fixture.execute("insert into groups(id,library_id,owner_user_id,name,version) values(901,91,101,'Preserved nineteen',13)")
+        fixture.execute("insert into group_memberships(group_id,user_id,role) values(901,101,'owner')")
+        fixture.execute("""insert into api_keys(id,user_id,name,token_hash)
+            values(401,101,'Nineteen key',decode(repeat('44',32),'hex'))""")
+        fixture.execute("insert into api_key_group_permissions(api_key_id,user_id,group_id,library,write,policy_limited) values(401,101,901,true,true,true)")
+        fixture.execute("""insert into pending_uploads(token_hash,library_id,group_id,authorizer_key_hash,
+            item_key,blob_key,md5,upload_md5,filename,filesize,mtime,state) values
+            (decode(repeat('77',32),'hex'),91,901,decode(repeat('44',32),'hex'),
+            'PEND2222','libraries/91/uploads/upgrade19','hash','hash','private.txt',4,1,'uploaded')""")
+        fixture.execute("select xotero_append_audit(101,101,'keys.create','success',gen_random_uuid())")
+        fixture.execute("select setval(pg_get_serial_sequence('groups','id'),1900,true)")
+    tables19=("users","library","personal_libraries","external_identities","instance_admins",
+        "bootstrap_state","groups","group_memberships","api_keys","api_key_group_permissions",
+        "pending_uploads","audit_events")
+    saved19={table:sql(upgrade19,"select jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text) from "+table+" t")
+        for table in tables19}
+    last_audit19=sql(upgrade19,"select max(id) from audit_events")[0][0]
+    checksums19=sql(upgrade19,"select version,checksum from _sqlx_migrations order by version")
+    start(upgrade19)
+    for table in tables19:
+        value="to_jsonb(t)-'subject_group_id'" if table=="audit_events" else "to_jsonb(t)"
+        old_rows=" where id<="+str(last_audit19) if table=="audit_events" else ""
+        assert sql(upgrade19,"select jsonb_agg("+value+" order by ("+value+")::text) from "+table+" t"+old_rows)==saved19[table],table
+    assert sql(upgrade19,"select subject_group_id from audit_events where id<=%s",(last_audit19,))==[(None,)]
+    assert sql(upgrade19,"select policy_limited from api_key_group_permissions")==[(True,)]
+    assert sql(upgrade19,"select version,checksum from _sqlx_migrations where version<=19 order by version")==checksums19
+    assert sql(upgrade19,"select nextval(pg_get_serial_sequence('groups','id'))")==[(1901,)]
+    print("CHECKPOINT17_UPGRADE "+json.dumps({"from":19,"to":20,"all_old_fields_preserved":True,
+        "pending_uploaded_receipt_preserved":True,"sequence_high_water_preserved":True,
+        "new_audit_subject_default":None,"checksums_preserved":True}),flush=True)
     print("CHECKPOINT13_BOOTSTRAP " + json.dumps(receipts, sort_keys=True), flush=True)
 finally:
     for process in processes:
@@ -441,12 +481,16 @@ import selectors
 import signal
 import subprocess
 import threading
+import socket
+import urllib.parse
 
 import psycopg
 
 database = "checkpoint14_web"
 print("CHECKPOINT14_RESOURCES "+json.dumps({"database":database,"pid":os.getpid()}),flush=True)
 server = None
+server_output = bytearray()
+server_log_thread = None
 proxy = None
 receipts = {}
 secrets = []
@@ -607,7 +651,7 @@ try:
         (select jsonb_agg(to_jsonb(p) order by user_id) from personal_libraries p),
         (select jsonb_agg(to_jsonb(a) order by user_id) from instance_admins a),
         (select jsonb_agg(to_jsonb(b) order by name) from bootstrap_state b),
-        (select jsonb_agg(to_jsonb(a)-'subject_key_id' order by id) from audit_events a where id<=1),
+        (select jsonb_agg(to_jsonb(a)-'subject_key_id'-'subject_group_id' order by id) from audit_events a where id<=1),
         (select jsonb_agg(to_jsonb(k) order by id) from api_keys k),
         (select jsonb_agg(to_jsonb(p) order by api_key_id) from api_key_user_permissions p))"""
     preserved=sql(v16_snapshot)
@@ -632,15 +676,23 @@ try:
             assert observer.select(45),"startup timeout"
             line=server.stdout.readline()
             assert line,server.poll()
+            server_output.extend(line)
             if b"xotero listening" in line:
                 break
+    def drain_server_log():
+        # Real HTTP/race coverage emits more than a pipe buffer of diagnostics.
+        # Drain continuously so log backpressure cannot masquerade as API hangs.
+        while chunk := server.stdout.read(65536):
+            server_output.extend(chunk)
+    server_log_thread=threading.Thread(target=drain_server_log)
+    server_log_thread.start()
     proxy=http.server.ThreadingHTTPServer(("127.0.0.1",0),Proxy)
     proxy_thread=threading.Thread(target=proxy.serve_forever)
     proxy_thread.start()
     print("CHECKPOINT14_PROXY "+json.dumps({"port":proxy.server_port,"backend":8189}),flush=True)
     assert sql(v16_snapshot)==preserved
     assert sql("select version,checksum from _sqlx_migrations where version<=16 order by version")==v16_checksums
-    assert sql("select max(version) from _sqlx_migrations")==[(19,)]
+    assert sql("select max(version) from _sqlx_migrations")==[(20,)]
     assert request("GET","/keys/current",extra=[("Zotero-API-Key",preserved_key)])[0]==200
     receipts["populated_v16_authority_audit_key_upgrade_preserved"]=True
     sql("insert into users(id,username,display_name) values(202,'second','Second'),(303,'disabled','Disabled')")
@@ -1189,6 +1241,419 @@ try:
     key_receipts["supported_logout_between_admission_and_body"]=True
     print("CHECKPOINT16_KEYS "+json.dumps(key_receipts,sort_keys=True),flush=True)
 
+    # Given a mapped ordinary session, group creation is a supported extension
+    # API rather than an upstream XML mutation or a direct SQL action.
+    subprocess.run(["curl","--fail-with-body","--silent","--show-error",
+        "--max-time","20","--aws-sigv4","aws:amz:us-east-1:s3",
+        "--user","rustfsadmin:rustfsadmin","-X","PUT","http://127.0.0.1:9000/zotero"],
+        check=True)
+    group_owner,group_owner_csrf=login(user="provisioned",user_id=target)
+    status,body,headers=request("POST","/xotero/groups",group_owner,group_owner_csrf,
+        body={"name":"Managed private group"})
+    assert status==201,("checkpoint17 supported group create",status,body)
+    managed_group=json.loads(body)
+    assert set(managed_group)=={"groupID","libraryID"}
+    assert managed_group["groupID"]>0 and managed_group["libraryID"]>0
+    gid=managed_group["groupID"]
+    glib=managed_group["libraryID"]
+    group_path="/xotero/groups/"+str(gid)
+    group_admin_path="/xotero/admin/groups/"+str(gid)
+    group_receipts={}
+
+    def group_api(method,path=group_path,payload=None,cookies=group_owner,
+                  token=group_owner_csrf,version=1):
+        extra=[] if version is None else [("If-Match",'"'+str(version)+'"')]
+        return request(method,path,cookies,token,body=payload,extra=extra)
+
+    status,body,headers=group_api("GET")
+    assert status==200 and headers["ETag"]=='"1"'
+    metadata=json.loads(body)
+    assert metadata=={
+        "groupID":gid,"libraryID":glib,"ownerUserID":target,"version":1,
+        "name":"Managed private group","description":"","url":"","type":"Private",
+        "libraryReading":"members","libraryEditing":"members","fileEditing":"members"}
+    assert sql("select user_id,role from group_memberships where group_id=%s",(gid,))==[(target,"owner")]
+    assert sql("select version,kind from library where id=%s",(glib,))==[(0,"group")]
+    assert group_api("GET",group_admin_path,cookies=jar,token=csrf)[0]==200
+    assert group_api("GET",cookies=jar,token=csrf)[0]==403
+    assert group_api("PATCH",payload={"name":"No role elevation"},cookies=jar,token=csrf)[0]==403
+    assert group_api("DELETE",cookies=jar,token=csrf)[0]==403
+    assert request("GET","/xotero/groups",group_owner,group_owner_csrf)[0]==200
+    for credential in ("fixture-admin-recovery",stronger["token"]):
+        assert request("GET","/xotero/groups",extra=[("Zotero-API-Key",credential)])[0]==401
+    assert group_api("PATCH",payload={"name":"No precondition"},version=None)[0]==428
+    for condition in ("1","*",'W/"1"','"0"','"-1"','"1", "2"'):
+        assert request("PATCH",group_path,group_owner,group_owner_csrf,
+            body={"name":"Malformed"},extra=[("If-Match",condition)])[0]==400
+    for payload in ({},{"name":None},{"name":" "},{"ownerUserID":101},
+                    {"members":[101]},{"libraryReading":"all"},{"type":"PublicOpen"},
+                    {"libraryEditing":"none"},{"fileEditing":"all"},{"url":None}):
+        assert group_api("PATCH",payload=payload)[0]==400,payload
+    assert group_api("PATCH",payload={"description":"Policy description","url":"https://example.test/group",
+        "libraryEditing":"admins","fileEditing":"admins"})[0]==204
+    assert group_api("PATCH",payload={"name":"Stale"})[0]==412
+    assert group_api("PATCH",payload={"fileEditing":"admins"},version=2)[0]==204
+    assert sql("select version from groups where id=%s",(gid,))==[(2,)]
+    assert sql("select version from library where id=%s",(glib,))==[(0,)]
+    group_receipts["supported_create_strict_metadata_versions_no_elevation"]=True
+
+    # Membership changes belong to checkpoint18, so only fixture setup uses SQL.
+    sql("insert into group_memberships(group_id,user_id,role) values(%s,202,'member')",(gid,))
+    group_member,group_member_csrf=login(user="second",user_id=202)
+    assert group_api("GET",cookies=group_member,token=group_member_csrf)[0]==200
+    assert group_api("PATCH",payload={"fileEditing":"members"},cookies=group_member,
+        token=group_member_csrf,version=2)[0]==403
+    assert group_api("DELETE",cookies=group_member,token=group_member_csrf,version=2)[0]==403
+    sql("update group_memberships set role='admin' where group_id=%s and user_id=202",(gid,))
+    assert group_api("PATCH",payload={"fileEditing":"members"},cookies=group_member,
+        token=group_member_csrf,version=2)[0]==204
+    assert group_api("DELETE",cookies=group_member,token=group_member_csrf,version=3)[0]==403
+    group_receipts["owner_admin_member_management_matrix"]=True
+
+    # Library-lock observation proves the demotion committed before admission
+    # completes, not merely a serial permission probe.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=%s for update",(glib,))
+            future=executor.submit(group_api,"PATCH",group_path,{"name":"Demoted"},
+                group_member,group_member_csrf,3)
+            wait_edge(blocker.info.backend_pid)
+            blocker.execute("update group_memberships set role='member' where group_id=%s and user_id=202",(gid,))
+            blocker.commit()
+            assert future.result(timeout=25)[0]==403
+    assert sql("select name,version from groups where id=%s",(gid,))==[("Managed private group",3)]
+    group_receipts["role_demotion_after_observed_library_wait"]=True
+
+    # A failed audit must roll back both metadata and library allocation.
+    with connect(autocommit=True) as ddl:
+        ddl.execute("""create function checkpoint17_audit_fail() returns trigger language plpgsql as
+            $$begin if new.action::text like 'groups.%' then
+            raise exception 'private-group-audit-failure'; end if; return new; end$$""")
+        ddl.execute("create trigger checkpoint17_audit_fail before insert on audit_events for each row execute function checkpoint17_audit_fail()")
+    before=(sql("select count(*) from library"),sql("select count(*) from groups"))
+    assert group_api("PATCH",payload={"name":"Rollback"},version=3)[0]==500
+    assert group_api("POST","/xotero/groups",{"name":"Rollback create"})[0]==500
+    assert (sql("select count(*) from library"),sql("select count(*) from groups"))==before
+    assert sql("select name,version from groups where id=%s",(gid,))==[("Managed private group",3)]
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint17_audit_fail on audit_events")
+        ddl.execute("drop function checkpoint17_audit_fail()")
+    secrets.append("private-group-audit-failure")
+    group_receipts["audit_failure_rolls_back_metadata_and_allocation"]=True
+    # Allocation skips explicit fixture/configuration IDs without overwriting
+    # their libraries. Metadata administration never grants data access.
+    assert group_api("POST","/xotero/admin/groups",{"name":"Missing owner"},jar,csrf)[0]==400
+    for owner,status in ((303,409),(999999,404)):
+        assert group_api("POST","/xotero/admin/groups",{"name":"Invalid owner","ownerUserID":owner},
+            jar,csrf)[0]==status
+    sql("select setval(pg_get_serial_sequence('groups','id'),707,false)")
+    sql("select setval(pg_get_serial_sequence('library','id'),77,false)")
+    status,body,_=group_api("POST","/xotero/admin/groups",
+        {"name":"Allocated by operator","ownerUserID":202},jar,csrf)
+    assert status==201,(status,body)
+    allocated=json.loads(body)
+    assert allocated=={"groupID":708,"libraryID":78},allocated
+    assert sql("select library_id,name from groups where id=707")==[(77,"Key scope fixture")]
+    assert group_api("DELETE","/xotero/admin/groups/708",cookies=jar,token=csrf)[0]==204
+    group_receipts["admin_create_enabled_owner_collision_safe_allocation"]=True
+
+    # No body is supplied. Authentication, role and cookie-CSRF decisions must
+    # arrive before buffering the declared payload.
+    for cookies,token,supplied_origin,expected in (
+        ({},None,origin,401),(group_member,group_member_csrf,origin,403),
+        (group_owner,group_owner_csrf,None,403),(group_owner,"0"*64,origin,403),
+        (group_owner,group_owner_csrf,"null",403),
+    ):
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=5)) as client:
+            client.putrequest("PATCH",group_path)
+            client.putheader("Content-Length","1048576")
+            client.putheader("If-Match",'"3"')
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in cookies.items()))
+            if token is not None:
+                client.putheader("X-Xotero-CSRF",token)
+            if supplied_origin is not None:
+                client.putheader("Origin",supplied_origin)
+            client.endheaders()
+            response=client.getresponse()
+            assert response.status==expected,(response.status,expected)
+            response.read()
+    group_receipts["prebody_session_role_origin_csrf"]=True
+
+    # Commit admission, then demote the group admin while body is withheld.
+    sql("update group_memberships set role='admin' where group_id=%s and user_id=202",(gid,))
+    payload=json.dumps({"name":"After demotion"}).encode()
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=20)) as client:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=%s for update",(glib,))
+            client.putrequest("PATCH",group_path)
+            client.putheader("Content-Length",str(len(payload)))
+            client.putheader("If-Match",'"3"')
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in group_member.items()))
+            client.putheader("Origin",origin)
+            client.putheader("X-Xotero-CSRF",group_member_csrf)
+            client.endheaders()
+            wait_edge(blocker.info.backend_pid)
+            admission_pid=sql("select pid from pg_stat_activity where %s=any(pg_blocking_pids(pid))",
+                (blocker.info.backend_pid,))[0][0]
+            blocker.commit()
+        with connect(autocommit=True) as observer:
+            observer.execute("""do $$declare deadline timestamptz:=clock_timestamp()+interval '10 seconds';
+                begin loop exit when exists(select 1 from pg_stat_activity where pid="""+str(admission_pid)+"""
+                and state='idle' and query='COMMIT');
+                if clock_timestamp()>deadline then raise exception 'group admission did not commit'; end if;
+                perform pg_stat_clear_snapshot(); end loop; end$$""")
+        sql("update group_memberships set role='member' where group_id=%s and user_id=202",(gid,))
+        client.send(payload)
+        response=client.getresponse()
+        assert response.status==403,response.status
+        response.read()
+    assert sql("select name,version from groups where id=%s",(gid,))==[("Managed private group",3)]
+    group_receipts["role_demotion_between_admission_and_body"]=True
+
+    # Original group owner/library binding is never followed after a wait.
+    sql("insert into library(id,version,kind) values(9090,0,'group')")
+    for mutation,expected in (("owner_disabled",409),("library_binding",409),("version",412)):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with connect() as blocker:
+                blocker.execute("select id from library where id=%s for update",(glib,))
+                future=executor.submit(group_api,"PATCH",group_admin_path,
+                    {"name":"Wait loser"},jar,csrf,3)
+                wait_edge(blocker.info.backend_pid)
+                match mutation:
+                    case "owner_disabled":
+                        blocker.execute("update users set disabled_at=clock_timestamp() where id=%s",(target,))
+                    case "library_binding":
+                        blocker.execute("update groups set library_id=9090 where id=%s",(gid,))
+                    case "version":
+                        blocker.execute("update groups set version=4 where id=%s",(gid,))
+                blocker.commit()
+                result=future.result(timeout=25)
+                assert result[0]==expected,(mutation,result)
+        sql("update users set disabled_at=null where id=%s",(target,))
+        sql("update groups set library_id=%s,version=3 where id=%s",(glib,gid))
+    sql("delete from library where id=9090")
+    group_receipts["postwait_owner_library_version_original_binding"]=True
+
+    # Owner disabling wins a create race before the positive user lock.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        with connect() as blocker:
+            blocker.execute("select id from users where id=202 for update")
+            future=executor.submit(group_api,"POST","/xotero/admin/groups",
+                {"name":"Disabled create contender","ownerUserID":202},jar,csrf)
+            wait_edge(blocker.info.backend_pid)
+            blocker.execute("update users set disabled_at=clock_timestamp() where id=202")
+            blocker.commit()
+            assert future.result(timeout=25)[0]==409
+    assert sql("select id from groups where name='Disabled create contender'")==[]
+    sql("update users set disabled_at=null where id=202")
+    group_receipts["disabled_owner_create_after_observed_user_wait"]=True
+
+    assert group_api("PATCH",payload={"libraryEditing":"members","fileEditing":"members"},version=3)[0]==204
+    owner_key=mint(wildcard,cookies=group_owner,token=group_owner_csrf)
+    member_key=mint(wildcard,cookies=group_member,token=group_member_csrf)
+    individual_scope=json.loads(json.dumps(empty))
+    individual_scope["groups"]["individual"]=[{"groupID":gid,"library":True,"write":True}]
+    individual_key=mint(individual_scope,cookies=group_member,token=group_member_csrf)
+    assert sql("select policy_limited from api_key_group_permissions where api_key_id=%s",
+        (individual_key["id"],))==[(True,)]
+    # A mixed explicit grant must survive target deletion for unrelated group707.
+    mixed=json.loads(json.dumps(empty))
+    mixed["groups"]["individual"]=[{"groupID":gid,"library":True,"write":True},
+        {"groupID":707,"library":True,"write":False}]
+    sql("insert into group_memberships(group_id,user_id,role) values(707,%s,'member')",(target,))
+    mixed_key=mint(mixed,cookies=group_owner,token=group_owner_csrf)
+
+    def data_call(method,path,body=b"",headers=None,credential=owner_key["token"]):
+        fields={"Zotero-API-Key":credential,"Content-Type":"application/x-www-form-urlencoded"}
+        fields.update(headers or {})
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=25)) as client:
+            client.request(method,path,body,fields)
+            response=client.getresponse()
+            return response.status,response.read(),dict(response.getheaders())
+
+    # Hyper emits100 only when middleware first polls the body, after its
+    # key/scope admission. Tighten through supported management before sending
+    # bytes; every store family, including no-op paths, must recheck live policy.
+    status,body,_=group_api("POST","/xotero/groups",{"name":"Policy race group"})
+    assert status==201
+    policy_group=json.loads(body)
+    policy_gid=policy_group["groupID"]
+    policy_lib=policy_group["libraryID"]
+    policy_path="/xotero/groups/"+str(policy_gid)
+    sql("insert into group_memberships(group_id,user_id,role) values(%s,202,'member')",(policy_gid,))
+    policy_version=1
+    policy_races=[]
+    for method,suffix,payload in (
+        ("POST","items",b"[]"),
+        ("POST","items",b'[{"key":"WAIT2222","itemType":"book","title":"Denied"}]'),
+        ("DELETE","items",b" "),
+        ("POST","collections",b'[{"key":"CLLC2222","name":"Denied"}]'),
+        ("POST","searches",b'[{"key":"SRCH2222","name":"Denied","conditions":[]}]'),
+        ("POST","fulltext",b"[]"),
+        ("POST","fulltext",b'[{"key":"TEXT2222","content":"Denied"}]'),
+        ("POST","settings",b"{}"),
+        ("POST","settings",b'{"tagColors":{"value":[]}}'),
+        ("DELETE","settings",b" "),
+        ("DELETE","tags",b" "),
+        ("DELETE","tags?tag=Denied",b" "),
+    ):
+        before=sql("select version from library where id=%s",(policy_lib,))
+        with socket.create_connection(("127.0.0.1",8189),timeout=20) as stream:
+            stream.sendall((
+                f"{method} /groups/{policy_gid}/{suffix} HTTP/1.1\r\nHost: localhost\r\n"
+                f"Zotero-API-Key: {member_key['token']}\r\nIf-Unmodified-Since-Version: 0\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(payload)}\r\n"
+                "Expect: 100-continue\r\nConnection: close\r\n\r\n").encode())
+            interim=b""
+            while not interim.endswith(b"\r\n\r\n"):
+                chunk=stream.recv(1)
+                assert chunk,"connection ended before100"
+                interim+=chunk
+            assert interim.startswith(b"HTTP/1.1 100 "),interim
+            assert group_api("PATCH",policy_path,{"libraryEditing":"admins"},
+                version=policy_version)[0]==204
+            policy_version+=1
+            stream.sendall(payload)
+            response=http.client.HTTPResponse(stream)
+            response.begin()
+            status=response.status
+            response.read()
+            assert status==403,("checkpoint17 live ordinary policy after body admission",method,suffix,status)
+        assert sql("select version from library where id=%s",(policy_lib,))==before
+        assert group_api("PATCH",policy_path,{"libraryEditing":"members"},
+            version=policy_version)[0]==204
+        policy_version+=1
+        policy_races.append({"method":method,"path":suffix,"admission":100,"status":403})
+    for table in ("object","fulltext","setting","deletion","file"):
+        assert sql("select count(*) from "+table+" where library_id=%s",(policy_lib,))==[(0,)]
+    assert group_api("DELETE",policy_path,version=policy_version)[0]==204
+    group_receipts["live_ordinary_mutation_body_policy_races"]=policy_races
+
+    def candidate(item,content,credential=owner_key["token"]):
+        status,body,_=data_call("POST",f"/groups/{gid}/items/{item}/file",
+            urllib.parse.urlencode({"md5":hashlib.md5(content).hexdigest(),"filename":"group.txt",
+                "filesize":len(content),"mtime":1}),{"If-None-Match":"*"},credential)
+        assert status==200,(status,body)
+        token=json.loads(body)["uploadKey"]
+        assert data_call("POST","/uploads/"+token,content)[0]==201
+        blob=sql("select blob_key from pending_uploads where token_hash=%s",
+            (hashlib.sha256(token.encode()).digest(),))[0][0]
+        return token,blob
+
+    def download(url):
+        parsed=urllib.parse.urlsplit(url)
+        with contextlib.closing(http.client.HTTPConnection(parsed.hostname,parsed.port,timeout=20)) as client:
+            client.request("GET",parsed.path+"?"+parsed.query)
+            response=client.getresponse()
+            return response.status,response.read()
+
+    items=[{"key":key,"itemType":"attachment","linkMode":"imported_file"}
+        for key in ("GRUPPF22","PENDNG22","UNCERT22")]
+    status,body,_=data_call("POST",f"/groups/{gid}/items",json.dumps(items),
+        {"Content-Type":"application/json","If-Unmodified-Since-Version":"0"})
+    assert status==200 and not json.loads(body)["failed"],(status,body)
+    registered,registered_blob=candidate("GRUPPF22",b"registered group bytes")
+    assert data_call("POST",f"/groups/{gid}/items/GRUPPF22/file",
+        urllib.parse.urlencode({"upload":registered}))[0]==204
+    status,_,headers=data_call("GET",f"/groups/{gid}/items/GRUPPF22/file")
+    assert status==302
+    signed_url=headers["location"]
+    assert download(signed_url)==(200,b"registered group bytes")
+    pending,pending_blob=candidate("PENDNG22",b"pending member bytes",individual_key["token"])
+    uncertain,uncertain_blob=candidate("UNCERT22",b"uncertain candidate bytes")
+    sql("update pending_uploads set state='discarded',expires_at='infinity' where token_hash=%s",
+        (hashlib.sha256(uncertain.encode()).digest(),))
+    before=sql("select version from library where id=%s",(glib,))
+    assert group_api("PATCH",payload={"fileEditing":"admins"},version=4)[0]==204
+    assert data_call("POST",f"/groups/{gid}/items/PENDNG22/file",
+        urllib.parse.urlencode({"upload":pending}))[0]==403
+    assert sql("select version from library where id=%s",(glib,))==before
+    assert sql("select item_key from file where library_id=%s",(glib,))==[("GRUPPF22",)]
+    assert group_api("PATCH",payload={"libraryEditing":"admins"},version=5)[0]==204
+    for credential in (individual_key["token"],member_key["token"]):
+        assert data_call("POST",f"/groups/{gid}/items",b"[]",
+            {"Content-Type":"application/json","If-Unmodified-Since-Version":str(before[0][0])},
+            credential)[0]==403
+    # New grants remain policy-limited; legacy false retains its established rule.
+    sql("update api_key_group_permissions set policy_limited=false where api_key_id=%s",
+        (individual_key["id"],))
+    assert data_call("POST",f"/groups/{gid}/items",b"[]",
+        {"Content-Type":"application/json","If-Unmodified-Since-Version":str(before[0][0])},
+        individual_key["token"])[0]==200
+    assert data_call("POST",f"/groups/{gid}/items/PENDNG22/file",
+        urllib.parse.urlencode({"upload":pending}))[0]==403
+    group_receipts["live_policy_original_authorizer_and_legacy_explicit_semantics"]=True
+    assert group_api("PATCH",payload={"libraryEditing":"members","fileEditing":"members"},version=6)[0]==204
+
+    # Preserve another live reference to the registered bytes in unrelated707.
+    sql("""insert into object(library_id,kind,key,version,data)
+        select 77,kind,'SHARED22',0,data from object where library_id=%s and key='GRUPPF22'""",(glib,))
+    sql("""insert into file(library_id,item_key,md5,filename,filesize,mtime,version,blob_key,blob_md5,compressed)
+        select 77,'SHARED22',md5,filename,filesize,mtime,0,blob_key,blob_md5,compressed
+        from file where library_id=%s and item_key='GRUPPF22'""",(glib,))
+    receipt_fields="""jsonb_build_object('token_hash',token_hash,'library_id',library_id,
+        'group_id',group_id,'authorizer_key_hash',authorizer_key_hash,'item_key',item_key,
+        'blob_key',blob_key,'md5',md5,'upload_md5',upload_md5,'filename',filename,
+        'filesize',filesize,'mtime',mtime,'compressed',compressed,'expires_at',expires_at)"""
+    receipts_before=sql("select "+receipt_fields+" from pending_uploads where library_id=%s order by token_hash",(glib,))
+    # Deletion owns library before waiting for the observed blob lock. A
+    # registration contender then waits behind deletion, rather than publishing.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        with connect() as blocker:
+            blocker.execute("select pg_advisory_xact_lock(1481593922,hashtext(%s))",(registered_blob,))
+            deletion=executor.submit(group_api,"DELETE",group_path,None,group_owner,group_owner_csrf,7)
+            wait_edge(blocker.info.backend_pid)
+            deleting_pid=sql("select pid from pg_stat_activity where %s=any(pg_blocking_pids(pid))",
+                (blocker.info.backend_pid,))[0][0]
+            registration=executor.submit(data_call,"POST",f"/groups/{gid}/items/PENDNG22/file",
+                urllib.parse.urlencode({"upload":pending}))
+            wait_edge(deleting_pid)
+            blocker.commit()
+            assert deletion.result(timeout=25)[0]==204
+            assert registration.result(timeout=25)[0] in (403,404)
+    assert group_api("GET")[0]==404
+    assert sql("select id from library where id=%s",(glib,))==[]
+    assert sql("select user_id from group_memberships where group_id=%s",(gid,))==[]
+    assert sql("select "+receipt_fields+" from pending_uploads where library_id=%s order by token_hash",(glib,))==receipts_before
+    assert sql("select group_id from api_key_group_permissions where api_key_id=%s",(mixed_key["id"],))==[(707,)]
+    assert data_call("GET","/groups/707/items",credential=mixed_key["token"])[0]==200
+    assert data_call("POST",f"/groups/{gid}/items/PENDNG22/file",
+        urllib.parse.urlencode({"upload":pending}))[0]==404
+    assert download(signed_url)==(200,b"registered group bytes")
+    assert sql("""select not_before>clock_timestamp()+interval '60 seconds' from blob_retirements
+        where blob_key=%s""",(registered_blob,))==[(True,)]
+    sql("update blob_retirements set not_before=clock_timestamp()-interval '1 second' where blob_key=%s",
+        (registered_blob,))
+    cleanup=subprocess.run(["xotero","maintenance","gc","--once"],env=environment,
+        stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True,timeout=30)
+    assert cleanup.returncode==0,cleanup.stdout
+    assert download(signed_url)==(200,b"registered group bytes")
+    # Uncertain receipt recurs, but its exact bytes are removed. It cannot
+    # consume another key, group grant or the still-live registered shared blob.
+    assert sql("select state,expires_at='infinity'::timestamptz from pending_uploads where blob_key=%s",
+        (uncertain_blob,))==[("discarded",True)]
+    sql("""update pending_uploads set created_at=clock_timestamp()-interval '2 hours',
+        expires_at=clock_timestamp()-interval '1 hour' where blob_key=%s""",(pending_blob,))
+    # Registered-blob maintenance intentionally does not reset live uploads.
+    # A real new authorization invokes the existing finite pending cleanup pass.
+    status,body,_=data_call("POST","/groups/707/items/SHARED22/file",
+        urllib.parse.urlencode({"md5":hashlib.md5(b"cleanup probe").hexdigest(),
+            "filename":"probe.txt","filesize":13,"mtime":1}),
+        {"If-Match":hashlib.md5(b"registered group bytes").hexdigest()},member_key["token"])
+    assert status==200,(status,body)
+    assert sql("select blob_key from pending_uploads where blob_key=%s",(pending_blob,))==[]
+    for blob in (pending_blob,uncertain_blob):
+        status=subprocess.run(["curl","--silent","--show-error","--max-time","20",
+            "--aws-sigv4","aws:amz:us-east-1:s3","--user","rustfsadmin:rustfsadmin",
+            "--output","/dev/null","--write-out","%{http_code}",
+            "http://127.0.0.1:9000/zotero/"+blob],
+            check=True,stdout=subprocess.PIPE,text=True).stdout
+        assert status=="404",(blob,status)
+    assert download(signed_url)==(200,b"registered group bytes")
+    group_receipts["registered_retirement_shared_grace_pending_receipts_no_collateral"]=True
+    group_receipts["deletion_registration_observed_overlap"]=True
+    print("CHECKPOINT17_GROUPS "+json.dumps(group_receipts,sort_keys=True),flush=True)
+
     def admin(method,path,payload=None,cookies=jar,token=csrf):
         return request(method,path,cookies,token,body=payload)
 
@@ -1451,7 +1916,9 @@ finally:
         if server.poll() is None:
             server.send_signal(signal.SIGINT)
         assert server.wait(timeout=15)==0
-        logs=server.stdout.read().decode()
+        server_log_thread.join(timeout=10)
+        assert not server_log_thread.is_alive()
+        logs=server_output.decode()
         assert all(secret not in logs for secret in secrets)
     subprocess.run(["sudo","-u","postgres","dropdb",database],check=True)
     print("CHECKPOINT14_CLEANUP "+json.dumps({"database":database,"server":None if server is None else server.pid}),flush=True)
