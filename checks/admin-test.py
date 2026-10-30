@@ -433,6 +433,12 @@ class Proxy(http.server.BaseHTTPRequestHandler):
         self.forward()
     def do_POST(self):
         self.forward()
+    def do_PATCH(self):
+        self.forward()
+    def do_PUT(self):
+        self.forward()
+    def do_DELETE(self):
+        self.forward()
     def log_message(self,*args):
         pass
     def forward(self):
@@ -443,7 +449,9 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             "Bearer fixture-second-auth": "second",
             "Bearer fixture-disabled-auth": "disabled",
             "Bearer fixture-unknown-auth": "unknown",
+            "Bearer fixture-provisioned-auth": "provisioned",
         }.get(self.headers.get("Authorization"))
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
         with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=20)) as backend:
             backend.putrequest(self.command,self.path)
             for name,value in self.headers.items():
@@ -453,7 +461,8 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             if identity is not None:
                 backend.putheader("X-Xotero-OIDC-Issuer","https://id.example.test")
                 backend.putheader("X-Xotero-OIDC-Subject",identity)
-            backend.endheaders()
+            backend.putheader("Content-Length", str(len(body)))
+            backend.endheaders(body)
             response=backend.getresponse()
             body=response.read()
             self.send_response(response.status)
@@ -464,7 +473,7 @@ class Proxy(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
 
-def request(method,path,cookies=None,csrf=None,user="owner",request_origin=origin,extra=()):
+def request(method,path,cookies=None,csrf=None,user="owner",request_origin=origin,extra=(),body=None):
     with contextlib.closing(http.client.HTTPConnection("127.0.0.1",proxy.server_port,timeout=25)) as client:
         client.putrequest(method,path)
         if cookies:
@@ -477,7 +486,10 @@ def request(method,path,cookies=None,csrf=None,user="owner",request_origin=origi
             client.putheader("Authorization","Bearer fixture-"+user+"-auth")
         for name,value in extra:
             client.putheader(name,value)
-        client.endheaders()
+        payload = b"" if body is None else json.dumps(body).encode()
+        client.putheader("Content-Type", "application/json")
+        client.putheader("Content-Length", str(len(payload)))
+        client.endheaders(payload)
         response=client.getresponse()
         body=response.read()
         return response.status,body,response.headers
@@ -499,12 +511,12 @@ def challenge(cookies=None):
     assert headers["Cache-Control"]=="no-store"
     return jar,result["csrfToken"]
 
-def login(cookies=None):
+def login(cookies=None,user="owner",user_id=101):
     jar,csrf=challenge(cookies)
-    status,body,headers=request("POST","/xotero/web/session",jar,csrf)
+    status,body,headers=request("POST","/xotero/web/session",jar,csrf,user=user)
     assert status==200,(status,body)
     result=json.loads(body)
-    assert set(result)=={"csrfToken","userID"} and result["userID"]==101,result
+    assert set(result)=={"csrfToken","userID"} and result["userID"]==user_id,result
     values=headers.get_all("Set-Cookie")
     assert len(values)==2,values
     assert {value.split("=",1)[0] for value in values}=={"__Host-xotero-session","__Host-xotero-browser"},values
@@ -567,6 +579,7 @@ try:
         "XOTERO_LOGIN_KDF_KEY_FILE":"/etc/xotero-test/kdf",
         "XOTERO_S3_ENDPOINT":"http://127.0.0.1:9000",
         "XOTERO_S3_ACCESS_KEY":"rustfsadmin","XOTERO_S3_SECRET_KEY":"rustfsadmin",
+        "XOTERO_API_KEY":"fixture-admin-recovery",
     }
     server=subprocess.Popen(["xotero"],env=environment,stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,bufsize=0)
@@ -584,7 +597,7 @@ try:
     print("CHECKPOINT14_PROXY "+json.dumps({"port":proxy.server_port,"backend":8189}),flush=True)
     assert sql(v16_snapshot)==preserved
     assert sql("select version,checksum from _sqlx_migrations where version<=16 order by version")==v16_checksums
-    assert sql("select max(version) from _sqlx_migrations")==[(17,)]
+    assert sql("select max(version) from _sqlx_migrations")==[(18,)]
     assert request("GET","/keys/current",extra=[("Zotero-API-Key",preserved_key)])[0]==200
     receipts["populated_v16_authority_audit_key_upgrade_preserved"]=True
     sql("insert into users(id,username,display_name) values(202,'second','Second'),(303,'disabled','Disabled')")
@@ -851,6 +864,277 @@ try:
     assert len({row[4] for row in events})==len(events)
     secrets.append("private-audit-failure-must-not-log")
     receipts["uuid_bound_safe_audit_atomic_failure"]=True
+    # Given a live mapped instance-admin session, provision through supported API.
+    jar,csrf=login()
+    status,body,headers=request("POST","/xotero/admin/users",jar,csrf,body={
+        "username":"provisioned","displayName":"Provisioned",
+        "issuer":"https://id.example.test","subject":"provisioned",
+    })
+    assert status==201,("checkpoint15 supported admin user create",status,body)
+    created=json.loads(body)
+    assert set(created)=={"userID","libraryID"}
+    assert created["userID"]>0 and created["libraryID"]!=1
+    assert sql("select library_id from personal_libraries where user_id=%s",
+        (created["userID"],))==[(created["libraryID"],)]
+    receipts["supported_admin_user_create"]=True
+    admin_receipts = {"api_provisioned_isolated_library": True}
+    target=created["userID"]
+    target_path="/xotero/admin/users/"+str(target)
+    identity={"issuer":"https://id.example.test","subject":"provisioned"}
+    extra_identity={"issuer":"https://id.example.test","subject":"second-exact-identity"}
+    ordinary,ordinary_csrf=login(user="provisioned",user_id=target)
+
+    def admin(method,path,payload=None,cookies=jar,token=csrf):
+        return request(method,path,cookies,token,body=payload)
+
+    for key in (preserved_key,"fixture-admin-recovery"):
+        assert request("GET","/xotero/admin/users",extra=[("Zotero-API-Key",key)])[0]==401
+    assert admin("GET","/xotero/admin/users",cookies=ordinary,token=ordinary_csrf)[0]==403
+    status,body,headers=admin("GET","/xotero/admin/users")
+    assert status==200 and headers["Cache-Control"]=="no-store"
+    listed=json.loads(body)
+    assert all(set(row)=={"userID","libraryID","username","displayName","disabled","instanceAdmin"}
+               for row in listed)
+    assert next(row for row in listed if row["userID"]==target)["libraryID"]==created["libraryID"]
+    assert admin("PATCH",target_path,{"displayName":"Renamed"})[0]==204
+    assert sql("select display_name from users where id=%s",(target,))==[("Renamed",)]
+    for path,payload in (
+        (target_path,{}),(target_path,{"displayName":None}),
+        (target_path,{"disabled":"true"}),(target_path,{"displayName":" "}),
+        (target_path,{"unknown":True}),(target_path,{"disabled":None}),
+    ):
+        assert admin("PATCH",path,payload)[0]==400,(path,payload)
+    assert admin("PUT",target_path+"/instance-admin",{"enabled":True,"unexpected":1})[0]==400
+    assert admin("POST",target_path+"/identities",{"issuer":"","subject":"valid"})[0]==400
+    assert admin("PATCH","/xotero/admin/users/not-an-id",{"disabled":True})[0]==400
+    assert admin("PATCH","/xotero/admin/users/999999",{"disabled":True})[0]==404
+    before=sql("select count(*) from library"),sql("select count(*) from users")
+    assert admin("POST","/xotero/admin/users",{
+        "username":"duplicate","displayName":"Duplicate",**identity})[0]==409
+    assert (sql("select count(*) from library"),sql("select count(*) from users"))==before
+    assert admin("POST",target_path+"/identities",
+        {"issuer":"https://id.example.test","subject":"owner"})[0]==409
+    assert sql("select user_id from external_identities where subject='owner'")==[(101,)]
+    assert admin("POST",target_path+"/identities",extra_identity)[0]==204
+    assert admin("POST",target_path+"/identities",extra_identity)[0]==204
+    assert admin("DELETE",target_path+"/identities",extra_identity)[0]==204
+    assert admin("DELETE",target_path+"/identities",extra_identity)[0]==204
+    assert admin("DELETE",target_path+"/identities",identity)[0]==409
+    admin_receipts["strict_contract_exact_mapping_conflict_atomic_create"]=True
+
+    assert admin("PUT",target_path+"/instance-admin",{"enabled":True})[0]==204
+    assert admin("GET","/xotero/admin/users",cookies=ordinary,token=ordinary_csrf)[0]==200
+    # An instance role does not confer data access, even when paired with its
+    # owner's real scoped API key. Enrollment is an API action, not SQL minting.
+    status,body,headers=request("POST","/keys/sessions",body={})
+    assert status==201
+    enrollment_token=json.loads(body)["sessionToken"]
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=10)) as client:
+        payload="session="+enrollment_token
+        client.request("POST","/login",payload,{
+            "Content-Type":"application/x-www-form-urlencoded",
+            "X-Xotero-OIDC-Issuer":"https://id.example.test",
+            "X-Xotero-OIDC-Subject":"provisioned",
+        })
+        response=client.getresponse()
+        assert response.status==200,response.read()
+        response.read()
+    status,body,headers=request("GET","/keys/sessions/"+enrollment_token)
+    assert status==200
+    issued_key=json.loads(body)["apiKey"]
+    secrets.append(issued_key)
+    assert request("GET","/users/101/items",extra=[("Zotero-API-Key",issued_key)])[0]==403
+    assert request("GET","/users/"+str(target)+"/items",extra=[("Zotero-API-Key",issued_key)])[0]==200
+    assert admin("PUT",target_path+"/instance-admin",{"enabled":False})[0]==204
+    assert admin("GET","/xotero/admin/users",cookies=ordinary,token=ordinary_csrf)[0]==403
+    assert admin("PUT","/xotero/admin/users/101/instance-admin",{"enabled":False})[0]==409
+    assert admin("DELETE","/xotero/admin/users/101/identities",
+        {"issuer":"https://id.example.test","subject":"owner"})[0]==409
+    assert admin("PATCH","/xotero/admin/users/101",{"disabled":True})[0]==409
+    admin_receipts["role_live_no_private_read_elevation_final_admin"]=True
+
+    def session_status(cookies,token):
+        return admin("GET","/xotero/admin/users",cookies=cookies,token=token)[0]
+    def session_revoked(cookies):
+        return sql("""select s.revoked_at is not null and k.revoked_at is not null
+            from web_sessions s join api_keys k on k.id=s.api_key_id
+            where s.token_hash=%s""",(token_hash(cookies),))==[(True,)]
+
+    disabled_jar,disabled_csrf=login(user="provisioned",user_id=target)
+    assert session_status(disabled_jar,disabled_csrf)==403
+    assert admin("PATCH",target_path,{"disabled":True})[0]==204
+    assert admin("DELETE",target_path+"/identities",identity)[0]==204
+    assert admin("PATCH",target_path,{"disabled":False})[0]==409
+    assert admin("PUT",target_path+"/instance-admin",{"enabled":True})[0]==409
+    assert admin("POST",target_path+"/identities",identity)[0]==204
+    assert admin("PATCH",target_path,{"disabled":False})[0]==204
+    # Re-enabling must not revive a browser session that disabling ended.
+    assert session_status(disabled_jar,disabled_csrf)==401
+    assert session_revoked(disabled_jar)
+
+    probe_identity={"issuer":"https://id.example.test","subject":"relink-probe"}
+    unlinked_jar,unlinked_csrf=login(user="provisioned",user_id=target)
+    assert session_status(unlinked_jar,unlinked_csrf)==403
+    assert admin("POST",target_path+"/identities",probe_identity)[0]==204
+    assert admin("DELETE",target_path+"/identities",identity)[0]==204
+    assert admin("POST",target_path+"/identities",identity)[0]==204
+    assert admin("DELETE",target_path+"/identities",probe_identity)[0]==204
+    # Relinking must not revive a browser session bound to the unlinked identity.
+    assert session_status(unlinked_jar,unlinked_csrf)==401
+    assert session_revoked(unlinked_jar)
+    admin_receipts["disable_and_unlink_revoke_browser_sessions"]=True
+    # Disabling ended the earlier ordinary session; later checks need a live one.
+    ordinary,ordinary_csrf=login(user="provisioned",user_id=target)
+    # SQL creates only the not-yet-supported group lifecycle fixture.
+    sql("insert into library(id,version,kind) values(66,0,'group')")
+    with connect() as fixture:
+        fixture.execute("""insert into groups(id,library_id,owner_user_id,name)
+            values(606,66,%s,'Owned group')""",(target,))
+        fixture.execute("""insert into group_memberships(group_id,user_id,role)
+            values(606,%s,'owner'),(606,202,'admin')""",(target,))
+    group_admin,group_csrf=login(user="second",user_id=202)
+    assert admin("GET","/xotero/admin/users",cookies=group_admin,token=group_csrf)[0]==403
+    assert admin("PATCH",target_path,{"disabled":True,"displayName":"Must not commit"})[0]==409
+    assert sql("select display_name,disabled_at from users where id=%s",(target,))==[("Renamed",None)]
+    admin_receipts["disabled_cleanup_reenable_policy_group_owner_conflict"]=True
+
+    # Given incomplete bodies, boundary denial must arrive before any body byte.
+    for cookies,token,supplied_origin,expected in (
+        ({},None,origin,401),(ordinary,ordinary_csrf,origin,403),
+        (jar,csrf,None,403),(jar,"0"*64,origin,403),(jar,csrf,"null",403),
+    ):
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=5)) as client:
+            client.putrequest("PATCH",target_path)
+            client.putheader("Content-Length","1048576")
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in cookies.items()))
+            if token is not None:
+                client.putheader("X-Xotero-CSRF",token)
+            if supplied_origin is not None:
+                client.putheader("Origin",supplied_origin)
+            client.endheaders()
+            response=client.getresponse()
+            assert response.status==expected,(response.status,expected)
+            response.read()
+    admin_receipts["prebody_auth_origin_csrf"]=True
+
+    # A real lock barrier forces discovery before a committed authority change.
+    # These SQL changes model competing revokers; the action under test is HTTP.
+    for mutation in ("role","session","key","mapping","disabled","expiry"):
+        race_jar,race_csrf=login()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with connect() as blocker:
+                blocker.execute("select id from library where id=1 for update")
+                future=executor.submit(admin,"PATCH",target_path,{"displayName":"Stale"},
+                    race_jar,race_csrf)
+                wait_edge(blocker.info.backend_pid)
+                match mutation:
+                    case "role":
+                        blocker.execute("delete from instance_admins where user_id=101")
+                    case "session":
+                        blocker.execute("update web_sessions set revoked_at=clock_timestamp() where token_hash=%s",
+                            (token_hash(race_jar),))
+                    case "key":
+                        blocker.execute("""update api_keys set revoked_at=clock_timestamp() where id=
+                            (select api_key_id from web_sessions where token_hash=%s)""",(token_hash(race_jar),))
+                    case "mapping":
+                        blocker.execute("update external_identities set user_id=202 where subject='owner'")
+                    case "disabled":
+                        blocker.execute("update users set disabled_at=clock_timestamp() where id=101")
+                    case "expiry":
+                        blocker.execute("""update web_sessions set created_at=clock_timestamp()-interval '9 hours',
+                            expires_at=clock_timestamp()-interval '1 hour' where token_hash=%s""",(token_hash(race_jar),))
+                blocker.commit()
+                assert future.result(timeout=25)[0]==(403 if mutation=="role" else 401),mutation
+        assert sql("select display_name from users where id=%s",(target,))==[("Renamed",)]
+        sql("insert into instance_admins(user_id) values(101) on conflict do nothing")
+        sql("update external_identities set user_id=101 where subject='owner'")
+        sql("update users set disabled_at=null where id=101")
+    admin_receipts["live_role_session_key_identity_disabled_expiry_after_wait"]=True
+
+    jar,csrf=login()
+    # Prove authorization repeats AFTER body arrival, not merely at admission.
+    # Observe the admission connection blocked on the library, then idle after
+    # COMMIT, before an independent operator demotes it through supported API.
+    assert admin("PUT",target_path+"/instance-admin",{"enabled":True},jar,csrf)[0]==204
+    other_admin,other_csrf=login(user="provisioned",user_id=target)
+    payload=json.dumps({"displayName":"Stale after body"}).encode()
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=20)) as client:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=1 for update")
+            client.putrequest("PATCH",target_path)
+            client.putheader("Content-Type","application/json")
+            client.putheader("Content-Length",str(len(payload)))
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in jar.items()))
+            client.putheader("Origin",origin)
+            client.putheader("X-Xotero-CSRF",csrf)
+            client.endheaders()
+            wait_edge(blocker.info.backend_pid)
+            admission_pid=sql("""select pid from pg_stat_activity where %s=any(pg_blocking_pids(pid))""",
+                (blocker.info.backend_pid,))[0][0]
+            blocker.commit()
+        with connect(autocommit=True) as observer:
+            observer.execute("""do $$declare deadline timestamptz:=clock_timestamp()+interval '10 seconds';
+                begin loop exit when exists(select 1 from pg_stat_activity where pid="""+str(admission_pid)+"""
+                and state='idle' and query='COMMIT');
+                if clock_timestamp()>deadline then raise exception 'admission did not commit'; end if;
+                perform pg_stat_clear_snapshot(); end loop; end$$""")
+        assert admin("PUT","/xotero/admin/users/101/instance-admin",{"enabled":False},
+            other_admin,other_csrf)[0]==204
+        client.send(payload)
+        response=client.getresponse()
+        assert response.status==403,response.status
+        response.read()
+    assert sql("select display_name from users where id=%s",(target,))==[("Renamed",)]
+    assert admin("PUT","/xotero/admin/users/101/instance-admin",{"enabled":True},
+        other_admin,other_csrf)[0]==204
+    assert admin("PUT",target_path+"/instance-admin",{"enabled":False},jar,csrf)[0]==204
+    admin_receipts["supported_demotion_after_admission_before_body_denies"]=True
+
+    # One request UUID, one event per action, and attribution only to a verified
+    # actor. Unknown tokens never borrow an actor ID from claims or the body.
+    correlations=[]
+    for method,path,payload,cookies,token,status,actor,subject,action,outcome in (
+        ("PATCH",target_path,{"unknown":1},jar,csrf,400,101,target,"admin.update-user","denied"),
+        ("PUT",target_path+"/instance-admin",{"enabled":True},other_admin,other_csrf,
+            403,target,target,"admin.set-role","denied"),
+        ("PATCH",target_path,{"displayName":"Unknown"},{},None,
+            401,None,target,"admin.update-user","denied"),
+        ("POST",target_path+"/identities",identity,jar,csrf,
+            204,101,target,"admin.link-identity","noop"),
+        ("DELETE",target_path+"/identities",extra_identity,jar,csrf,
+            204,101,target,"authority.unlink-identity","noop"),
+        ("PATCH","/xotero/admin/users/999999",{"disabled":True},jar,csrf,
+            404,101,999999,"admin.update-user","denied"),
+    ):
+        baseline=sql("select coalesce(max(id),0) from audit_events")[0][0]
+        assert admin(method,path,payload,cookies,token)[0]==status
+        events=sql("""select actor_user_id,subject_user_id,action::text,outcome::text,request_id::text
+            from audit_events where id>%s order by id""",(baseline,))
+        assert len(events)==1 and events[0][:4]==(actor,subject,action,outcome),events
+        correlations.append(events[0][4])
+    assert len(set(correlations))==len(correlations)
+    admin_receipts["single_action_audit_verified_attribution_and_correlation"]=True
+    with connect(autocommit=True) as ddl:
+        ddl.execute("""create function checkpoint15_audit_fail() returns trigger language plpgsql as
+            $$begin raise exception 'private-admin-audit-failure'; end$$""")
+        ddl.execute("create trigger checkpoint15_audit_fail before insert on audit_events for each row execute function checkpoint15_audit_fail()")
+    before=sql("select count(*) from audit_events")
+    assert admin("PATCH",target_path,{"displayName":"Rollback"},jar,csrf)[0]==500
+    assert sql("select display_name from users where id=%s",(target,))==[("Renamed",)]
+    assert sql("select count(*) from audit_events")==before
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint15_audit_fail on audit_events")
+        ddl.execute("drop function checkpoint15_audit_fail()")
+    secrets.append("private-admin-audit-failure")
+    audits=sql("""select action::text,outcome::text,actor_user_id,subject_user_id,
+        request_id::text,occurred_at is not null from audit_events where action::text like 'admin.%'""")
+    assert any(row[:2]==("admin.update-user","success") and row[2:4]==(101,target) for row in audits)
+    assert any(row[1]=="noop" for row in audits) and any(row[1]=="denied" for row in audits)
+    assert all(row[4] and row[5] for row in audits)
+    assert sql("""select count(*) from audit_events where row_to_json(audit_events)::text
+        like '%second-exact-identity%'""")==[(0,)]
+    admin_receipts["audit_success_noop_denied_safe_atomic_rollback"]=True
+    print("CHECKPOINT15_USERS "+json.dumps(admin_receipts,sort_keys=True),flush=True)
     print("CHECKPOINT14_SESSIONS "+json.dumps(receipts,sort_keys=True),flush=True)
 finally:
     if proxy is not None:

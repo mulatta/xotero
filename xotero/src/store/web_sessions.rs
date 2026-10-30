@@ -349,3 +349,102 @@ pub async fn logout_web_session(
     tx.commit().await?;
     Ok(true)
 }
+
+/// Only this constructor can produce a transaction carrying live instance
+/// authority. Admission drops it before reading a body; mutation obtains a new
+/// guard, keeping validation, mutation and audit in one transaction.
+pub struct AdminGuard<'a> {
+    pub(super) tx: sqlx::Transaction<'a, sqlx::Postgres>,
+    pub(super) actor: i64,
+    pub(super) audit: crate::domain::AdminAudit,
+}
+
+pub enum AdminDenial {
+    Unauthenticated,
+    Unauthorized,
+}
+
+pub async fn admin_guard<'a>(
+    pool: &'a PgPool,
+    proof: &crate::domain::WebSessionProof,
+    audit: &mut crate::domain::AdminAudit,
+) -> sqlx::Result<Result<AdminGuard<'a>, AdminDenial>> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("select xotero_lock_instance_authority()")
+        .execute(&mut *tx)
+        .await?;
+    let candidate = sqlx::query(
+        "select user_id,library_id,issuer,subject,api_key_id \
+         from web_sessions where token_hash=$1 and browser_hash=$2",
+    )
+    .bind(proof.token.as_slice())
+    .bind(proof.browser.as_slice())
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(candidate) = candidate else {
+        return Ok(Err(AdminDenial::Unauthenticated));
+    };
+    let binding = Binding::from_row(&candidate);
+    let key: i64 = candidate.get("api_key_id");
+    sqlx::query("select xotero_lock_admin_users($1,$2)")
+        .bind(binding.user)
+        .bind(audit.subject.map(crate::domain::UserId::get))
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("select id from api_keys where id=$1 for share")
+        .bind(key)
+        .fetch_optional(&mut *tx)
+        .await?;
+    sqlx::query("select token_hash from web_sessions where token_hash=$1 for share")
+        .bind(proof.token.as_slice())
+        .fetch_optional(&mut *tx)
+        .await?;
+    // Fresh READ COMMITTED statement after every possible wait. Never follow a
+    // changed discovery binding: that could request an earlier lock out of order.
+    let live: bool = sqlx::query_scalar(
+        "select exists(select 1 from web_sessions s join api_keys k \
+         on k.id=s.api_key_id and k.user_id=s.user_id \
+         where s.token_hash=$1 and s.browser_hash=$2 and s.origin=$3 \
+         and s.user_id=$4 and s.library_id=$5 and s.issuer=$6 and s.subject=$7 \
+         and s.api_key_id=$8 and s.revoked_at is null and k.revoked_at is null \
+         and s.expires_at>clock_timestamp())",
+    )
+    .bind(proof.token.as_slice())
+    .bind(proof.browser.as_slice())
+    .bind(&proof.origin)
+    .bind(binding.user)
+    .bind(binding.library)
+    .bind(&binding.issuer)
+    .bind(&binding.subject)
+    .bind(key)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !live || !valid_binding(&mut tx, &binding).await? {
+        return Ok(Err(AdminDenial::Unauthenticated));
+    }
+    audit.actor = crate::domain::UserId::new(binding.user);
+    if let Some(csrf) = proof.csrf {
+        let matches: bool =
+            sqlx::query_scalar("select csrf_hash=$2 from web_sessions where token_hash=$1")
+                .bind(proof.token.as_slice())
+                .bind(csrf.as_slice())
+                .fetch_one(&mut *tx)
+                .await?;
+        if !matches {
+            return Ok(Err(AdminDenial::Unauthorized));
+        }
+    }
+    let role: bool =
+        sqlx::query_scalar("select exists(select 1 from instance_admins where user_id=$1)")
+            .bind(binding.user)
+            .fetch_one(&mut *tx)
+            .await?;
+    if !role {
+        return Ok(Err(AdminDenial::Unauthorized));
+    }
+    Ok(Ok(AdminGuard {
+        tx,
+        actor: binding.user,
+        audit: audit.clone(),
+    }))
+}

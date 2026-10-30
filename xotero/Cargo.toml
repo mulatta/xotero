@@ -25,6 +25,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 # preserve_order keeps object key order under our control: Zotero's attachment
 # fromJSON processes fields in order and needs linkMode before filename/path.
 serde_json = { version = "1", features = ["preserve_order"] }
+serde = { version = "=1.0.229", features = ["derive"] }
 # Hash presented API tokens before database lookup; plaintext keys never persist.
 sha2 = "0.10"
 # Parse multi-valued query strings: the CLI `tag` filter repeats the key for AND.

@@ -1,3 +1,4 @@
+pub(crate) mod admin;
 pub(crate) mod files;
 pub(crate) mod fulltext;
 pub(crate) mod groups;

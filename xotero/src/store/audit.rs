@@ -1,6 +1,7 @@
 use sqlx::{Postgres, Transaction};
 
 use crate::domain::UserId;
+use crate::domain::{AdminAction, AdminAudit};
 
 pub(super) enum BootstrapAction {
     Identity,
@@ -20,6 +21,27 @@ pub(super) enum AuditOutcome {
     Success,
     Noop,
     Denied,
+}
+
+pub(super) async fn append_admin(
+    tx: &mut Transaction<'_, Postgres>,
+    event: (&AdminAudit, AdminAction, AuditOutcome),
+) -> sqlx::Result<()> {
+    let (audit, action, outcome) = event;
+    let outcome = match outcome {
+        AuditOutcome::Success => "success",
+        AuditOutcome::Noop => "noop",
+        AuditOutcome::Denied => "denied",
+    };
+    sqlx::query("select xotero_append_audit($1,$2,$3::audit_action,$4::audit_outcome,$5::uuid)")
+        .bind(audit.actor.map(UserId::get))
+        .bind(audit.subject.map(UserId::get))
+        .bind(action.as_str())
+        .bind(outcome)
+        .bind(&audit.request_id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

@@ -110,6 +110,104 @@ pub struct RequestContext {
     pub api_key_id: Option<ApiKeyId>,
 }
 
+/// Presented browser proof, not an authorization cache. Each transaction must
+/// resolve and lock its original binding again. No raw credentials or Debug.
+pub struct WebSessionProof {
+    pub token: [u8; 32],
+    pub browser: [u8; 32],
+    pub csrf: Option<[u8; 32]>,
+    pub origin: String,
+}
+
+#[derive(Clone, Copy)]
+pub enum AdminAction {
+    List,
+    Create,
+    Update,
+    Role,
+    Link,
+    Unlink,
+}
+
+impl AdminAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "admin.users",
+            Self::Create => "admin.create-user",
+            Self::Update => "admin.update-user",
+            Self::Role => "admin.set-role",
+            Self::Link => "admin.link-identity",
+            Self::Unlink => "authority.unlink-identity",
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct CreateUser {
+    #[serde(deserialize_with = "admin_text")]
+    pub username: String,
+    #[serde(deserialize_with = "admin_text")]
+    pub display_name: String,
+    #[serde(deserialize_with = "admin_text")]
+    pub issuer: String,
+    #[serde(deserialize_with = "admin_text")]
+    pub subject: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UpdateUser {
+    #[serde(default, deserialize_with = "optional_admin_text")]
+    pub display_name: Option<String>,
+    #[serde(default, deserialize_with = "optional_bool")]
+    pub disabled: Option<bool>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetInstanceAdmin {
+    pub enabled: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalIdentity {
+    #[serde(deserialize_with = "admin_text")]
+    pub issuer: String,
+    #[serde(deserialize_with = "admin_text")]
+    pub subject: String,
+}
+
+fn admin_text<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let value = <String as serde::Deserialize>::deserialize(deserializer)?;
+    if value.trim().is_empty() || value.contains('\0') {
+        return Err(serde::de::Error::custom("nonempty text required"));
+    }
+    Ok(value)
+}
+
+fn optional_admin_text<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    admin_text(deserializer).map(Some)
+}
+
+fn optional_bool<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    <bool as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// Safe request attribution, never proof of authority. Guard validation alone
+/// fills actor; later transactions still authenticate from the browser proof.
+#[derive(Clone)]
+pub struct AdminAudit {
+    pub request_id: String,
+    pub actor: Option<UserId>,
+    pub subject: Option<UserId>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ApiKeyId, GroupId, LibraryId, Permissions, UserId};

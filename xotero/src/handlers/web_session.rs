@@ -11,13 +11,13 @@ use crate::{store, AppState};
 const BROWSER: &str = "__Host-xotero-browser";
 const SESSION: &str = "__Host-xotero-session";
 
-fn singleton<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub(super) fn singleton<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let mut values = headers.get_all(name).iter();
     let value = values.next()?.to_str().ok().filter(|v| !v.is_empty())?;
     values.next().is_none().then_some(value)
 }
 
-fn cookie(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
+pub(super) fn cookie(headers: &HeaderMap, name: &str) -> Result<Option<String>, ()> {
     let mut found = None;
     for value in headers.get_all("cookie") {
         for entry in value.to_str().map_err(|_| ())?.split(';') {
@@ -38,7 +38,7 @@ fn valid_token(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn digest(value: &str) -> [u8; 32] {
+pub(super) fn digest(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 

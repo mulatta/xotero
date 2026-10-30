@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::HeaderMap,
     middleware,
-    routing::{get, post},
+    routing::{get, patch, post, put},
     Router,
 };
 use sqlx::PgPool;
@@ -67,6 +67,19 @@ pub(crate) fn router(state: AppState) -> Router {
             )
     };
     Router::new()
+        .route(
+            "/xotero/admin/users",
+            get(crate::handlers::admin::users).post(crate::handlers::admin::users),
+        )
+        .route("/xotero/admin/users/{id}", patch(crate::handlers::admin::users))
+        .route(
+            "/xotero/admin/users/{id}/instance-admin",
+            put(crate::handlers::admin::users),
+        )
+        .route(
+            "/xotero/admin/users/{id}/identities",
+            post(crate::handlers::admin::users).delete(crate::handlers::admin::users),
+        )
         .route(
             "/xotero/web/session",
             get(crate::handlers::web_session::challenge).post(crate::handlers::web_session::login),

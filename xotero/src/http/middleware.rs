@@ -176,6 +176,11 @@ pub(crate) async fn log_and_auth(
     {
         return next.run(Request::from_parts(parts, body)).await;
     }
+    // Admin handlers own the distinct live-session boundary and must see the
+    // unpolled body. A data key cannot authorize these routes.
+    if path.starts_with("/xotero/admin/") {
+        return next.run(Request::from_parts(parts, body)).await;
+    }
 
     let mut selected_access = None;
     let segments: Vec<_> = path.split('/').collect();
