@@ -18,6 +18,7 @@ let
     );
   v15Migrations = migrationsThrough "0015";
   v16Migrations = migrationsThrough "0016";
+  v18Migrations = migrationsThrough "0018";
 in
 testPkgs.testers.runNixOSTest {
   name = "xotero-admin";
@@ -51,6 +52,7 @@ testPkgs.testers.runNixOSTest {
     };
     environment.etc."xotero-test/v15-migrations".source = v15Migrations;
     environment.etc."xotero-test/v16-migrations".source = v16Migrations;
+    environment.etc."xotero-test/v18-migrations".source = v18Migrations;
     environment.etc."xotero-test/current-migrations".source = ../../xotero/migrations;
     environment.etc."xotero-test/kdf".text = "0123456789abcdef0123456789abcdef";
     environment.systemPackages = [

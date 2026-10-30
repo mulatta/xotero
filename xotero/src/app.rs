@@ -6,7 +6,7 @@ use axum::{
     extract::{DefaultBodyLimit, Query, State},
     http::HeaderMap,
     middleware,
-    routing::{get, patch, post, put},
+    routing::{delete as route_delete, get, patch, post, put},
     Router,
 };
 use sqlx::PgPool;
@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::handlers::files::{file_get, file_post, upload_put};
 use crate::handlers::fulltext::{fulltext_item, fulltext_versions, fulltext_write};
 use crate::handlers::groups::{group_get, groups};
-use crate::handlers::keys::key_current;
+use crate::handlers::keys::{key_current, manage};
 use crate::handlers::login::{
     cancel_session, check_session, create_session, login_authorize, login_page,
 };
@@ -67,6 +67,10 @@ pub(crate) fn router(state: AppState) -> Router {
             )
     };
     Router::new()
+        .route("/xotero/me/keys", get(manage).post(manage))
+        .route("/xotero/me/keys/{id}", route_delete(manage))
+        .route("/xotero/admin/users/{id}/keys", get(manage))
+        .route("/xotero/admin/users/{id}/keys/{keyId}", route_delete(manage))
         .route(
             "/xotero/admin/users",
             get(crate::handlers::admin::users).post(crate::handlers::admin::users),
@@ -88,7 +92,7 @@ pub(crate) fn router(state: AppState) -> Router {
             "/xotero/web/session/logout",
             post(crate::handlers::web_session::logout),
         )
-        .route("/keys/current", get(key_current))
+        .route("/keys/current", get(key_current).delete(manage))
         .route("/keys/sessions", post(create_session))
         .route(
             "/keys/sessions/{token}",

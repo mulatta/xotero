@@ -178,7 +178,11 @@ pub(crate) async fn log_and_auth(
     }
     // Admin handlers own the distinct live-session boundary and must see the
     // unpolled body. A data key cannot authorize these routes.
-    if path.starts_with("/xotero/admin/") {
+    if path.starts_with("/xotero/admin/")
+        || path == "/xotero/me/keys"
+        || path.starts_with("/xotero/me/keys/")
+        || (path == "/keys/current" && method == axum::http::Method::DELETE)
+    {
         return next.run(Request::from_parts(parts, body)).await;
     }
 

@@ -66,7 +66,8 @@ pub struct Principal {
 }
 
 /// Personal-library capabilities carried by an API key.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Permissions {
     pub library: bool,
     pub notes: bool,
@@ -117,6 +118,82 @@ pub struct WebSessionProof {
     pub browser: [u8; 32],
     pub csrf: Option<[u8; 32]>,
     pub origin: String,
+}
+
+/// Management accepts either a mapped browser session or an attenuated DB key.
+/// A recovery credential is deliberately not representable here.
+pub enum KeyProof {
+    Session(WebSessionProof),
+    Database([u8; 32]),
+}
+
+#[derive(Clone, Copy)]
+pub enum KeyAction {
+    List,
+    Create,
+    Revoke,
+}
+
+impl KeyAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::List => "keys.list",
+            Self::Create => "keys.create",
+            Self::Revoke => "keys.revoke",
+        }
+    }
+}
+
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupPermissions {
+    pub library: bool,
+    pub write: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndividualGroupScope {
+    #[serde(rename = "groupID")]
+    pub group_id: i64,
+    pub library: bool,
+    pub write: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupScopes {
+    pub all: GroupPermissions,
+    pub individual: Vec<IndividualGroupScope>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyScopes {
+    pub user: Permissions,
+    pub groups: GroupScopes,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateKey {
+    #[serde(deserialize_with = "admin_text")]
+    pub name: String,
+    pub access: KeyScopes,
+}
+
+impl CreateKey {
+    pub fn valid(&self) -> bool {
+        let user = self.access.user;
+        let groups = &self.access.groups;
+        let mut ids = std::collections::BTreeSet::new();
+        self.name.len() <= 255
+            && (user.library || !(user.notes || user.write || user.files))
+            && (groups.all.library || !groups.all.write)
+            && groups.individual.iter().all(|group| {
+                group.group_id > 0 && (group.library || !group.write) && ids.insert(group.group_id)
+            })
+    }
 }
 
 #[derive(Clone, Copy)]

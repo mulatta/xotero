@@ -42,6 +42,33 @@ pub(super) fn digest(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 
+pub(super) fn session_proof(
+    headers: &HeaderMap,
+    origin: &str,
+    mutation: bool,
+) -> Result<crate::domain::WebSessionProof, StatusCode> {
+    let (Ok(Some(token)), Ok(Some(browser))) = (cookie(headers, SESSION), cookie(headers, BROWSER))
+    else {
+        return Err(StatusCode::UNAUTHORIZED);
+    };
+    let csrf = if mutation {
+        if singleton(headers, "origin") != Some(origin) {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        Some(digest(
+            singleton(headers, "x-xotero-csrf").ok_or(StatusCode::FORBIDDEN)?,
+        ))
+    } else {
+        None
+    };
+    Ok(crate::domain::WebSessionProof {
+        token: digest(&token),
+        browser: digest(&browser),
+        csrf,
+        origin: origin.to_owned(),
+    })
+}
+
 async fn random_token() -> std::io::Result<String> {
     use tokio::io::AsyncReadExt;
     let mut bytes = [0u8; 32];

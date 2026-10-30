@@ -1,7 +1,7 @@
 use sqlx::{Postgres, Transaction};
 
 use crate::domain::UserId;
-use crate::domain::{AdminAction, AdminAudit};
+use crate::domain::{AdminAction, AdminAudit, ApiKeyId, KeyAction};
 
 pub(super) enum BootstrapAction {
     Identity,
@@ -21,6 +21,34 @@ pub(super) enum AuditOutcome {
     Success,
     Noop,
     Denied,
+}
+
+pub(super) async fn append_key(
+    tx: &mut Transaction<'_, Postgres>,
+    audit: &AdminAudit,
+    action: KeyAction,
+    key: Option<ApiKeyId>,
+    outcome: AuditOutcome,
+) -> sqlx::Result<()> {
+    let outcome = match outcome {
+        AuditOutcome::Success => "success",
+        AuditOutcome::Noop => "noop",
+        AuditOutcome::Denied => "denied",
+    };
+    sqlx::query(
+        "insert into audit_events \
+         (actor_user_id,subject_user_id,subject_key_id,action,outcome,request_id) \
+         values($1,$2,$3,$4::audit_action,$5::audit_outcome,$6::uuid)",
+    )
+    .bind(audit.actor.map(UserId::get))
+    .bind(audit.subject.map(UserId::get))
+    .bind(key.map(ApiKeyId::get))
+    .bind(action.as_str())
+    .bind(outcome)
+    .bind(&audit.request_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 pub(super) async fn append_admin(

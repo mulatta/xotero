@@ -436,8 +436,12 @@ tables = ["library", "object", "setting", "deletion", "fulltext", "users",
           "personal_libraries", "api_keys", "api_key_user_permissions", "groups",
           "group_memberships", "api_key_group_permissions", "login_sessions", "pending_uploads"]
 def durable_snapshot():
-    families = {table: sql(f"select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from {table} t")
-                for table in tables}
+    families = {}
+    for table in tables:
+        # Compare every historical column; the forward policy ceiling is
+        # asserted separately rather than treated as lost historical data.
+        row = "to_jsonb(t)-'policy_limited'" if table == "api_key_group_permissions" else "to_jsonb(t)"
+        families[table] = sql(f"select coalesce(jsonb_agg({row} order by ({row})::text), '[]') from {table} t")
     families["file_metadata"] = sql("""select jsonb_agg(to_jsonb(f) - 'blob_key' order by library_id,item_key) from file f""")
     families["old_checksums"] = sql("select jsonb_agg(row(version,checksum) order by version) from _sqlx_migrations where version <= 13")
     return families
@@ -446,6 +450,7 @@ subprocess.run(["sudo", "-u", "postgres", "createdb", "-O", "xotero",
                 "-T", database, "checkpoint11_template"], check=True)
 subprocess.run(["sudo", "-u", "xotero", "env", "DATABASE_URL=" + url,
                 "sqlx", "migrate", "run", "--source", "/etc/xotero-test/current-migrations"], check=True)
+assert sql("select bool_and(not policy_limited) from api_key_group_permissions") == "t"
 # An unrelated bare tombstone cannot invalidate a proven current prefix.
 sql("""insert into blob_retirements (blob_key,not_before,state,deleted_at)
        values ('PREFXK22',clock_timestamp(),'deleted',clock_timestamp())""")
@@ -815,7 +820,7 @@ machine.wait_for_open_port(8189)
 with subtest("populated v7 data survives the identity migration"):
     assert (
         psql("select string_agg(version::text, ',' order by version) from _sqlx_migrations")
-         == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18"
+         == "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19"
     )
     assert psql("select count(*) from pending_uploads") == "0"
     assert psql("select bool_and(not compressed) from file") == "t"
@@ -2861,7 +2866,10 @@ with subtest("registration revalidates original authority with a different live 
         assert register_upload(path, registrar, baseline) == "204"
         pending = authorize_bytes(path, original, "world", hashlib.md5(b"hello").hexdigest())
         try:
-            psql(revoke)
+            if label == "original-key-revoked":
+                assert http_code("/keys/current", original, method="DELETE") == "204"
+            else:
+                psql(revoke)
             assert http_code("/keys/current", registrar) == "200"
             assert http_code(path, registrar) == "302"
             before = registration_snapshot(library_id, item_key)

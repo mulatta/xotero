@@ -5,10 +5,9 @@ use axum::{
     Json,
 };
 
-use super::web_session::{cookie, digest, singleton};
+use super::web_session::session_proof;
 use crate::domain::{
     AdminAction, AdminAudit, CreateUser, ExternalIdentity, SetInstanceAdmin, UpdateUser, UserId,
-    WebSessionProof,
 };
 use crate::http::middleware::buffered_body;
 use crate::{store, AppState};
@@ -91,28 +90,13 @@ async fn handle(state: &AppState, request: Request) -> Response {
         },
         None => None,
     };
-    let (Ok(Some(token)), Ok(Some(browser))) = (
-        cookie(&parts.headers, "__Host-xotero-session"),
-        cookie(&parts.headers, "__Host-xotero-browser"),
-    ) else {
-        return deny(state, (action, &audit), StatusCode::UNAUTHORIZED).await;
-    };
-    let csrf = if parts.method == Method::GET {
-        None
-    } else {
-        if singleton(&parts.headers, "origin") != Some(state.config.web_origin.as_str()) {
-            return deny(state, (action, &audit), StatusCode::FORBIDDEN).await;
-        }
-        let Some(csrf) = singleton(&parts.headers, "x-xotero-csrf") else {
-            return deny(state, (action, &audit), StatusCode::FORBIDDEN).await;
-        };
-        Some(digest(csrf))
-    };
-    let proof = WebSessionProof {
-        token: digest(&token),
-        browser: digest(&browser),
-        csrf,
-        origin: state.config.web_origin.clone(),
+    let proof = match session_proof(
+        &parts.headers,
+        &state.config.web_origin,
+        parts.method != Method::GET,
+    ) {
+        Ok(proof) => proof,
+        Err(status) => return deny(state, (action, &audit), status).await,
     };
     let guard = match store::admin_guard(&state.pool, &proof, &mut audit).await {
         Ok(Ok(guard)) => guard,

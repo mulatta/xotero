@@ -372,6 +372,49 @@ try:
     assert not any("secret-claim-conflict" in line for line in logs), logs
     assert sql(upgrade, "select count(*) from audit_events where row_to_json(audit_events)::text like '%secret-claim%'") == [(0,)]
     receipts["sanitized_durable_audit"] = True
+    upgrade18=database("keys_upgrade18")
+    subprocess.run(["env","DATABASE_URL=postgres://xotero@127.0.0.1/"+upgrade18,
+        "sqlx","migrate","run","--source","/etc/xotero-test/v18-migrations"],check=True)
+    with connect(upgrade18) as fixture:
+        fixture.execute("insert into users(id,username,display_name) values(101,'owner','Owner')")
+        fixture.execute("insert into personal_libraries(user_id,library_id) values(101,1)")
+        fixture.execute("insert into external_identities(issuer,subject,user_id) values('https://id.example.test','owner',101)")
+        fixture.execute("insert into instance_admins(user_id) values(101)")
+        fixture.execute("insert into bootstrap_state(name) values('identity'),('instance-admin')")
+        fixture.execute("""insert into api_keys(id,user_id,name,token_hash) values
+            (401,101,'Preserved API',decode(repeat('44',32),'hex')),
+            (402,101,'Preserved Web',decode(repeat('55',32),'hex'))""")
+        fixture.execute("""insert into api_key_user_permissions(api_key_id,library,notes,write,files)
+            values(401,true,false,false,true),(402,true,true,true,true)""")
+        fixture.execute("insert into api_key_all_groups_permissions(api_key_id,library,write) values(401,true,false)")
+        fixture.execute("insert into library(id,version,kind) values(88,9,'group')")
+        fixture.execute("insert into groups(id,library_id,owner_user_id,name) values(808,88,101,'Preserved key group')")
+        fixture.execute("insert into group_memberships(group_id,user_id,role) values(808,101,'owner')")
+        fixture.execute("""insert into api_key_group_permissions(api_key_id,user_id,group_id,library,write)
+            values(401,101,808,true,true)""")
+        fixture.execute("""insert into web_sessions(token_hash,browser_hash,csrf_hash,origin,
+            user_id,library_id,issuer,subject,api_key_id) values(
+            decode(repeat('11',32),'hex'),decode(repeat('22',32),'hex'),decode(repeat('33',32),'hex'),
+            'https://library.example.test',101,1,'https://id.example.test','owner',402)""")
+    snapshot18="""select jsonb_build_array(
+        (select jsonb_agg(to_jsonb(k) order by id) from api_keys k),
+        (select jsonb_agg(to_jsonb(p) order by api_key_id) from api_key_user_permissions p),
+        (select jsonb_agg(to_jsonb(p) order by api_key_id) from api_key_all_groups_permissions p),
+        (select jsonb_agg(to_jsonb(p)-'policy_limited' order by api_key_id,group_id) from api_key_group_permissions p),
+        (select jsonb_agg(to_jsonb(s) order by token_hash) from web_sessions s),
+        (select jsonb_agg(to_jsonb(e) order by issuer,subject) from external_identities e),
+        (select jsonb_agg(to_jsonb(m) order by group_id,user_id) from group_memberships m))"""
+    saved18=sql(upgrade18,snapshot18)
+    checksums18=sql(upgrade18,"select version,checksum from _sqlx_migrations order by version")
+    start(upgrade18)
+    assert sql(upgrade18,snapshot18)==saved18
+    assert sql(upgrade18,"select version,checksum from _sqlx_migrations where version<=18 order by version")==checksums18
+    assert sql(upgrade18,"select policy_limited from api_key_group_permissions")==[(False,)]
+    assert sql(upgrade18,"select max(version) from _sqlx_migrations")==[(19,)]
+    print("CHECKPOINT16_UPGRADE "+json.dumps({"from":18,"to":19,"preserved_keys":2,
+        "preserved_sessions":1,"preserved_personal_permissions":2,
+        "preserved_all_group_permissions":1,"preserved_explicit_permissions":1,
+        "legacy_explicit_policy_limited":False,"checksums_preserved":True}),flush=True)
     print("CHECKPOINT13_BOOTSTRAP " + json.dumps(receipts, sort_keys=True), flush=True)
 finally:
     for process in processes:
@@ -564,7 +607,7 @@ try:
         (select jsonb_agg(to_jsonb(p) order by user_id) from personal_libraries p),
         (select jsonb_agg(to_jsonb(a) order by user_id) from instance_admins a),
         (select jsonb_agg(to_jsonb(b) order by name) from bootstrap_state b),
-        (select jsonb_agg(to_jsonb(a) order by id) from audit_events a where id<=1),
+        (select jsonb_agg(to_jsonb(a)-'subject_key_id' order by id) from audit_events a where id<=1),
         (select jsonb_agg(to_jsonb(k) order by id) from api_keys k),
         (select jsonb_agg(to_jsonb(p) order by api_key_id) from api_key_user_permissions p))"""
     preserved=sql(v16_snapshot)
@@ -597,7 +640,7 @@ try:
     print("CHECKPOINT14_PROXY "+json.dumps({"port":proxy.server_port,"backend":8189}),flush=True)
     assert sql(v16_snapshot)==preserved
     assert sql("select version,checksum from _sqlx_migrations where version<=16 order by version")==v16_checksums
-    assert sql("select max(version) from _sqlx_migrations")==[(18,)]
+    assert sql("select max(version) from _sqlx_migrations")==[(19,)]
     assert request("GET","/keys/current",extra=[("Zotero-API-Key",preserved_key)])[0]==200
     receipts["populated_v16_authority_audit_key_upgrade_preserved"]=True
     sql("insert into users(id,username,display_name) values(202,'second','Second'),(303,'disabled','Disabled')")
@@ -883,6 +926,268 @@ try:
     identity={"issuer":"https://id.example.test","subject":"provisioned"}
     extra_identity={"issuer":"https://id.example.test","subject":"second-exact-identity"}
     ordinary,ordinary_csrf=login(user="provisioned",user_id=target)
+
+    # Given an ordinary mapped session, issue a named, explicitly narrowed key.
+    key_scope={"user":{"library":True,"notes":False,"write":False,"files":False},
+               "groups":{"all":{"library":False,"write":False},"individual":[]}}
+    status,body,headers=request("POST","/xotero/me/keys",ordinary,ordinary_csrf,
+        body={"name":"Checkpoint16 read only","access":key_scope})
+    assert status==201,("checkpoint16 supported ordinary key issuance",status,body)
+    managed_key=json.loads(body)
+    assert set(managed_key)=={"id","name","createdAt","revokedAt","access","token"}
+    assert managed_key["access"]==key_scope and len(managed_key["token"])==64
+    secrets.append(managed_key["token"])
+    key_receipts={}
+    def key_api(method,path="/xotero/me/keys",payload=None,credential=None,
+                cookies=ordinary,token=ordinary_csrf):
+        headers=[] if credential is None else [("Zotero-API-Key",credential)]
+        if method=="POST" and path=="/groups/707/items":
+            # These empty-batch permission probes preserve seeded version zero.
+            headers.append(("If-Unmodified-Since-Version","0"))
+        return request(method,path,cookies if credential is None else None,
+            token if credential is None else None,body=payload,
+            extra=headers)
+
+    def mint(scope,name="Scoped child",credential=None,cookies=ordinary,token=ordinary_csrf):
+        status,body,_=key_api("POST",payload={"name":name,"access":scope},
+            credential=credential,cookies=cookies,token=token)
+        assert status==201,(status,body)
+        result=json.loads(body)
+        secrets.append(result["token"])
+        return result
+
+    assert sql("select token_hash from api_keys where id=%s",(managed_key["id"],))==[
+        (hashlib.sha256(managed_key["token"].encode()).digest(),)]
+    for path,cookies,token in (("/xotero/me/keys",ordinary,ordinary_csrf),
+            (target_path+"/keys",jar,csrf)):
+        status,body,headers=key_api("GET",path,cookies=cookies,token=token)
+        assert status==200 and headers["Cache-Control"]=="no-store",(status,body)
+        listed=json.loads(body)
+        assert all(set(row)=={"id","name","createdAt","revokedAt","access"} for row in listed)
+        assert managed_key["id"] in [row["id"] for row in listed]
+        assert not set(row["id"] for row in listed).intersection(
+            row[0] for row in sql("select api_key_id from web_sessions"))
+        assert managed_key["token"].encode() not in body
+        assert hashlib.sha256(managed_key["token"].encode()).hexdigest().encode() not in body
+    assert key_api("GET",credential=managed_key["token"])[0]==200
+    assert key_api("GET","/users/"+str(target)+"/items",credential=managed_key["token"])[0]==200
+    assert key_api("GET","/users/101/items",credential=managed_key["token"])[0]==403
+    assert request("GET","/users/"+str(target)+"/items",ordinary,ordinary_csrf)[0]==403
+    child=mint(key_scope,credential=managed_key["token"])
+    for payload in ({},{"name":"Missing scope"},{"name":"Missing groups","access":{"user":key_scope["user"]}},
+                    {"name":"Null","access":None},{"name":"Unknown","access":key_scope,"userID":101}):
+        assert key_api("POST",payload=payload,credential=managed_key["token"])[0]==400
+    widened=json.loads(json.dumps(key_scope))
+    widened["user"]["write"]=True
+    stronger=mint(widened,name="Unrelated stronger same-user key")
+    assert key_api("POST",payload={"name":"Widen","access":widened},
+        credential=managed_key["token"])[0]==403
+    assert key_api("GET","/keys/current",credential=stronger["token"])[0]==200
+    for path in ("/xotero/me/keys",target_path+"/keys"):
+        assert request("GET",path,extra=[("Zotero-API-Key","fixture-admin-recovery")])[0] in (401,403)
+    assert request("DELETE","/keys/current",extra=[("Zotero-API-Key","fixture-admin-recovery")])[0]==403
+    assert request("DELETE","/keys/current",ordinary,ordinary_csrf)[0]==401
+    assert key_api("GET",target_path+"/keys",credential=managed_key["token"])[0]==401
+    assert key_api("GET","/xotero/admin/users/101/keys")[0]==403
+    own=mint(key_scope,cookies=jar,token=csrf)
+    assert key_api("DELETE","/xotero/me/keys/"+str(own["id"]))[0]==404
+    assert key_api("DELETE","/xotero/me/keys/"+str(child["id"]))[0]==204
+    assert key_api("DELETE","/xotero/me/keys/"+str(child["id"]))[0]==204
+    assert key_api("GET","/keys/current",credential=child["token"])[0]==403
+    assert key_api("DELETE","/keys/current",credential=managed_key["token"])[0]==204
+    assert key_api("GET","/keys/current",credential=managed_key["token"])[0]==403
+    key_receipts["supported_named_narrowed_issue_metadata_cross_user_readonly_self_revoke"]=True
+
+    # Group policy is a fixture until checkpoints 17/18; issuance is always HTTP.
+    sql("insert into library(id,version,kind) values(77,0,'group')")
+    with connect() as fixture:
+        fixture.execute("""insert into groups(id,library_id,owner_user_id,name)
+            values(707,77,101,'Key scope fixture')""")
+        fixture.execute("""insert into group_memberships(group_id,user_id,role)
+            values(707,101,'owner'),(707,%s,'member')""",(target,))
+    empty={"user":{"library":False,"notes":False,"write":False,"files":False},
+           "groups":{"all":{"library":False,"write":False},"individual":[]}}
+    wildcard=json.loads(json.dumps(empty))
+    wildcard["groups"]["all"]={"library":True,"write":True}
+    all_key=mint(wildcard)
+    individual=json.loads(json.dumps(empty))
+    individual["groups"]["individual"]=[{"groupID":707,"library":True,"write":True}]
+    member_explicit=mint(individual)
+    assert key_api("POST","/groups/707/items",[],credential=member_explicit["token"])[0]==200
+    before=(sql("select count(*) from api_keys"),
+        sql("select count(*) from api_key_user_permissions"),
+        sql("select count(*) from api_key_all_groups_permissions"),
+        sql("select count(*) from api_key_group_permissions"))
+    baseline=sql("select coalesce(max(id),0) from audit_events")[0][0]
+    rejected=key_api("POST",payload={"name":"Policy escape","access":individual},
+        credential=all_key["token"])
+    assert rejected[0]==403 and b"token" not in rejected[1],rejected[:2]
+    assert (sql("select count(*) from api_keys"),
+        sql("select count(*) from api_key_user_permissions"),
+        sql("select count(*) from api_key_all_groups_permissions"),
+        sql("select count(*) from api_key_group_permissions"))==before
+    assert sql("""select actor_user_id,subject_user_id,action::text,outcome::text
+        from audit_events where id>%s""",(baseline,))==[(target,target,"keys.create","denied")]
+    individual["groups"]["individual"][0]["write"]=False
+    explicit_key=mint(individual,credential=all_key["token"])
+    assert key_api("POST",payload={"name":"Future groups","access":wildcard},
+        credential=explicit_key["token"])[0]==403
+    assert key_api("GET","/groups/707/items",credential=explicit_key["token"])[0]==200
+    assert key_api("POST","/groups/707/items",[],credential=all_key["token"])[0]==200
+    sql("update groups set library_editing='admins' where id=707")
+    assert key_api("POST","/groups/707/items",[],credential=all_key["token"])[0]==403
+    assert key_api("POST","/groups/707/items",[],credential=member_explicit["token"])[0]==403
+    individual["groups"]["individual"][0]["write"]=True
+    assert key_api("POST",payload={"name":"Current policy escape","access":individual},
+        credential=all_key["token"])[0]==403
+    assert key_api("POST",payload={"name":"Session policy escape","access":individual})[0]==403
+    explicit_owner=mint(individual,cookies=jar,token=csrf)
+    inherited_explicit=mint(individual,credential=explicit_owner["token"])
+    assert key_api("POST","/groups/707/items",[],credential=inherited_explicit["token"])[0]==200
+    assert key_api("POST","/groups/707/items",[],credential=explicit_owner["token"])[0]==200
+    with connect() as fixture:
+        fixture.execute("update group_memberships set role='member' where group_id=707 and user_id=101")
+        fixture.execute("insert into group_memberships(group_id,user_id,role) values(707,202,'owner')")
+        fixture.execute("update groups set owner_user_id=202 where id=707")
+    assert key_api("POST","/groups/707/items",[],credential=explicit_owner["token"])[0]==403
+    assert key_api("POST","/groups/707/items",[],credential=inherited_explicit["token"])[0]==403
+    sql("delete from group_memberships where group_id=707 and user_id=%s",(target,))
+    assert key_api("GET","/groups/707/items",credential=explicit_key["token"])[0]==403
+    assert key_api("POST",payload={"name":"Removed membership","access":individual})[0]==403
+    key_receipts["no_omission_wildcard_future_membership_or_policy_escape"]=True
+
+    # Every expected outcome has one secret-free, request-correlated audit.
+    correlations=[]
+    for method,path,payload,cookies,token,status,outcome in (
+        ("GET",target_path+"/keys",None,jar,csrf,200,"success"),
+        ("DELETE",target_path+"/keys/"+str(all_key["id"]),None,jar,csrf,204,"success"),
+        ("DELETE",target_path+"/keys/"+str(all_key["id"]),None,jar,csrf,204,"noop"),
+        ("DELETE",target_path+"/keys/999999",None,jar,csrf,404,"denied"),
+        ("POST","/xotero/me/keys",{"name":"Omitted"},ordinary,ordinary_csrf,400,"denied"),
+    ):
+        baseline=sql("select coalesce(max(id),0) from audit_events")[0][0]
+        result=key_api(method,path,payload,cookies=cookies,token=token)
+        assert result[0]==status,(result,status)
+        events=sql("""select action::text,outcome::text,request_id::text,subject_key_id
+            from audit_events where id>%s""",(baseline,))
+        assert len(events)==1 and events[0][1]==outcome,events
+        assert events[0][0].startswith("keys.")
+        correlations.append(events[0][2])
+    assert len(set(correlations))==len(correlations)
+    survivor=mint(key_scope)
+    with connect(autocommit=True) as ddl:
+        ddl.execute("""create function checkpoint16_audit_fail() returns trigger language plpgsql as
+            $$begin raise exception 'private-key-audit-failure'; end$$""")
+        ddl.execute("create trigger checkpoint16_audit_fail before insert on audit_events for each row execute function checkpoint16_audit_fail()")
+    before=sql("select count(*) from api_keys"),sql("select count(*) from audit_events")
+    assert key_api("POST",payload={"name":"Rollback","access":key_scope})[0]==500
+    assert key_api("DELETE","/xotero/me/keys/"+str(survivor["id"]))[0]==500
+    assert (sql("select count(*) from api_keys"),sql("select count(*) from audit_events"))==before
+    assert sql("select revoked_at from api_keys where id=%s",(survivor["id"],))==[(None,)]
+    with connect(autocommit=True) as ddl:
+        ddl.execute("drop trigger checkpoint16_audit_fail on audit_events")
+        ddl.execute("drop function checkpoint16_audit_fail()")
+    secrets.append("private-key-audit-failure")
+    key_receipts["audit_exact_counts_correlation_noop_missing_and_atomic_rollback"]=True
+    # Body stays incomplete: invalid authority must be rejected without a poll.
+    for credential,cookies,token,expected in (
+        (None,{},None,401),(None,ordinary,"0"*64,403),
+        ("fixture-admin-recovery",{},None,403),("unknown-key",{},None,401),
+    ):
+        with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=5)) as client:
+            client.putrequest("POST","/xotero/me/keys")
+            client.putheader("Content-Length","1048576")
+            client.putheader("Origin",origin)
+            if cookies:
+                client.putheader("Cookie","; ".join(k+"="+v for k,v in cookies.items()))
+            if token is not None:
+                client.putheader("X-Xotero-CSRF",token)
+            if credential is not None:
+                client.putheader("Zotero-API-Key",credential)
+            client.endheaders()
+            response=client.getresponse()
+            assert response.status==expected,(response.status,expected)
+            response.read()
+    key_receipts["prebody_session_csrf_recovery_and_invalid_key_denial"]=True
+
+    # Prove live ordinary-session revocation and admin role revalidation after
+    # actual library-row waits. The response cannot borrow the discovered user.
+    key_races=[]
+    for mutation in ("session","key","mapping","disabled","association","role"):
+        race_jar,race_csrf=login(user="provisioned",user_id=target) if mutation!="role" else login()
+        actor=target if mutation!="role" else 101
+        library=created["libraryID"] if mutation!="role" else 1
+        route="/xotero/me/keys" if mutation!="role" else target_path+"/keys"
+        before=sql("select count(*) from api_keys")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            with connect() as blocker:
+                blocker.execute("select id from library where id=%s for update",(library,))
+                future=executor.submit(key_api,"GET",route,None,None,race_jar,race_csrf)
+                wait_edge(blocker.info.backend_pid)
+                edges=sql("""select pid,%s=any(pg_blocking_pids(pid)) from pg_stat_activity
+                    where %s=any(pg_blocking_pids(pid))""",
+                    (blocker.info.backend_pid,blocker.info.backend_pid))
+                match mutation:
+                    case "session":
+                        blocker.execute("update web_sessions set revoked_at=clock_timestamp() where token_hash=%s",(token_hash(race_jar),))
+                    case "key":
+                        blocker.execute("""update api_keys set revoked_at=clock_timestamp() where id=
+                            (select api_key_id from web_sessions where token_hash=%s)""",(token_hash(race_jar),))
+                    case "mapping":
+                        blocker.execute("update external_identities set user_id=202 where subject='provisioned'")
+                    case "disabled":
+                        blocker.execute("update users set disabled_at=clock_timestamp() where id=%s",(actor,))
+                    case "association":
+                        blocker.execute("update web_sessions set api_key_id=%s where token_hash=%s",
+                            (survivor["id"],token_hash(race_jar)))
+                    case "role":
+                        blocker.execute("delete from instance_admins where user_id=101")
+                blocker.commit()
+                result=future.result(timeout=25)
+                assert result[0]==(403 if mutation=="role" else 401),(mutation,result)
+                key_races.append({"case":mutation,"blocker":blocker.info.backend_pid,
+                    "contenders":edges,"status":result[0]})
+        assert sql("select count(*) from api_keys")==before
+        sql("update users set disabled_at=null where id=%s",(actor,))
+        sql("update external_identities set user_id=%s where subject='provisioned'",(target,))
+        sql("insert into instance_admins(user_id) values(101) on conflict do nothing")
+    # Association fixture deliberately turned survivor into an internal key:
+    # metadata/revocation must now hide it, not follow or expose its binding.
+    assert key_api("DELETE","/xotero/me/keys/"+str(survivor["id"]))[0]==404
+    key_receipts["live_session_key_identity_disable_association_and_admin_role_races"]=key_races
+    # Admission commits while body is withheld. Supported logout then wins
+    # before final issuance authorization, without polling/sleeping in the test.
+    race_jar,race_csrf=login(user="provisioned",user_id=target)
+    payload=json.dumps({"name":"After logout","access":key_scope}).encode()
+    before=sql("select count(*) from api_keys")
+    with contextlib.closing(http.client.HTTPConnection("127.0.0.1",8189,timeout=20)) as client:
+        with connect() as blocker:
+            blocker.execute("select id from library where id=%s for update",(created["libraryID"],))
+            client.putrequest("POST","/xotero/me/keys")
+            client.putheader("Content-Length",str(len(payload)))
+            client.putheader("Content-Type","application/json")
+            client.putheader("Cookie","; ".join(k+"="+v for k,v in race_jar.items()))
+            client.putheader("Origin",origin)
+            client.putheader("X-Xotero-CSRF",race_csrf)
+            client.endheaders()
+            wait_edge(blocker.info.backend_pid)
+            admission_pid=sql("select pid from pg_stat_activity where %s=any(pg_blocking_pids(pid))",
+                (blocker.info.backend_pid,))[0][0]
+            blocker.commit()
+        with connect(autocommit=True) as observer:
+            observer.execute("""do $$declare deadline timestamptz:=clock_timestamp()+interval '10 seconds';
+                begin loop exit when exists(select 1 from pg_stat_activity where pid="""+str(admission_pid)+"""
+                and state='idle' and query='COMMIT');
+                if clock_timestamp()>deadline then raise exception 'key admission did not commit'; end if;
+                perform pg_stat_clear_snapshot(); end loop; end$$""")
+        assert logout(race_jar,race_csrf)==204
+        client.send(payload)
+        response=client.getresponse()
+        assert response.status==401,response.status
+        response.read()
+    assert sql("select count(*) from api_keys")==before
+    key_receipts["supported_logout_between_admission_and_body"]=True
+    print("CHECKPOINT16_KEYS "+json.dumps(key_receipts,sort_keys=True),flush=True)
 
     def admin(method,path,payload=None,cookies=jar,token=csrf):
         return request(method,path,cookies,token,body=payload)

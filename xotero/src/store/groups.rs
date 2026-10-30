@@ -182,7 +182,8 @@ pub(super) async fn resolve_group_library_with_grants<'e>(
                 coalesce(all_grant.library, false) as all_library, \
                 coalesce(all_grant.write, false) as all_write, \
                 coalesce(explicit_grant.library, false) as explicit_library, \
-                coalesce(explicit_grant.write, false) as explicit_write \
+                coalesce(explicit_grant.write, false) as explicit_write, \
+                coalesce(explicit_grant.policy_limited, false) as policy_limited \
          from groups g \
          join library l on l.id = g.library_id and l.kind = g.library_kind \
          join users owner_user \
@@ -218,7 +219,9 @@ pub(super) async fn resolve_group_library_with_grants<'e>(
     }
     let policy_write = matches!(role.as_str(), "owner" | "admin")
         || (role == "member" && row.get::<String, _>("library_editing") == "members");
-    let write = (explicit_library && row.get::<bool, _>("explicit_write"))
+    let write = (explicit_library
+        && row.get::<bool, _>("explicit_write")
+        && (!row.get::<bool, _>("policy_limited") || policy_write))
         || (all_library && all_write && policy_write);
     let is_admin = matches!(role.as_str(), "owner" | "admin");
     let file_write = write

@@ -357,6 +357,7 @@ pub struct AdminGuard<'a> {
     pub(super) tx: sqlx::Transaction<'a, sqlx::Postgres>,
     pub(super) actor: i64,
     pub(super) audit: crate::domain::AdminAudit,
+    pub(super) target_key_locked: bool,
 }
 
 pub enum AdminDenial {
@@ -364,79 +365,158 @@ pub enum AdminDenial {
     Unauthorized,
 }
 
+/// Discovery fixes the association that every later validation must retain.
+/// Callers plan all earlier authority locks before locking keys and this session.
+pub(super) struct SessionCandidate {
+    binding: Binding,
+    pub(super) key: i64,
+}
+
+impl SessionCandidate {
+    pub(super) fn user(&self) -> i64 {
+        self.binding.user
+    }
+
+    pub(super) fn library(&self) -> i64 {
+        self.binding.library
+    }
+
+    pub(super) async fn discover(
+        conn: &mut PgConnection,
+        proof: &crate::domain::WebSessionProof,
+    ) -> sqlx::Result<Option<Self>> {
+        Ok(sqlx::query(
+            "select user_id,library_id,issuer,subject,api_key_id \
+             from web_sessions where token_hash=$1 and browser_hash=$2",
+        )
+        .bind(proof.token.as_slice())
+        .bind(proof.browser.as_slice())
+        .fetch_optional(conn)
+        .await?
+        .map(|row| Self {
+            binding: Binding::from_row(&row),
+            key: row.get("api_key_id"),
+        }))
+    }
+
+    pub(super) async fn lock_identity(&self, conn: &mut PgConnection) -> sqlx::Result<bool> {
+        Ok(sqlx::query(
+            "select user_id from external_identities \
+             where issuer=$1 and subject=$2 and user_id=$3 for share",
+        )
+        .bind(&self.binding.issuer)
+        .bind(&self.binding.subject)
+        .bind(self.binding.user)
+        .fetch_optional(conn)
+        .await?
+        .is_some())
+    }
+
+    pub(super) async fn validate(
+        &self,
+        conn: &mut PgConnection,
+        proof: &crate::domain::WebSessionProof,
+        audit: &mut crate::domain::AdminAudit,
+    ) -> sqlx::Result<Result<(), AdminDenial>> {
+        sqlx::query("select token_hash from web_sessions where token_hash=$1 for share")
+            .bind(proof.token.as_slice())
+            .fetch_optional(&mut *conn)
+            .await?;
+        // Fresh READ COMMITTED statement after the last possible authority wait.
+        // No discovery rebinding or additional earlier lock is allowed here.
+        let live: bool = sqlx::query_scalar(
+            "select exists(select 1 from web_sessions s join api_keys k \
+             on k.id=s.api_key_id and k.user_id=s.user_id \
+             where s.token_hash=$1 and s.browser_hash=$2 and s.origin=$3 \
+             and s.user_id=$4 and s.library_id=$5 and s.issuer=$6 and s.subject=$7 \
+             and s.api_key_id=$8 and s.revoked_at is null and k.revoked_at is null \
+             and s.expires_at>clock_timestamp())",
+        )
+        .bind(proof.token.as_slice())
+        .bind(proof.browser.as_slice())
+        .bind(&proof.origin)
+        .bind(self.binding.user)
+        .bind(self.binding.library)
+        .bind(&self.binding.issuer)
+        .bind(&self.binding.subject)
+        .bind(self.key)
+        .fetch_one(&mut *conn)
+        .await?;
+        if !live || !valid_binding(conn, &self.binding).await? {
+            return Ok(Err(AdminDenial::Unauthenticated));
+        }
+        audit.actor = crate::domain::UserId::new(self.binding.user);
+        if let Some(csrf) = proof.csrf {
+            let matches: bool =
+                sqlx::query_scalar("select csrf_hash=$2 from web_sessions where token_hash=$1")
+                    .bind(proof.token.as_slice())
+                    .bind(csrf.as_slice())
+                    .fetch_one(conn)
+                    .await?;
+            if !matches {
+                return Ok(Err(AdminDenial::Unauthorized));
+            }
+        }
+        Ok(Ok(()))
+    }
+}
+
 pub async fn admin_guard<'a>(
     pool: &'a PgPool,
     proof: &crate::domain::WebSessionProof,
     audit: &mut crate::domain::AdminAudit,
 ) -> sqlx::Result<Result<AdminGuard<'a>, AdminDenial>> {
+    admin_guard_with_key(pool, proof, audit, None).await
+}
+
+pub(super) async fn admin_guard_with_key<'a>(
+    pool: &'a PgPool,
+    proof: &crate::domain::WebSessionProof,
+    audit: &mut crate::domain::AdminAudit,
+    target_key: Option<crate::domain::ApiKeyId>,
+) -> sqlx::Result<Result<AdminGuard<'a>, AdminDenial>> {
     let mut tx = pool.begin().await?;
     sqlx::query("select xotero_lock_instance_authority()")
         .execute(&mut *tx)
         .await?;
-    let candidate = sqlx::query(
-        "select user_id,library_id,issuer,subject,api_key_id \
-         from web_sessions where token_hash=$1 and browser_hash=$2",
-    )
-    .bind(proof.token.as_slice())
-    .bind(proof.browser.as_slice())
-    .fetch_optional(&mut *tx)
-    .await?;
+    let candidate = SessionCandidate::discover(&mut tx, proof).await?;
     let Some(candidate) = candidate else {
         return Ok(Err(AdminDenial::Unauthenticated));
     };
-    let binding = Binding::from_row(&candidate);
-    let key: i64 = candidate.get("api_key_id");
     sqlx::query("select xotero_lock_admin_users($1,$2)")
-        .bind(binding.user)
+        .bind(candidate.user())
         .bind(audit.subject.map(crate::domain::UserId::get))
         .execute(&mut *tx)
         .await?;
-    sqlx::query("select id from api_keys where id=$1 for share")
-        .bind(key)
-        .fetch_optional(&mut *tx)
-        .await?;
-    sqlx::query("select token_hash from web_sessions where token_hash=$1 for share")
-        .bind(proof.token.as_slice())
-        .fetch_optional(&mut *tx)
-        .await?;
-    // Fresh READ COMMITTED statement after every possible wait. Never follow a
-    // changed discovery binding: that could request an earlier lock out of order.
-    let live: bool = sqlx::query_scalar(
-        "select exists(select 1 from web_sessions s join api_keys k \
-         on k.id=s.api_key_id and k.user_id=s.user_id \
-         where s.token_hash=$1 and s.browser_hash=$2 and s.origin=$3 \
-         and s.user_id=$4 and s.library_id=$5 and s.issuer=$6 and s.subject=$7 \
-         and s.api_key_id=$8 and s.revoked_at is null and k.revoked_at is null \
-         and s.expires_at>clock_timestamp())",
-    )
-    .bind(proof.token.as_slice())
-    .bind(proof.browser.as_slice())
-    .bind(&proof.origin)
-    .bind(binding.user)
-    .bind(binding.library)
-    .bind(&binding.issuer)
-    .bind(&binding.subject)
-    .bind(key)
-    .fetch_one(&mut *tx)
-    .await?;
-    if !live || !valid_binding(&mut tx, &binding).await? {
+    if !candidate.lock_identity(&mut tx).await? {
         return Ok(Err(AdminDenial::Unauthenticated));
     }
-    audit.actor = crate::domain::UserId::new(binding.user);
-    if let Some(csrf) = proof.csrf {
-        let matches: bool =
-            sqlx::query_scalar("select csrf_hash=$2 from web_sessions where token_hash=$1")
-                .bind(proof.token.as_slice())
-                .bind(csrf.as_slice())
-                .fetch_one(&mut *tx)
-                .await?;
-        if !matches {
-            return Ok(Err(AdminDenial::Unauthorized));
+    let mut keys = vec![candidate.key];
+    keys.extend(target_key.map(crate::domain::ApiKeyId::get));
+    keys.sort_unstable();
+    keys.dedup();
+    let mut target_key_locked = false;
+    for key in keys {
+        let query = if target_key.is_some_and(|target| target.get() == key) {
+            "select id from api_keys where id=$1 for update"
+        } else {
+            "select id from api_keys where id=$1 for share"
+        };
+        let locked = sqlx::query(query)
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some();
+        if target_key.is_some_and(|target| target.get() == key) {
+            target_key_locked = locked;
         }
+    }
+    if let Err(denial) = candidate.validate(&mut tx, proof, audit).await? {
+        return Ok(Err(denial));
     }
     let role: bool =
         sqlx::query_scalar("select exists(select 1 from instance_admins where user_id=$1)")
-            .bind(binding.user)
+            .bind(candidate.user())
             .fetch_one(&mut *tx)
             .await?;
     if !role {
@@ -444,7 +524,8 @@ pub async fn admin_guard<'a>(
     }
     Ok(Ok(AdminGuard {
         tx,
-        actor: binding.user,
+        actor: candidate.user(),
         audit: audit.clone(),
+        target_key_locked,
     }))
 }
