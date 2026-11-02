@@ -81,8 +81,7 @@ pub async fn deleted(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::
             "collection" => collections.push(Value::from(key)),
             "search" => searches.push(Value::from(key)),
             "setting" => settings.push(Value::from(key)),
-            // Tag deletions are objects ({tag, type}); type is unknown here, so 0.
-            "tag" => tags.push(serde_json::json!({ "tag": key, "type": 0 })),
+            "tag" => tags.push(Value::from(key)),
             _ => items.push(Value::from(key)),
         }
     }

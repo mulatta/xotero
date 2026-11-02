@@ -1060,6 +1060,207 @@ with subtest("settings round-trip through write, read and delete"):
         f"curl -sf '{base}/users/1/deleted?since=0' {auth} | jq -e '.settings | index(\"tagColors\")'"
     )
 
+with subtest("deleted tag feed returns tag names as strings"):
+    creation = machine.succeed(
+        f"curl -sS -w '\\nTASK19_HTTP_STATUS=%{{http_code}}' "
+        f"-X POST {base}/users/1/items {auth} "
+        f"-H 'If-Unmodified-Since-Version: {library_version()}' "
+        f'-d \'[{{"key":"TAGDEL23","itemType":"book","title":"tagged",'
+        f'"tags":[{{"tag":"gone-tag"}},{{"tag":"keep-tag"}}]}},'
+        f'{{"key":"NTEDEL23","itemType":"note","note":"visible",'
+        f'"tags":[{{"tag":"gone-tag"}},{{"tag":"note-only"}}]}},'
+        f'{{"key":"ANNDEL23","itemType":"annotation","annotationType":"highlight",'
+        f'"annotationText":"visible","tags":[{{"tag":"gone-tag"}}]}},'
+        f'{{"key":"DELITM23","itemType":"book","title":"deleted"}}]\''
+    ).strip()
+    creation_body, creation_status = creation.rsplit("\nTASK19_HTTP_STATUS=", 1)
+    assert creation_status == "200", creation
+    print("TASK19_CREATE", creation_status, creation_body, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(creation_body)} "
+        f"| jq -e '(.successful | keys | sort) == [\"0\",\"1\",\"2\",\"3\"] "
+        f"and (.failed | length) == 0'"
+    )
+    notes_writer_token = "task19-nonotes-write"
+    notes_writer_hash = machine.succeed(
+        f"printf '%s' {shlex.quote(notes_writer_token)} | sha256sum | cut -d' ' -f1"
+    ).strip()
+    notes_writer_id_output = psql(
+        "insert into api_keys (user_id,name,token_hash) "
+        f"values (1,'task19 no-notes writer',decode('{notes_writer_hash}','hex')) returning id"
+    )
+    notes_writer_ids = [
+        line for line in notes_writer_id_output.splitlines() if line.isdecimal()
+    ]
+    assert len(notes_writer_ids) == 1 and int(notes_writer_ids[0]) > 0, (
+        notes_writer_id_output
+    )
+    notes_writer_id = notes_writer_ids[0]
+    psql(
+        "insert into api_key_user_permissions (api_key_id,library,notes,write,files) "
+        f"values ({notes_writer_id},true,false,true,false)"
+    )
+    notes_writer_auth = (
+        f"-H 'Zotero-API-Key: {notes_writer_token}' -H 'Zotero-API-Version: 3'"
+    )
+    no_notes_items = machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=NTEDEL23,ANNDEL23&format=json' "
+        f"{notes_writer_auth}"
+    ).strip()
+    print("TASK19_NO_NOTES_VISIBLE_ITEMS", no_notes_items, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(no_notes_items)} "
+        f"| jq -e 'map(.key) == [\"ANNDEL23\"] "
+        f"and .[0].data.tags[0].tag == \"gone-tag\"'"
+    )
+    aggregate_before = machine.succeed(
+        f"curl -sf {base}/users/1/tags {notes_writer_auth}"
+    ).strip()
+    print("TASK19_NO_NOTES_AGGREGATE_TAGS_BEFORE", aggregate_before, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(aggregate_before)} "
+        f"| jq -e 'any(.[]; .tag == \"gone-tag\" and .numItems == 3) "
+        f"and any(.[]; .tag == \"keep-tag\" and .numItems == 1) "
+        f"and any(.[]; .tag == \"note-only\" and .numItems == 1)'"
+    )
+    since = library_version()
+    assert int(since) > 0
+    stale_tag_status = http_code(
+        f"-X DELETE '{base}/users/1/tags?tags=gone-tag' {auth} "
+        f"-H 'If-Unmodified-Since-Version: 0'"
+    )
+    assert stale_tag_status == "412", stale_tag_status
+    print("TASK19_STALE_TAG_DELETE", stale_tag_status, "since", since, flush=True)
+    tag_status = machine.succeed(
+        f"curl -sS -D /tmp/task19-tag-delete.headers -o /dev/null "
+        f"-w '%{{http_code}}' -X DELETE '{base}/users/1/tags?tags=gone-tag' "
+        f"{notes_writer_auth} "
+        f"-H 'If-Unmodified-Since-Version: {since}'"
+    ).strip()
+    tag_version = machine.succeed(
+        "grep -i '^last-modified-version:' /tmp/task19-tag-delete.headers "
+        "| tr -d '\\r' | awk '{print $2}'"
+    ).strip()
+    assert tag_status == "204" and tag_version == str(int(since) + 1), (
+        tag_status,
+        since,
+        tag_version,
+    )
+    print("TASK19_TAG_DELETE", tag_status, "before", since, "after", tag_version, flush=True)
+    no_notes_items_after = machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=NTEDEL23,ANNDEL23&format=json' "
+        f"{notes_writer_auth}"
+    ).strip()
+    print("TASK19_NO_NOTES_VISIBLE_ITEMS_AFTER", no_notes_items_after, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(no_notes_items_after)} "
+        f"| jq -e 'map(.key) == [\"ANNDEL23\"] and .[0].data.tags == [] "
+        f"and .[0].data.annotationText == \"visible\"'"
+    )
+    # Tag deletion stays library-wide: it mutates book, note, and annotation
+    # tags while keeping those item records visible and preserving other tags.
+    book = machine.succeed(
+        f"curl -sf '{base}/users/1/items?itemKey=TAGDEL23&format=json' {auth}"
+    ).strip()
+    print("TASK19_BOOK_AFTER_TAG_DELETE", book, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(book)} "
+        f"| jq -e '.[0].data.tags == [{{\"tag\":\"keep-tag\"}}]'"
+    )
+    for key in ("NTEDEL23", "ANNDEL23"):
+        item = machine.succeed(
+            f"curl -sf '{base}/users/1/items?itemKey={key}&format=json' {auth}"
+        ).strip()
+        print("TASK19_VISIBLE_ITEM", key, item, flush=True)
+        if key == "NTEDEL23":
+            machine.succeed(
+                f"printf '%s' {shlex.quote(item)} "
+                f"| jq -e '.[0].key == \"NTEDEL23\" "
+                f"and .[0].data.tags == [{{\"tag\":\"note-only\"}}] "
+                f"and .[0].data.note == \"visible\"'"
+            )
+        else:
+            machine.succeed(
+                f"printf '%s' {shlex.quote(item)} "
+                f"| jq -e '.[0].key == \"ANNDEL23\" "
+                f"and .[0].data.tags == [] "
+                f"and .[0].data.annotationText == \"visible\"'"
+            )
+    aggregate_tags = machine.succeed(
+        f"curl -sf {base}/users/1/tags {notes_writer_auth}"
+    ).strip()
+    print("TASK19_AGGREGATE_TAGS", aggregate_tags, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(aggregate_tags)} "
+        f"| jq -e 'all(.[]; .tag != \"gone-tag\") "
+        f"and any(.[]; .tag == \"keep-tag\" and .numItems == 1) "
+        f"and any(.[]; .tag == \"note-only\" and .numItems == 1)'"
+    )
+    delete_since = library_version()
+    item_delete_status = machine.succeed(
+        f"curl -sS -D /tmp/task19-item-delete.headers -o /dev/null "
+        f"-w '%{{http_code}}' -X DELETE '{base}/users/1/items?itemKey=DELITM23' {auth} "
+        f"-H 'If-Unmodified-Since-Version: {delete_since}'"
+    ).strip()
+    item_delete_version = machine.succeed(
+        "grep -i '^last-modified-version:' /tmp/task19-item-delete.headers "
+        "| tr -d '\\r' | awk '{print $2}'"
+    ).strip()
+    assert item_delete_status == "204" and item_delete_version == str(int(delete_since) + 1), (
+        item_delete_status,
+        delete_since,
+        item_delete_version,
+    )
+    print(
+        "TASK19_ITEM_DELETE",
+        item_delete_status,
+        "before",
+        delete_since,
+        "after",
+        item_delete_version,
+        flush=True,
+    )
+    deleted_response = machine.succeed(
+        f"curl -sS -w '\\nTASK19_HTTP_STATUS=%{{http_code}}' "
+        f"'{base}/users/1/deleted?since={since}' {auth}"
+    ).strip()
+    deleted_feed, deleted_status = deleted_response.rsplit(
+        "\nTASK19_HTTP_STATUS=", 1
+    )
+    assert deleted_status == "200", deleted_status
+    print("TASK19_DELETED_FEED", deleted_status, deleted_feed, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(deleted_feed)} "
+        f"| jq -e '.tags == [\"gone-tag\"]'"
+    )
+    machine.succeed(
+        f"printf '%s' {shlex.quote(deleted_feed)} "
+        f"| jq -e '.items == [\"DELITM23\"]'"
+    )
+    machine.succeed(
+        f"printf '%s' {shlex.quote(deleted_feed)} "
+        f"| jq -e '.collections == [] and .searches == [] and .settings == []'"
+    )
+    machine.succeed(
+        f"printf '%s' {shlex.quote(deleted_feed)} "
+        f"| jq -e '.tags == [\"gone-tag\"] and .items == [\"DELITM23\"] "
+        f"and .collections == [] and .searches == [] and .settings == []'"
+    )
+    malformed_since = machine.succeed(
+        f"curl -sS -w '\\nTASK19_HTTP_STATUS=%{{http_code}}' "
+        f"'{base}/users/1/deleted?since=not-a-number' {auth}"
+    ).strip()
+    malformed_body, malformed_status = malformed_since.rsplit(
+        "\nTASK19_HTTP_STATUS=", 1
+    )
+    assert malformed_status == "200", malformed_status
+    print("TASK19_MALFORMED_SINCE", malformed_status, malformed_body, flush=True)
+    machine.succeed(
+        f"printf '%s' {shlex.quote(malformed_body)} "
+        f"| jq -e '(.tags | index(\"gone-tag\")) != null "
+        f"and (.items | index(\"DELITM23\")) != null'"
+    )
+
 with subtest("a gzip-compressed write body is decoded"):
     # The real client gzips write bodies; exercise the decompression middleware.
     machine.succeed(
