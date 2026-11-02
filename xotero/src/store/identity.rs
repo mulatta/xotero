@@ -197,16 +197,24 @@ async fn bootstrap_setup(
 
     // Explicit bootstrap IDs do not advance an identity sequence. Never move a
     // sequence backwards if higher generated IDs were later deleted.
+    let sequence: Option<String> =
+        sqlx::query_scalar("select pg_get_serial_sequence('users', 'id')")
+            .fetch_one(&mut **tx)
+            .await?;
+    let sequence = sequence.ok_or_else(|| {
+        sqlx::Error::Protocol("users identity sequence metadata is missing".into())
+    })?;
     sqlx::query(
         "select setval( \
-             pg_get_serial_sequence('users', 'id'), \
+             $1::regclass, \
              greatest( \
                  (select coalesce(max(id), 1) from users), \
-                 (select last_value from users_id_seq) \
+                 coalesce(pg_sequence_last_value($1::regclass), 1) \
              ), \
              true \
          )",
     )
+    .bind(sequence)
     .fetch_one(&mut **tx)
     .await?;
     Ok(())

@@ -2281,6 +2281,88 @@ try:
     assert sql("""select count(*) from audit_events where row_to_json(audit_events)::text
         like '%second-exact-identity%'""")==[(0,)]
     admin_receipts["audit_success_noop_denied_safe_atomic_rollback"]=True
+
+    server.send_signal(signal.SIGINT)
+    assert server.wait(timeout=15)==0
+    server_log_thread.join(timeout=10)
+    assert not server_log_thread.is_alive()
+    server.stdout.close()
+
+    sequence_database="checkpoint20_sequence"
+    subprocess.run(["sudo","-u","postgres","createdb","-O","xotero",
+                    sequence_database],check=True)
+    subprocess.run(["env","DATABASE_URL=postgres://xotero@127.0.0.1/"+sequence_database,
+        "sqlx","migrate","run","--source","/etc/xotero-test/current-migrations"],check=True)
+    def sequence_sql(statement,params=None):
+        with psycopg.connect(host="127.0.0.1",user="xotero",dbname=sequence_database,
+                             connect_timeout=5) as connection:
+            cursor=connection.execute(statement,params)
+            return cursor.fetchall() if cursor.description is not None else []
+    assert sequence_sql("select count(*) from bootstrap_state")==[(0,)]
+    sequence_sql("alter sequence users_id_seq rename to users_id_checkpoint20")
+    sequence_sql("select setval('users_id_checkpoint20',200,true)")
+    deleted_highwater=sequence_sql(
+        "insert into users(username,display_name) values('deleted-high','Deleted') returning id"
+    )[0][0]
+    assert deleted_highwater>101
+    sequence_sql("delete from users where id=%s",(deleted_highwater,))
+    assert sequence_sql("select count(*) from users")==[(0,)]
+
+    environment = environment | {
+        "XOTERO_DATABASE_URL":"postgres://xotero@127.0.0.1/"+sequence_database,
+        "XOTERO_BIND":"127.0.0.1:8189",
+        "XOTERO_USER_ID":"101","XOTERO_USERNAME":"owner","XOTERO_DISPLAY_NAME":"Owner",
+        "XOTERO_BOOTSTRAP_INSTANCE_ADMIN":"true",
+    }
+    server_output=bytearray()
+    server=subprocess.Popen(["xotero"],env=environment,stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,bufsize=0)
+    with selectors.DefaultSelector() as observer:
+        observer.register(server.stdout,selectors.EVENT_READ)
+        while True:
+            assert observer.select(45),"checkpoint20 bootstrap startup timeout"
+            line=server.stdout.readline()
+            assert line,server.poll()
+            server_output.extend(line)
+            if b"xotero listening" in line:
+                break
+    server_log_thread=threading.Thread(target=drain_server_log)
+    server_log_thread.start()
+    assert sequence_sql("select pg_get_serial_sequence('users','id')")==[
+        ("public.users_id_checkpoint20",)]
+    assert sequence_sql("select last_value from users_id_checkpoint20")==[
+        (deleted_highwater,)]
+    assert sequence_sql("select id from users")==[(101,)]
+    assert sequence_sql(
+        "select count(*) from bootstrap_state where name in ('identity','instance-admin')"
+    )==[(2,)]
+    assert sequence_sql(
+        "select count(*) from audit_events where action='bootstrap.instance-admin' and outcome='success'"
+    )==[(1,)]
+
+    sequence_jar,sequence_csrf=login()
+    sequence_status,sequence_body,_=request(
+        "POST","/xotero/admin/users",sequence_jar,sequence_csrf,
+        body={"username":"after-bootstrap","displayName":"After Bootstrap",
+              "issuer":"https://id.example.test","subject":"after-bootstrap"})
+    assert sequence_status==201,(sequence_status,sequence_body)
+    generated_after_bootstrap=json.loads(sequence_body)["userID"]
+    assert generated_after_bootstrap>deleted_highwater,(
+        deleted_highwater,generated_after_bootstrap)
+    assert sequence_sql("select id from users where username='after-bootstrap'")==[
+        (generated_after_bootstrap,)]
+    assert sequence_sql("select last_value from users_id_checkpoint20")==[
+        (generated_after_bootstrap,)]
+    assert logout(sequence_jar,sequence_csrf)==204
+    admin_receipts["renamed_sequence_real_bootstrap_preserves_deleted_highwater"]={
+        "deleted_generated_id":deleted_highwater,"bootstrap_id":101,
+        "next_supported_admin_id":generated_after_bootstrap}
+    server.send_signal(signal.SIGINT)
+    assert server.wait(timeout=15)==0
+    server_log_thread.join(timeout=10)
+    assert not server_log_thread.is_alive()
+    assert all(secret not in server_output.decode() for secret in secrets)
+    server.stdout.close()
     print("CHECKPOINT15_USERS "+json.dumps(admin_receipts,sort_keys=True),flush=True)
     print("CHECKPOINT14_SESSIONS "+json.dumps(receipts,sort_keys=True),flush=True)
 finally:
@@ -2297,7 +2379,14 @@ finally:
         assert not server_log_thread.is_alive()
         logs=server_output.decode()
         assert all(secret not in logs for secret in secrets)
+    databases=[database]
     subprocess.run(["sudo","-u","postgres","dropdb",database],check=True)
-    print("CHECKPOINT14_CLEANUP "+json.dumps({"database":database,"server":None if server is None else server.pid}),flush=True)
+    if "sequence_database" in locals():
+        subprocess.run(["sudo","-u","postgres","dropdb","--if-exists",
+                        sequence_database],check=True)
+        databases.append(sequence_database)
+    print("CHECKPOINT14_CLEANUP "+json.dumps({
+        "databases":databases,"server":None if server is None else server.pid}),flush=True)
 '''
+compile(web_script, "checkpoint20-admin-web-script", "exec")
 print(machine.succeed("python3 -u -c " + shlex.quote(web_script)))

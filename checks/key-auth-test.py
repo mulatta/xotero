@@ -813,6 +813,17 @@ psql(
        values (1, 'LEGACY22', 'legacy text', 11, 11, 1, 1, 7)"""
 )
 
+# Apply schema before startup so the actual identity sequence can be renamed
+# before bootstrap and provisioning exercise it.
+machine.succeed(
+    "sudo -u xotero env "
+    "'DATABASE_URL=postgresql://xotero@localhost/xotero?host=/run/postgresql' "
+    "sqlx migrate run --source /etc/xotero-test/current-migrations"
+)
+machine.succeed(
+    "sudo -u postgres psql -v ON_ERROR_STOP=1 -d xotero "
+    "-c 'alter sequence users_id_seq rename to users_id_checkpoint20'"
+)
 machine.start_job("xotero.service")
 machine.wait_for_unit("xotero.service")
 machine.wait_for_open_port(8189)
@@ -894,6 +905,12 @@ with subtest("bootstrap identity owns the legacy personal library"):
         )
         == "t"
     )
+    assert psql("select pg_get_serial_sequence('users', 'id')") == (
+        "public.users_id_checkpoint20"
+    )
+    assert psql(
+        "select last_value from users_id_checkpoint20"
+    ) == "101"
 
 with subtest("bootstrap OIDC identity remains unique across restarts"):
     restart_xotero()
@@ -3087,3 +3104,121 @@ with subtest("locked registration commits before a later revocation"):
         ) == "hello"
     finally:
         psql("update api_keys set revoked_at = null where id = 6001")
+
+with subtest("bootstrap fails closed without users identity metadata"):
+    missing_metadata_script = r'''
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import tempfile
+
+pid = subprocess.check_output(
+    ["systemctl", "show", "-p", "MainPID", "--value", "xotero.service"],
+    text=True).strip()
+assert pid and pid != "0", pid
+service_environment = {}
+with open("/proc/" + pid + "/environ", "rb") as source:
+    for entry in source.read().split(b"\0"):
+        if entry.startswith(b"XOTERO_"):
+            key, value = entry.split(b"=", 1)
+            service_environment[key.decode()] = value.decode()
+assert "XOTERO_DATABASE_URL" in service_environment
+
+def copy_credential(path, name):
+    destination = os.path.join(credential_root, name)
+    shutil.copyfile(path, destination)
+    os.chown(destination, xotero_uid, xotero_gid)
+    os.chmod(destination, 0o600)
+    return destination
+
+def sql(statement):
+    return subprocess.check_output(
+        ["sudo", "-u", "xotero", "psql", "-v", "ON_ERROR_STOP=1", "-At",
+         "-d", "xotero", "-c", statement], text=True).strip()
+
+success_before = int(sql("""select count(*) from audit_events
+    where action='bootstrap.identity' and outcome='success'"""))
+denied_before = int(sql("""select count(*) from audit_events
+    where action='bootstrap.identity' and outcome='denied'"""))
+users_before = int(sql("select count(*) from users"))
+identities_before = int(sql("select count(*) from external_identities"))
+account = pwd.getpwnam("xotero")
+xotero_uid, xotero_gid = account.pw_uid, account.pw_gid
+credential_root = tempfile.mkdtemp(prefix="xotero-task20-", dir="/run")
+os.chown(credential_root, xotero_uid, xotero_gid)
+os.chmod(credential_root, 0o700)
+try:
+    key_entries = []
+    for index, entry in enumerate(service_environment["XOTERO_KEYS"].split(",")):
+        scope, path = entry.split(":", 1)
+        key_entries.append(
+            scope + ":" + copy_credential(path, "key-" + str(index)))
+    service_environment["XOTERO_KEYS"] = ",".join(key_entries)
+    for variable, filename in (
+        ("XOTERO_LOGIN_KDF_KEY_FILE", "login-kdf-key"),
+        ("XOTERO_S3_ACCESS_KEY_FILE", "s3-access-key"),
+        ("XOTERO_S3_SECRET_KEY_FILE", "s3-secret-key"),
+    ):
+        service_environment[variable] = copy_credential(
+            service_environment[variable], filename)
+    subprocess.run(["systemctl", "stop", "xotero.service"], check=True)
+    sql("delete from bootstrap_state where name='identity'")
+    sql("alter table users alter column id drop identity")
+    assert sql("select pg_get_serial_sequence('users','id') is null") == "t"
+    binary = shutil.which("xotero")
+    assert binary
+    process = subprocess.Popen(
+        ["sudo", "-u", "xotero", "env",
+         *[key + "=" + value for key, value in service_environment.items()], binary],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        output, _ = process.communicate(timeout=30)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise AssertionError("missing-metadata startup did not terminate")
+    assert process.returncode == 101, (process.returncode, output)
+    assert "bootstrap identity" in output and "bootstrap setup denied" in output, output
+    assert "users identity sequence metadata is missing" not in output, output
+    assert "xotero listening" not in output, output
+    assert sql("select count(*) from bootstrap_state where name='identity'") == "0"
+    assert int(sql("select count(*) from users")) == users_before
+    assert int(sql("select count(*) from external_identities")) == identities_before
+    success_after = int(sql("""select count(*) from audit_events
+        where action='bootstrap.identity' and outcome='success'"""))
+    denied_after = int(sql("""select count(*) from audit_events
+        where action='bootstrap.identity' and outcome='denied'"""))
+    assert success_after == success_before, (success_before, success_after)
+    assert denied_after == denied_before + 1, (denied_before, denied_after)
+    missing_metadata_receipt = {
+        "exit": process.returncode,
+        "pid": process.pid,
+        "identity_metadata": None,
+        "diagnostic": "bootstrap setup denied",
+        "bootstrap_marker": False,
+        "users_unchanged": True,
+        "identities_unchanged": True,
+        "success_delta": 0,
+        "denied_delta": 1,
+    }
+finally:
+    shutil.rmtree(credential_root)
+    assert not os.path.exists(credential_root)
+missing_metadata_receipt["credential_dir_removed"] = True
+print(json.dumps(missing_metadata_receipt), flush=True)
+'''
+    compile(missing_metadata_script, "checkpoint20-missing-metadata", "exec")
+    missing_metadata_receipt = json.loads(
+        machine.succeed(
+            f"python3 -c {shlex.quote(missing_metadata_script)}"
+        )
+    )
+    assert missing_metadata_receipt["exit"] == 101
+    assert missing_metadata_receipt["bootstrap_marker"] is False
+    assert missing_metadata_receipt["success_delta"] == 0
+    assert missing_metadata_receipt["denied_delta"] == 1
+    assert missing_metadata_receipt["users_unchanged"] is True
+    assert missing_metadata_receipt["identities_unchanged"] is True
+    assert missing_metadata_receipt["credential_dir_removed"] is True
