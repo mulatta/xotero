@@ -13,7 +13,8 @@ supported client, so the desktop GUI tier is retired.
 Run before every code commit:
 
 - `cargo test`
-- `cargo clippy --all-targets -- -D warnings`
+- `cargo clippy --all-targets --all-features -- -D warnings`, also run by
+  `checks.x86_64-linux.clippy`
 - `cargo fmt --check`
 - treefmt/flake formatting check
 - shellcheck for changed scripts
@@ -77,10 +78,12 @@ Desktop support has since been removed, so this run is history and not a gate.
 
 ## Current status
 
-Tasks 1 to 6 of the roadmap are merged. CI passes these checks on `main`:
+Tasks 1 to 20 of the roadmap are merged. CI passes these checks on `main`:
 
 - `checks.x86_64-linux.api-contracts`
+- `checks.x86_64-linux.clippy`
 - `checks.x86_64-linux.formatting`
+- `checks.x86_64-linux.nixos-admin`
 - `checks.x86_64-linux.nixos-key-auth`
 - `checks.x86_64-linux.nixos-sync`
 

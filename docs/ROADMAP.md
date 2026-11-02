@@ -354,7 +354,7 @@ Tasks 1 to 12 are merged. Tasks 13 to 20 are implemented and await review.
   tests are not a client-compatibility substitute. Plan Task 32.
 - [ ] Confirm two-user, two-library, same-object-key isolation coverage.
 - [ ] Add backup and restore tests. Plan Task 37.
-- [ ] Run Clippy and dependency advisory/license checks in CI. Formatting, unit
+- [ ] Run dependency advisory/license checks in CI. Clippy, formatting, unit
   tests, and individual NixOS checks already run.
 
 ### P2: dependencies and abstractions
