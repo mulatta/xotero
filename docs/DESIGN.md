@@ -4,8 +4,6 @@ This file describes the system as it exists. Plans belong in `ROADMAP.md`, the
 wire contract belongs in `API.md`, and the reasons for accepted decisions belong
 in `adr/`.
 
-Sections marked _unmerged_ describe implemented work that is not in `main` yet.
-
 ## Purpose
 
 xotero is a self-hosted, multi-user server for the public Zotero Web API. It
@@ -52,17 +50,20 @@ headers.
 Three paths issue or carry credentials:
 
 - `Zotero-API-Key` carries a database-backed key that is hashed, owned by a user,
-  scoped, and revocable. Configured recovery credentials are hashed and validated
-  at startup.
+  scoped, and revocable. Recovery credentials come only from the `XOTERO_KEYS`
+  manifest and are hashed and validated at startup.
 - Web sessions use a server-side session with a CSRF header `x-xotero-csrf`.
-  Mutations must present it. _unmerged_
-
+  Mutations must present it.
 - `/keys/sessions` and `/login` run a browser-approved login session. After OIDC
   approval, the server issues a user-owned API key derived with
   `loginKdfKeyFile`.
 
 Instance administrators are explicit records, and bootstrap runs once.
-_unmerged_
+
+Each request rechecks the live user and identity state. Disabling a user also
+revokes every key the user owns and their web sessions, and unlinking an
+identity revokes the web sessions bound to it, so re-enabling or relinking never
+revives those credentials.
 
 ## Authorization
 
@@ -75,7 +76,7 @@ Requests are authorized before the server reads their bodies. Lookup failures
 return an error and never fall back to a permissive default.
 
 Group roles are owner, admin, and member. Group lifecycle, membership, and
-ownership transitions live under `/xotero/...`. _unmerged_
+ownership transitions live under `/xotero/...`.
 
 ## Data model
 

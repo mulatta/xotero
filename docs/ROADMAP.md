@@ -245,13 +245,13 @@ Exit criteria for 1.0:
 
 ## Current work
 
-Tasks 1 to 12 are merged. Tasks 13 to 20 are implemented and await review.
+Tasks 1 to 20 are merged.
 
 ### Wave D: browser API semantics
 
-- [ ] 19. Correct deleted-tag wire representation
+- [x] 19. Correct deleted-tag wire representation
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L` proves string tombstones and unchanged item deletion shapes.
-- [ ] 20. Resolve identity sequence without hard-coded name
+- [x] 20. Resolve identity sequence without hard-coded name
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-key-auth -L`; generated IDs remain positive/collision-free.
 - [ ] 21. Serve pinned metadata and item templates
   - Acceptance: `nix build .#checks.x86_64-linux.api-contracts .#checks.x86_64-linux.nixos-sync -L`.

@@ -39,7 +39,7 @@ Use real PostgreSQL and RustFS, not mocks.
   - DB-backed scoped keys and revocation
   - personal/group authorization and role boundaries
   - restart and startup-failure behavior
-- `checks.x86_64-linux.nixos-admin` (unmerged)
+- `checks.x86_64-linux.nixos-admin`
   - instance authority, one-shot bootstrap, and audit
   - web sessions and CSRF
   - user, identity, key, group, membership, and ownership administration
