@@ -118,7 +118,9 @@ that file unchanged. The mapping routes (`/itemTypes`, `/itemFields`,
 `/creatorFields`, `/itemTypeFields`, `/itemTypeCreatorTypes`) and the
 `/items/new` templates derive from it, following dataserver's shapes, ordering,
 locale fallback, and errors. They need no API key because they carry no library
-data, and responses carry `Zotero-Schema-Version`.
+data, but a presented key must be valid. A schema that lacks en-US strings,
+repeats an item type, or gives a type other than one primary creator type fails
+startup. Every response carries `Zotero-Schema-Version`.
 
 ## Migrations
 
