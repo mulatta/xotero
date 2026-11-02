@@ -43,7 +43,8 @@ stays available for issuing keys, but desktop Zotero is not a supported client.
 | --------------------- | -------------------------------------------------------- |
 | `packages.xotero`     | the server binary                                        |
 | `nixosModules.xotero` | systemd service, local PostgreSQL, loaded credentials    |
-| `overlays.default`    | adds `pkgs.xotero`                                       |
+| `packages.zotero-schema` | Zotero schema served by `/schema`, pinned via Web Library |
+| `overlays.default`    | adds `pkgs.xotero` and `pkgs.zotero-schema`              |
 
 ## Deployment
 

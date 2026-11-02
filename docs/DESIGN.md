@@ -110,6 +110,16 @@ before deletion. Uploads stream through bounded hashing with concurrency, size,
 and time limits. An upload whose remote outcome is unknown keeps its pending row
 as a cleanup identity, so a late remote write is still deleted.
 
+## Schema metadata
+
+The server embeds one `zotero-schema` commit at build time: the one that Web
+Library 1.8.3 vendors, packaged as `packages.zotero-schema`. `/schema` returns
+that file unchanged. The mapping routes (`/itemTypes`, `/itemFields`,
+`/creatorFields`, `/itemTypeFields`, `/itemTypeCreatorTypes`) and the
+`/items/new` templates derive from it, following dataserver's shapes, ordering,
+locale fallback, and errors. They need no API key because they carry no library
+data, and responses carry `Zotero-Schema-Version`.
+
 ## Migrations
 
 - Every schema change is an ordered migration. Merged migrations are not edited.

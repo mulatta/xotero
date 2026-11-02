@@ -34,6 +34,8 @@ Use real PostgreSQL and RustFS, not mocks.
   - wrong ZIP hash rejection
   - pending upload survival across authorization/upload restarts
   - S3 `application/zip` metadata and compressed response headers
+  - public schema, mapping lists, and every item template against the pinned
+    schema, including locale fallback and 400 errors
 - `checks.x86_64-linux.nixos-key-auth`
   - populated-schema migration through latest version
   - OIDC identity mapping and ownership
