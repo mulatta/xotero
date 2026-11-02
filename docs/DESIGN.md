@@ -72,7 +72,8 @@ touches data. The context holds the principal, the library, and the permissions.
 `/users/<id>/...` and `/groups/<id>/...` resolve to a library, and then share data
 handlers. URL identifiers, object keys, and file keys never bypass this context.
 
-Requests are authorized before the server reads their bodies. Lookup failures
+Requests are routed first, so an unknown path is 404 whatever the key. Matched
+requests are authorized before the server reads their bodies. Lookup failures
 return an error and never fall back to a permissive default.
 
 Group roles are owner, admin, and member. Group lifecycle, membership, and
