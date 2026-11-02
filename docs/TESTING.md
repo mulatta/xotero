@@ -99,7 +99,6 @@ Structure status:
 ## Remaining release-gate work
 
 - Add the real browser gate. Plan Task 32.
-- Replace `minio-client` in `nixos-sync` so nixpkgs updates can land.
 - Add backup/restore drill covering metadata, full text, original item hashes,
   compressed blob hashes, and S3 bytes. Plan Task 37.
 - Resolve or expire three legacy pending rows from the failed pre-migration ZIP

@@ -37,7 +37,7 @@ browser or API client
 | `xotero/src/http/`    | middleware, request access, headers, validation          |
 | `xotero/src/handlers/` | one module per API family                               |
 | `xotero/src/store/`   | store facade and one module per persistence domain       |
-| `xotero/src/upload.rs` | bounded attachment upload path (_unmerged_)             |
+| `xotero/src/upload.rs` | bounded attachment upload path                          |
 | `xotero/migrations/`  | ordered SQL migrations                                   |
 | `nix/`                | package, NixOS module, check wiring                      |
 | `checks/`             | integration test scripts and API contract inventory      |
@@ -106,7 +106,8 @@ Registration rechecks the original upload authority inside the transaction.
 
 Removed blobs enter `blob_retirements`, so issued pre-signed URLs can expire
 before deletion. Uploads stream through bounded hashing with concurrency, size,
-and time limits. _unmerged_
+and time limits. An upload whose remote outcome is unknown keeps its pending row
+as a cleanup identity, so a late remote write is still deleted.
 
 ## Migrations
 
