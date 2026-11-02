@@ -2118,6 +2118,11 @@ try:
     # Re-enabling must not revive a browser session that disabling ended.
     assert session_status(disabled_jar,disabled_csrf)==401
     assert session_revoked(disabled_jar)
+    # Disabling is incident response, so the user's issued keys stay revoked too.
+    assert request("GET","/users/"+str(target)+"/items",
+        extra=[("Zotero-API-Key",issued_key)])[0]==403
+    assert sql("""select count(*) from api_keys
+        where user_id=%s and revoked_at is null""",(target,))==[(0,)]
 
     probe_identity={"issuer":"https://id.example.test","subject":"relink-probe"}
     unlinked_jar,unlinked_csrf=login(user="provisioned",user_id=target)

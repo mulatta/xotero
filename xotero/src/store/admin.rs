@@ -98,7 +98,7 @@ impl AdminGuard<'_> {
                 .reduce(target, "unlink-identity", Some(&identity))
                 .await?;
             if outcome == "success" {
-                self.end_sessions(target, Some(&identity)).await?;
+                self.revoke_access(target, Some(&identity)).await?;
             }
             let result = match outcome.as_str() {
                 "success" | "noop" => AdminResult::Changed,
@@ -203,7 +203,7 @@ impl AdminGuard<'_> {
                     }
                     match self.reduce(target, "disable-user", None).await?.as_str() {
                         "conflict" => return Ok((AdminResult::Conflict, AuditOutcome::Denied)),
-                        "success" => self.end_sessions(target, None).await?,
+                        "success" => self.revoke_access(target, None).await?,
                         _ => {}
                     }
                 }
@@ -293,10 +293,11 @@ impl AdminGuard<'_> {
         ).bind(target.get()).fetch_one(&mut *self.tx).await
     }
 
-    // Session validity follows live identity state, so without an explicit
-    // revocation a later re-enable or relink would revive these sessions.
-    // Keys lock before sessions, matching logout.
-    async fn end_sessions(
+    // Credential validity follows live user and identity state, so without an
+    // explicit revocation a later re-enable or relink would revive them.
+    // Disabling ends every key the user owns; unlinking ends only the sessions
+    // bound to that identity. Keys lock before sessions, matching logout.
+    async fn revoke_access(
         &mut self,
         target: UserId,
         identity: Option<&ExternalIdentity>,
@@ -304,8 +305,9 @@ impl AdminGuard<'_> {
         const BOUND: &str = "user_id=$1 and revoked_at is null \
              and ($2::text is null or (issuer=$2 and subject=$3))";
         sqlx::query(&format!(
-            "update api_keys set revoked_at=clock_timestamp() where revoked_at is null \
-             and id in (select api_key_id from web_sessions where {BOUND})"
+            "update api_keys set revoked_at=clock_timestamp() \
+             where user_id=$1 and revoked_at is null \
+             and ($2::text is null or id in (select api_key_id from web_sessions where {BOUND}))"
         ))
         .bind(target.get())
         .bind(identity.map(|i| i.issuer.as_str()))
