@@ -74,8 +74,8 @@ while the level is declared in deployment config:
 reflects read-only); the login session (`/keys/sessions`) hands out a read/write
 key, since the app that drives it needs to write. Config: `XOTERO_KEYS` is a
 comma-separated list of `<role>:<path>` entries (`rw`/`ro`); each path is a
-single-line token file. A single `XOTERO_API_KEY_FILE`/`XOTERO_API_KEY` is still
-accepted as one read/write key.
+single-line token file. `XOTERO_API_KEY_FILE` and `XOTERO_API_KEY` are removed,
+and setting either one fails startup.
 
 ### Enrollment & public exposure
 
