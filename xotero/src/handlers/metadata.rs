@@ -12,16 +12,19 @@ use crate::metadata::{creator_fields, Invalid, SCHEMA, SCHEMA_JSON};
 
 type Params = Query<HashMap<String, String>>;
 
-fn schema_version() -> [(HeaderName, HeaderValue); 1] {
-    [(
+/// dataserver reports its schema version on every response, so clients can
+/// tell when to refresh their copy.
+pub(crate) async fn stamp_schema_version(mut response: Response) -> Response {
+    response.headers_mut().insert(
         HeaderName::from_static("zotero-schema-version"),
         HeaderValue::from(SCHEMA.version),
-    )]
+    );
+    response
 }
 
 fn reply(result: Result<Value, Invalid>) -> Response {
     match result {
-        Ok(value) => (schema_version(), Json(value)).into_response(),
+        Ok(value) => Json(value).into_response(),
         Err(Invalid(message)) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
 }
@@ -32,12 +35,7 @@ fn param<'a>(params: &'a HashMap<String, String>, name: &str) -> Option<&'a str>
 
 /// `GET /schema`: the pinned schema file, byte for byte.
 pub(crate) async fn schema() -> Response {
-    (
-        schema_version(),
-        [(header::CONTENT_TYPE, "application/json")],
-        SCHEMA_JSON,
-    )
-        .into_response()
+    ([(header::CONTENT_TYPE, "application/json")], SCHEMA_JSON).into_response()
 }
 
 /// `GET /itemTypes`

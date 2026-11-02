@@ -13,7 +13,7 @@ use serde_json::{json, Map, Value};
 pub(crate) const SCHEMA_JSON: &[u8] = include_bytes!(env!("XOTERO_SCHEMA"));
 
 pub(crate) static SCHEMA: LazyLock<Schema> = LazyLock::new(|| {
-    serde_json::from_slice(SCHEMA_JSON).expect("embedded Zotero schema must parse")
+    Schema::parse(SCHEMA_JSON).unwrap_or_else(|error| panic!("embedded Zotero schema: {error}"))
 });
 
 const DEFAULT_LOCALE: &str = "en-US";
@@ -72,16 +72,46 @@ fn localized<'a>(strings: &'a HashMap<String, String>, name: &'a str) -> &'a str
 }
 
 /// `{prop, localized}` rows sorted by byte order of the localized string, as
-/// PHP `strcmp` does. The sort is stable, so ties keep schema order.
+/// PHP `strcmp` does. dataserver breaks ties by database row order, which the
+/// schema does not carry, so ties fall back to the name to stay deterministic.
 fn sorted_rows<'a>(prop: &str, rows: impl Iterator<Item = (&'a str, &'a str)>) -> Value {
     let mut rows: Vec<_> = rows.collect();
-    rows.sort_by(|a, b| a.1.as_bytes().cmp(b.1.as_bytes()));
+    rows.sort_by(|a, b| (a.1.as_bytes(), a.0).cmp(&(b.1.as_bytes(), b.0)));
     rows.into_iter()
         .map(|(name, text)| json!({ prop: name, "localized": text }))
         .collect()
 }
 
 impl Schema {
+    /// Parse and check the invariants every endpoint relies on, so a bad pin
+    /// fails startup instead of producing wrong or panicking responses.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let schema: Self = serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+        if !schema.locales.contains_key(DEFAULT_LOCALE) {
+            return Err(format!("missing {DEFAULT_LOCALE} strings"));
+        }
+        let mut names = std::collections::HashSet::new();
+        for item_type in &schema.item_types {
+            let name = item_type.item_type.as_str();
+            if !names.insert(name) {
+                return Err(format!("duplicate item type {name}"));
+            }
+            let primaries = item_type.creator_types.iter().filter(|c| c.primary).count();
+            let creatorless = matches!(name, "note" | "attachment" | "annotation");
+            if primaries != usize::from(!creatorless) {
+                return Err(format!(
+                    "item type {name} has {primaries} primary creator types"
+                ));
+            }
+        }
+        for required in ["note", "attachment", "annotation"] {
+            if !names.contains(required) {
+                return Err(format!("missing item type {required}"));
+            }
+        }
+        Ok(schema)
+    }
+
     /// Exact match, then the bare language, then a regional variant of the
     /// language (en-US, then the language's own region, then by region), else
     /// en-US. An unknown locale is never an error.
@@ -347,6 +377,100 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect()
+    }
+
+    fn schema_with(item_types: Value, locales: Value) -> Result<Schema, String> {
+        Schema::parse(
+            json!({ "version": 1, "itemTypes": item_types, "locales": locales })
+                .to_string()
+                .as_bytes(),
+        )
+    }
+
+    fn special_types() -> Vec<Value> {
+        ["note", "attachment", "annotation"]
+            .map(|name| json!({ "itemType": name, "fields": [], "creatorTypes": [] }))
+            .to_vec()
+    }
+
+    fn book(creator_types: Value) -> Value {
+        json!({ "itemType": "book", "fields": [{ "field": "title" }], "creatorTypes": creator_types })
+    }
+
+    fn english() -> Value {
+        json!({ "en-US": { "itemTypes": {}, "fields": {}, "creatorTypes": {} } })
+    }
+
+    #[test]
+    fn embedded_schema_satisfies_the_parser() {
+        assert!(Schema::parse(SCHEMA_JSON).is_ok());
+    }
+
+    #[test]
+    fn malformed_schemas_fail_closed() {
+        let author = json!([{ "creatorType": "author", "primary": true }]);
+        let with = |extra: Vec<Value>| {
+            let mut types = special_types();
+            types.extend(extra);
+            Value::Array(types)
+        };
+        assert!(schema_with(with(vec![book(author.clone())]), english()).is_ok());
+        for (item_types, locales, reason) in [
+            (
+                with(vec![book(author.clone())]),
+                json!({ "fr-FR": english()["en-US"] }),
+                "missing en-US",
+            ),
+            (
+                with(vec![book(author.clone()), book(author.clone())]),
+                english(),
+                "duplicate",
+            ),
+            (
+                with(vec![book(json!([{ "creatorType": "author" }]))]),
+                english(),
+                "0 primary",
+            ),
+            (
+                with(vec![book(json!([
+                    { "creatorType": "author", "primary": true },
+                    { "creatorType": "editor", "primary": true },
+                ]))]),
+                english(),
+                "2 primary",
+            ),
+            (
+                Value::Array(special_types()[..2].to_vec()),
+                english(),
+                "missing item type annotation",
+            ),
+        ] {
+            let error = schema_with(item_types, locales).err().expect(reason);
+            assert!(error.contains(reason), "{reason}: {error}");
+        }
+        for bytes in [
+            &b"not json"[..],
+            br#"{"version":1}"#,
+            br#"{"version":"45","itemTypes":[],"locales":{}}"#,
+        ] {
+            assert!(Schema::parse(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn localized_ties_sort_by_name() {
+        let fields = SCHEMA.item_fields(None);
+        let types: Vec<_> = fields
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["localized"] == "Type")
+            .map(|f| f["field"].as_str().unwrap())
+            .collect();
+        let mut sorted = types.clone();
+        sorted.sort_unstable();
+        assert!(types.len() > 1);
+        assert_eq!(types, sorted);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::handlers::login::{
 };
 use crate::handlers::metadata::{
     creator_field_names, item_fields, item_type_creator_types, item_type_fields, item_types,
-    new_item, schema,
+    new_item, schema, stamp_schema_version,
 };
 use crate::handlers::objects::{
     collection_items, collection_items_top, delete, items_get, items_top, items_trash, read, write,
@@ -275,6 +275,7 @@ pub(crate) fn router(state: AppState) -> Router {
         // to MAX_BODY; middleware and the capability handler enforce body bounds.
         .layer(DefaultBodyLimit::max(MAX_BODY))
         .layer(middleware::from_fn_with_state(state.clone(), log_and_auth))
+        .layer(middleware::map_response(stamp_schema_version))
         .with_state(state)
 }
 

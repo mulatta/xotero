@@ -309,6 +309,14 @@ with subtest("public metadata and templates follow the pinned schema"):
             position |= {"width": 0, "height": 0}
         assert template["annotationPosition"] == position, kind
 
+    stamp = f"zotero-schema-version: {schema['version']}"
+    for args in (f"{base}/users/1/items {auth}", f"{base}/users/1/items"):
+        head = machine.succeed(f"curl -sS -o /dev/null -D - {args}").lower()
+        assert stamp in head, (args, head)
+    # A presented key must be valid even where no key is required.
+    for key, expected in (("testtoken", "200"), ("readonlytoken", "200"), ("nope", "403")):
+        assert http_code(f"-H 'Zotero-API-Key: {key}' {base}/itemTypes") == expected, key
+
     assert public("/itemTypeCreatorTypes?itemType=note")[:2] == (200, "[]")
     for path, message in (
         ("/items/new", "'itemType' not provided"),

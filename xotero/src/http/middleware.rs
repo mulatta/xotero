@@ -192,9 +192,19 @@ pub(crate) async fn log_and_auth(
     let segments: Vec<_> = path.split('/').collect();
     let is_upload = method == axum::http::Method::POST
         && matches!(segments.as_slice(), ["", "uploads", token] if !token.is_empty());
+    let is_public_metadata = is_public_metadata_path(&path)
+        && matches!(method, axum::http::Method::GET | axum::http::Method::HEAD);
+    // Public routes need no key, but a presented key must still be valid, as
+    // dataserver authenticates any key before dispatching to a controller.
+    if is_public_metadata && parts.headers.contains_key("zotero-api-key") {
+        match authenticate_request(&state, &parts.headers).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return (StatusCode::FORBIDDEN, "invalid API key").into_response(),
+            Err(error) => return server_error("API key authentication", error),
+        }
+    }
     let is_bootstrap = is_upload
-        || (is_public_metadata_path(&path)
-            && matches!(method, axum::http::Method::GET | axum::http::Method::HEAD))
+        || is_public_metadata
         || (path == "/login"
             && matches!(
                 method,
