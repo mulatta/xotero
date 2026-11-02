@@ -70,6 +70,7 @@
         { system, pkgs, ... }:
         {
           api-contracts = import ./nix/checks/api-contracts.nix { inherit pkgs; };
+          clippy = import ./nix/checks/clippy.nix { inherit pkgs; };
           formatting = treefmtEval.${system}.config.build.check self;
         }
         # nixosTest needs a linux VM, so wire it only on linux systems.
