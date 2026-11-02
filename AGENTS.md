@@ -35,6 +35,9 @@
 - Merge to `main` only through a pull request and the `gitea-mq` queue. Use a
   merge commit for stacked pull requests so commit hashes stay stable.
 - Land stacked pull requests bottom-up, one at a time.
+- Enable auto-merge on a stacked pull request only after its parent has merged
+  and its base is `main`. Only `main` requires the nixbot checks, so `gitea-mq`
+  would merge into any other base without them.
 
 ## Agent coordination
 
