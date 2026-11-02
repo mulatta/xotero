@@ -2,6 +2,7 @@
 nixosModule-deployed service. Grouped by flow rather than per endpoint, since
 each run boots a VM."""
 
+import json
 import shlex
 
 base = "http://localhost:8189"
@@ -200,6 +201,128 @@ with subtest("the login consent endpoint validates the session token"):
     assert http_code(f"{base}/login?session=nope") == "404"  # unknown session
     assert http_code(f"-X POST {base}/login {oidc} -d 'session=nope'") == "404"
     assert http_code(f"{base}/keys/sessions/nope") == "404"
+
+def public(path):
+    status = machine.succeed(
+        f"curl -sS -D /tmp/public.h -o /tmp/public.b -w '%{{http_code}}' '{base}{path}'"
+    )
+    return (
+        int(status),
+        machine.succeed("cat /tmp/public.b"),
+        machine.succeed("cat /tmp/public.h").lower(),
+    )
+
+
+with subtest("public metadata and templates follow the pinned schema"):
+    # No API key: Web Library reads these before any library is selected.
+    status, body, head = public("/schema")
+    assert status == 200 and "content-type: application/json" in head, (status, head)
+    assert body == machine.succeed("cat /etc/xotero-test/zotero-schema.json")
+    schema = json.loads(body)
+    assert f"zotero-schema-version: {schema['version']}" in head, head
+    special = {"note", "attachment", "annotation"}
+    regular = [t for t in schema["itemTypes"] if t["itemType"] not in special]
+    french = schema["locales"]["fr-FR"]
+
+    status, body, head = public("/itemTypes?locale=fr")
+    listed = json.loads(body)
+    assert status == 200 and "content-type: application/json" in head
+    assert [t["itemType"] for t in listed if t["itemType"] in special] == ["note"]
+    assert len(listed) == len(regular) + 1
+    assert [t["localized"].encode() for t in listed] == sorted(
+        t["localized"].encode() for t in listed
+    )
+    assert {"itemType": "book", "localized": french["itemTypes"]["book"]} in listed
+
+    status, body, _ = public("/itemTypes?locale=xx-YY")
+    assert status == 200
+    assert {"itemType": "book", "localized": "Book"} in json.loads(body)
+
+    status, body, _ = public("/itemFields")
+    fields = json.loads(body)
+    used = {f["field"] for t in schema["itemTypes"] for f in t["fields"]}
+    assert {f["field"] for f in fields} == used and len(fields) == len(used)
+    assert {"field": "title", "localized": "Title"} in fields
+
+    assert json.loads(public("/creatorFields?locale=fr-FR")[1]) == [
+        {"field": "firstName", "localized": "First"},
+        {"field": "lastName", "localized": "Last"},
+        {"field": "name", "localized": "Name"},
+    ]
+
+    for item_type in regular:
+        name = item_type["itemType"]
+        names = [f["field"] for f in item_type["fields"]]
+        primary = [c["creatorType"] for c in item_type["creatorTypes"] if c.get("primary")]
+        status, body, _ = public(f"/items/new?itemType={name}")
+        template = json.loads(body)
+        assert status == 200, (name, status, body)
+        assert list(template) == [
+            "itemType", names[0], "creators", *names[1:],
+            "tags", "collections", "relations",
+        ], (name, list(template))
+        assert template["creators"] == [
+            {"creatorType": primary[0], "firstName": "", "lastName": ""}
+        ], name
+        assert all(template[field] == "" for field in names), name
+        status, body, _ = public(f"/itemTypeFields?itemType={name}")
+        assert [f["field"] for f in json.loads(body)] == names, name
+        status, body, _ = public(f"/itemTypeCreatorTypes?itemType={name}&locale=fr-FR")
+        creators = json.loads(body)
+        assert creators[0]["creatorType"] == primary[0], name
+        assert {c["creatorType"] for c in creators} == {
+            c["creatorType"] for c in item_type["creatorTypes"]
+        }, name
+        rest = [c["localized"].encode() for c in creators[1:]]
+        assert rest == sorted(rest), name
+
+    assert json.loads(public("/items/new?itemType=note")[1]) == {
+        "itemType": "note", "note": "", "tags": [], "collections": [], "relations": {},
+    }
+    for mode in ("imported_file", "imported_url", "linked_file", "linked_url"):
+        template = json.loads(public(f"/items/new?itemType=attachment&linkMode={mode}")[1])
+        expected = ["itemType", "linkMode", "title", "accessDate"]
+        expected += ["url"] if mode.endswith("_url") else []
+        expected += ["note", "tags", "collections", "relations", "contentType", "charset"]
+        expected += ["path"] if mode == "linked_file" else []
+        expected += ["filename", "md5", "mtime"] if mode.startswith("imported_") else []
+        assert list(template) == expected, (mode, list(template))
+        assert template["linkMode"] == mode
+    assert json.loads(public("/items/new?itemType=attachment&linkMode=embedded_image")[1]) == {
+        "itemType": "attachment", "linkMode": "embedded_image", "parentItem": "",
+        "contentType": "", "filename": "", "md5": None, "mtime": None,
+    }
+    for kind in ("highlight", "note", "image", "ink", "underline", "text"):
+        template = json.loads(public(f"/items/new?itemType=annotation&annotationType={kind}")[1])
+        expected = ["itemType", "parentItem", "annotationType"]
+        expected += ["annotationText"] if kind in ("highlight", "underline") else []
+        expected += [
+            "annotationComment", "annotationColor", "annotationPageLabel",
+            "annotationSortIndex", "annotationPosition", "tags",
+        ]
+        assert list(template) == expected, (kind, list(template))
+        assert template["annotationSortIndex"] == "00000|000000|00000"
+        position = {"pageIndex": 0, "rects": []}
+        if kind == "ink":
+            position = {"pageIndex": 0, "paths": [], "width": 2}
+        if kind == "image":
+            position |= {"width": 0, "height": 0}
+        assert template["annotationPosition"] == position, kind
+
+    assert public("/itemTypeCreatorTypes?itemType=note")[:2] == (200, "[]")
+    for path, message in (
+        ("/items/new", "'itemType' not provided"),
+        ("/items/new?itemType=nope", "Invalid item type 'nope'"),
+        ("/items/new?itemType=attachment", "linkMode required for itemType=attachment"),
+        ("/items/new?itemType=attachment&linkMode=nope", "Invalid linkMode 'nope'"),
+        ("/items/new?itemType=annotation", "annotationType required for itemType=annotation"),
+        ("/items/new?itemType=annotation&annotationType=nope", "Invalid annotationType 'nope'"),
+        ("/itemTypeFields", "'itemType' not provided"),
+        ("/itemTypeFields?itemType=annotation", "Invalid item type 'annotation'"),
+        ("/itemTypeCreatorTypes?itemType=nope", "Invalid item type 'nope'"),
+    ):
+        assert public(path)[:2] == (400, message), (path, public(path)[:2])
+
 
 with subtest("groups endpoint returns empty upstream listing shapes"):
     machine.succeed(f"curl -sf {base}/users/1/groups {auth} | jq -e '. == []'")

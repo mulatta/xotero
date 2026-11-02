@@ -63,6 +63,20 @@ pub(crate) fn request_log_path(path: &str) -> &str {
     }
 }
 
+/// Schema mappings and item templates carry no library data and need no key.
+pub(crate) fn is_public_metadata_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/schema"
+            | "/itemTypes"
+            | "/itemFields"
+            | "/creatorFields"
+            | "/itemTypeFields"
+            | "/itemTypeCreatorTypes"
+            | "/items/new"
+    )
+}
+
 pub(crate) fn is_group_discovery_path(path: &str) -> bool {
     let segments: Vec<_> = path
         .split('/')

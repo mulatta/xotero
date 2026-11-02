@@ -4,6 +4,7 @@ pub(crate) mod fulltext;
 pub(crate) mod groups;
 pub(crate) mod keys;
 pub(crate) mod login;
+pub(crate) mod metadata;
 pub(crate) mod objects;
 pub(crate) mod settings;
 pub(crate) mod tags;

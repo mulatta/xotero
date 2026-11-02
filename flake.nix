@@ -52,8 +52,9 @@
       );
     in
     {
-      overlays.default = _final: prev: {
-        xotero = prev.callPackage ./nix/packages/xotero { };
+      overlays.default = final: prev: {
+        xotero = prev.callPackage ./nix/packages/xotero { inherit (final) zotero-schema; };
+        zotero-schema = prev.callPackage ./nix/packages/zotero-schema { };
       };
 
       nixosModules.xotero = ./nix/modules/nixos/xotero.nix;
@@ -61,8 +62,12 @@
 
       packages = eachSystem (
         { pkgs, ... }:
+        let
+          zotero-schema = pkgs.callPackage ./nix/packages/zotero-schema { };
+        in
         {
-          xotero = pkgs.callPackage ./nix/packages/xotero { };
+          inherit zotero-schema;
+          xotero = pkgs.callPackage ./nix/packages/xotero { inherit zotero-schema; };
         }
       );
 
@@ -87,6 +92,8 @@
         { pkgs, ... }:
         {
           default = pkgs.mkShell {
+            # The server embeds the pinned schema at compile time.
+            XOTERO_SCHEMA = "${pkgs.callPackage ./nix/packages/zotero-schema { }}/schema.json";
             packages = [
               pkgs.cargo
               pkgs.rustc

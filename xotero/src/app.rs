@@ -19,6 +19,10 @@ use crate::handlers::keys::{key_current, manage};
 use crate::handlers::login::{
     cancel_session, check_session, create_session, login_authorize, login_page,
 };
+use crate::handlers::metadata::{
+    creator_field_names, item_fields, item_type_creator_types, item_type_fields, item_types,
+    new_item, schema,
+};
 use crate::handlers::objects::{
     collection_items, collection_items_top, delete, items_get, items_top, items_trash, read, write,
 };
@@ -142,6 +146,13 @@ pub(crate) fn router(state: AppState) -> Router {
             get(check_session).delete(cancel_session),
         )
         .route("/login", get(login_page).post(login_authorize))
+        .route("/schema", get(schema))
+        .route("/itemTypes", get(item_types))
+        .route("/itemFields", get(item_fields))
+        .route("/creatorFields", get(creator_field_names))
+        .route("/itemTypeFields", get(item_type_fields))
+        .route("/itemTypeCreatorTypes", get(item_type_creator_types))
+        .route("/items/new", get(new_item))
         .route("/users/{id}/groups", get(groups))
         .route("/groups/{id}", get(group_get).head(group_get))
         .route(

@@ -15,8 +15,8 @@ use crate::domain::{LibraryAccess, RequestContext};
 use crate::error::server_error;
 use crate::http::access::request_access_scope;
 use crate::http::validation::{
-    is_attachment_permission_path, is_group_discovery_path, path_group_data_id, path_user_id,
-    request_log_path,
+    is_attachment_permission_path, is_group_discovery_path, is_public_metadata_path,
+    path_group_data_id, path_user_id, request_log_path,
 };
 use crate::{store, AppState};
 
@@ -193,6 +193,8 @@ pub(crate) async fn log_and_auth(
     let is_upload = method == axum::http::Method::POST
         && matches!(segments.as_slice(), ["", "uploads", token] if !token.is_empty());
     let is_bootstrap = is_upload
+        || (is_public_metadata_path(&path)
+            && matches!(method, axum::http::Method::GET | axum::http::Method::HEAD))
         || (path == "/login"
             && matches!(
                 method,

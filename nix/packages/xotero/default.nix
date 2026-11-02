@@ -2,6 +2,7 @@
   lib,
   rustPlatform,
   cacert,
+  zotero-schema,
 }:
 
 rustPlatform.buildRustPackage {
@@ -12,6 +13,9 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../../../Cargo.lock;
 
   buildAndTestSubdir = "xotero";
+
+  # Embedded at compile time so the served schema always matches the binary.
+  XOTERO_SCHEMA = "${zotero-schema}/schema.json";
 
   preCheck = ''
     export SSL_CERT_FILE=${cacert}/etc/ssl/certs/ca-bundle.crt

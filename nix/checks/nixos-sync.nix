@@ -58,6 +58,7 @@ testPkgs.testers.runNixOSTest {
       deadlock_timeout = "10ms";
     };
     environment.etc."xotero-checkpoint9-migrations".source = ../../xotero/migrations;
+    environment.etc."xotero-test/zotero-schema.json".source = "${testPkgs.zotero-schema}/schema.json";
 
     environment.systemPackages = [
       testPkgs.curl

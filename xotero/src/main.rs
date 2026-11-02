@@ -10,6 +10,7 @@ mod domain;
 mod error;
 mod handlers;
 mod http;
+mod metadata;
 mod query;
 mod s3;
 mod store;
@@ -56,6 +57,8 @@ async fn main() {
         }
     };
     let config = Arc::new(Config::from_env());
+    // Parse the embedded schema before serving so a bad pin fails at startup.
+    std::sync::LazyLock::force(&metadata::SCHEMA);
 
     if gc_once {
         // Maintenance runs beside the serving process: never migrate/bootstrap,
