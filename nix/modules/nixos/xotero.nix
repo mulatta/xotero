@@ -8,22 +8,21 @@
 let
   cfg = config.services.xotero;
 
-  # Fold the apiKeyFile shorthand into the keys set.
-  allKeys =
-    cfg.keys
-    // lib.optionalAttrs (cfg.apiKeyFile != null) {
-      default = {
-        file = cfg.apiKeyFile;
-        readOnly = false;
-      };
-    };
   credName = name: "key-${name}";
   # XOTERO_KEYS: "<role>:%d/<cred>" entries; %d is the systemd credentials dir.
   keyManifest = lib.concatStringsSep "," (
-    lib.mapAttrsToList (name: k: "${if k.readOnly then "ro" else "rw"}:%d/${credName name}") allKeys
+    lib.mapAttrsToList (name: k: "${if k.readOnly then "ro" else "rw"}:%d/${credName name}") cfg.keys
   );
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [
+      "services"
+      "xotero"
+      "apiKeyFile"
+    ] "Use services.xotero.keys, for example keys.default.file.")
+  ];
+
   options.services.xotero = {
     enable = lib.mkEnableOption "self-hosted Zotero sync server";
 
@@ -215,16 +214,6 @@ in
       '';
     };
 
-    apiKeyFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      description = ''
-        Shorthand for a single read/write key (equivalent to one `keys` entry).
-        Use `keys` instead when you also need a read-only key. Loaded as a systemd
-        credential, never placed in the store.
-      '';
-    };
-
     createLocalDatabase = lib.mkOption {
       type = lib.types.bool;
       default = true;
@@ -234,10 +223,6 @@ in
 
   config = lib.mkIf cfg.enable {
     assertions = [
-      {
-        assertion = cfg.apiKeyFile == null || !(cfg.keys ? default);
-        message = "services.xotero: apiKeyFile conflicts with keys.default.";
-      }
       {
         assertion = cfg.bootstrapOidcIssuer != "";
         message = "services.xotero.bootstrapOidcIssuer must be nonempty.";
@@ -300,7 +285,7 @@ in
         XOTERO_LOGIN_KDF_KEY_FILE = "%d/login-kdf-key";
         RUST_LOG = "info";
       }
-      // lib.optionalAttrs (allKeys != { }) {
+      // lib.optionalAttrs (cfg.keys != { }) {
         XOTERO_KEYS = keyManifest;
       };
 
@@ -308,7 +293,7 @@ in
         ExecStart = lib.getExe cfg.package;
         User = cfg.user;
         Group = cfg.user;
-        LoadCredential = (lib.mapAttrsToList (name: k: "${credName name}:${k.file}") allKeys) ++ [
+        LoadCredential = (lib.mapAttrsToList (name: k: "${credName name}:${k.file}") cfg.keys) ++ [
           "s3-access-key:${cfg.s3.accessKeyFile}"
           "s3-secret-key:${cfg.s3.secretKeyFile}"
           "login-kdf-key:${cfg.loginKdfKeyFile}"

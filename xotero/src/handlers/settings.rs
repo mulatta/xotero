@@ -46,7 +46,7 @@ pub(crate) async fn settings_write(
 ) -> Response {
     let expected = match precondition(&headers) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(rejection) => return rejection.into_response(),
     };
     let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| json!({}));
     match store::write_settings(
@@ -82,7 +82,7 @@ pub(crate) async fn settings_delete(
 ) -> Response {
     let expected = match precondition(&headers) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(rejection) => return rejection.into_response(),
     };
     let keys = csv_of(&params, "settingKey");
     match store::delete_settings(

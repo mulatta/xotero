@@ -62,7 +62,7 @@ pub(crate) async fn fulltext_write(
     };
     let expected = match precondition(&headers) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(rejection) => return rejection.into_response(),
     };
     match store::write_fulltext(
         &state.pool,
