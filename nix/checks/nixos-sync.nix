@@ -11,7 +11,10 @@ testPkgs.testers.runNixOSTest {
   name = "xotero-sync";
 
   nodes.machine = {
-    imports = [ self.nixosModules.xotero ];
+    imports = [
+      self.nixosModules.xotero
+      (import ./aws-client.nix { pkgs = testPkgs; })
+    ];
 
     services.xotero = {
       enable = true;
@@ -64,8 +67,6 @@ testPkgs.testers.runNixOSTest {
       (testPkgs.python3.withPackages (ps: [ ps.psycopg ]))
       testPkgs.unzip
       testPkgs.zip
-      # `mc` creates the bucket before the upload subtest.
-      testPkgs.minio-client
     ];
   };
 

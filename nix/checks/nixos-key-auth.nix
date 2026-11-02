@@ -45,7 +45,10 @@ testPkgs.testers.runNixOSTest {
   name = "xotero-key-auth";
 
   nodes.machine = {
-    imports = [ self.nixosModules.xotero ];
+    imports = [
+      self.nixosModules.xotero
+      (import ./aws-client.nix { pkgs = testPkgs; })
+    ];
 
     services.xotero = {
       enable = true;
@@ -93,7 +96,6 @@ testPkgs.testers.runNixOSTest {
     environment.systemPackages = [
       testPkgs.curl
       testPkgs.jq
-      testPkgs.minio-client
       testPkgs.postgresql
       testPkgs.python3
       testPkgs.sqlx-cli

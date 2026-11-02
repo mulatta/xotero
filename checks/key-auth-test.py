@@ -322,8 +322,7 @@ print("keyless stable-KDF replay passed")
 
 machine.wait_for_unit("postgresql.service")
 machine.wait_for_unit("rustfs.service")
-machine.succeed("mc alias set s3 http://localhost:9000 rustfsadmin rustfsadmin")
-machine.succeed("mc mb s3/zotero")
+machine.succeed("aws s3 mb s3://zotero")
 
 with subtest("checkpoint11 populated v13 shared bare upgrade"):
     # Independent supported history, real storage and real HTTP downloads.
@@ -368,7 +367,7 @@ for library, user in [(22, 202), (23, 203)]:
                     '{{"key":"SHAREB22","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"shared.bin","title":"preserved"}}');
             insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version)
             values ({library},'SHAREB22','{digest}','{digest}','libraries/{library}/SHAREB22','shared.bin',{len(payload)},1700000000011,11)""")
-subprocess.run(["mc", "pipe", "s3/zotero/SHAREB22"], input=payload, check=True)
+subprocess.run(["aws", "s3", "cp", "-", "s3://zotero/SHAREB22"], input=payload, check=True)
 for key, pointer in [
     ("PREFXK22", "libraries/22/PREFXK22"),
     ("WRNGFX22", "libraries/22/WRNGFX22"),
@@ -385,8 +384,8 @@ for key, pointer in [
             insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version)
             values (22,'{key}','{digest}','{digest}','{pointer}','preserved.bin',{len(payload)},1700000000011,11)""")
 for key in ["PREFXK22", "WRNGFX22"]:
-    subprocess.run(["mc", "pipe", "s3/zotero/" + key], input=payload, check=True)
-    subprocess.run(["mc", "pipe", "s3/zotero/libraries/22/" + key],
+    subprocess.run(["aws", "s3", "cp", "-", "s3://zotero/" + key], input=payload, check=True)
+    subprocess.run(["aws", "s3", "cp", "-", "s3://zotero/libraries/22/" + key],
                    input=payload if key == "PREFXK22" else b"x" * len(payload), check=True)
 # More than one descriptor page exercises whole-pass lock acquisition, rather
 # than accidentally proving only a single-page ordering.
@@ -398,7 +397,7 @@ for key in page_keys:
                     '{{"key":"{key}","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"page.bin"}}');
             insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version)
             values (22,'{key}','{digest}','{digest}','libraries/22/{key}','page.bin',{len(payload)},1700000000011,11)""")
-    subprocess.run(["mc","pipe","s3/zotero/libraries/22/"+key],input=payload,check=True)
+    subprocess.run(["aws", "s3", "cp", "-", "s3://zotero/libraries/22/"+key],input=payload,check=True)
 archive = io.BytesIO()
 with zipfile.ZipFile(archive,"w",compression=zipfile.ZIP_DEFLATED) as zipped:
     member = zipfile.ZipInfo("shared.bin",date_time=(2026,1,1,0,0,0))
@@ -411,7 +410,7 @@ sql(f"""insert into object (library_id,kind,key,version,data)
                 '{{"key":"CMPRSS22","version":11,"itemType":"attachment","linkMode":"imported_file","filename":"shared.bin"}}');
         insert into file (library_id,item_key,md5,blob_md5,blob_key,filename,filesize,mtime,version,compressed)
         values (22,'CMPRSS22','{digest}','{compressed_hash}','libraries/22/CMPRSS22','shared.bin',{len(compressed_bytes)},1700000000011,11,true)""")
-subprocess.run(["mc","pipe","s3/zotero/CMPRSS22"],input=compressed_bytes,check=True)
+subprocess.run(["aws", "s3", "cp", "-", "s3://zotero/CMPRSS22"],input=compressed_bytes,check=True)
 # Untouched compressed candidate has distinct logical and byte integrity domains.
 sql("update file set md5 = repeat('a',32), compressed = true where item_key = 'CANDBL22'")
 sql("""insert into setting (library_id,key,version,value) values (22,'historical',13,'{"preserved":true}');
@@ -514,8 +513,8 @@ try:
     assert sql("select count(*) from legacy_blob_reconciliation") == "0"
     assert sql("select count(*) from blob_retirements where blob_key='libraries/22/PREFXK22'") == "0"
     assert sql("select count(*) from blob_retirements where blob_key='libraries/22/WRNGFX22' and state='queued' and not_before > clock_timestamp()") == "1"
-    assert subprocess.check_output(["mc","cat","s3/zotero/libraries/22/WRNGFX22"]) == b"x" * len(payload)
-    assert subprocess.check_output(["mc","cat","s3/zotero/SHAREB22"]) == payload
+    assert subprocess.check_output(["aws", "s3", "cp", "s3://zotero/libraries/22/WRNGFX22", "-"]) == b"x" * len(payload)
+    assert subprocess.check_output(["aws", "s3", "cp", "s3://zotero/SHAREB22", "-"]) == payload
     print("CHECKPOINT11_SHARED_BARE_HTTP=" + json.dumps({"libraries": [22,23], "bytes": len(payload), "md5": digest}), flush=True)
     print("CHECKPOINT11_PRESERVATION=" + json.dumps({"families": sorted(snapshot), "initial_status":302, "prefixed_kept":True, "wrong_prefix_retired_not_deleted":True, "untouched_classes":4, "candidate_rows":38, "descriptor_pages":2, "valid_prefix_with_bare_tombstone":True, "compressed_blob_md5_not_logical":True}), flush=True)
 finally:
@@ -801,7 +800,7 @@ psql(
        values (22, 'OLDLIB22', '27b525e7d8fdb7db5b821c3a0bf7c60e',
                'old.pdf', 5, 1700000000001, 0)"""
 )
-machine.succeed("printf old22 | mc pipe s3/zotero/libraries/22/OLDLIB22")
+machine.succeed("printf old22 | aws s3 cp - s3://zotero/libraries/22/OLDLIB22")
 psql(
     """insert into fulltext
        (library_id, item_key, content, indexed_chars, total_chars,

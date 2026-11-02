@@ -61,8 +61,7 @@ machine.wait_for_unit("xotero.service")
 machine.wait_for_open_port(8189)
 
 # Create the attachment bucket in the S3 store before any upload.
-machine.succeed("mc alias set s3 http://localhost:9000 rustfsadmin rustfsadmin")
-machine.succeed("mc mb s3/zotero")
+machine.succeed("aws s3 mb s3://zotero")
 
 with subtest("the module deploys a working service backed by postgres"):
     assert http_code(f"{base}/keys/current {auth}") == "200"
@@ -509,7 +508,7 @@ with subtest("an unregistered replacement cannot change the live attachment"):
         f"select state = 'queued' and not_before > clock_timestamp() "
         f"from blob_retirements where blob_key = '{displaced_blob}'"
     ) == "t"
-    machine.succeed(f"mc stat 's3/zotero/{displaced_blob}'")
+    machine.succeed(f"aws s3api head-object --bucket zotero --key '{displaced_blob}'")
 
 with subtest("expired upload candidates are deleted before their rows"):
     world_md5 = "7d793037a0760186574b0282f2f435e7"
@@ -527,7 +526,7 @@ with subtest("expired upload candidates are deleted before their rows"):
         """select blob_key from pending_uploads
            where library_id = 1 and item_key = 'ATTACH22' and state = 'uploaded'"""
     )
-    machine.succeed(f"mc stat 's3/zotero/{expired_blob}'")
+    machine.succeed(f"aws s3api head-object --bucket zotero --key '{expired_blob}'")
     psql(
         """update pending_uploads
            set created_at = now() - interval '2 hours',
@@ -536,7 +535,7 @@ with subtest("expired upload candidates are deleted before their rows"):
     )
     restart_xotero()
     assert psql("select count(*) from pending_uploads where expires_at <> 'infinity'::timestamptz") == "0"
-    machine.fail(f"mc stat 's3/zotero/{expired_blob}'")
+    machine.fail(f"aws s3api head-object --bucket zotero --key '{expired_blob}'")
     assert_attachment("ATTACH22", world_md5, "world", "expired-candidate-cleanup")
     psql(
         """insert into pending_uploads (
@@ -1265,7 +1264,7 @@ with subtest("storage SDK round-trips small and multipart encoded keys"):
         machine.succeed(f"cmp {payload} /tmp/sdk-download")
         print(f"SDK roundtrip {item} size={size} md5={digest} blob={blob}")
         print(upload_response, registration)
-        # Exercise Storage.delete, not mc's independent delete implementation.
+        # Exercise Storage.delete, not the AWS CLI's independent delete implementation.
         # A new abandoned candidate uses an encoded key and the same payload size.
         cleanup_token = machine.succeed(
             f"curl -sf -X POST {base}/users/1/items/{item}/file {auth} "
@@ -1282,7 +1281,7 @@ with subtest("storage SDK round-trips small and multipart encoded keys"):
             f"curl -sf --max-time 60 -X POST {base}/uploads/{cleanup_token} "
             f"--data-binary @{payload}"
         )
-        machine.succeed(f"mc stat 's3/zotero/{cleanup_blob}'")
+        machine.succeed(f"aws s3api head-object --bucket zotero --key '{cleanup_blob}'")
         psql(
             "update pending_uploads set created_at = now() - interval '2 hours', "
             "expires_at = now() - interval '1 hour' "
@@ -1290,7 +1289,7 @@ with subtest("storage SDK round-trips small and multipart encoded keys"):
         )
         restart_xotero()
         assert psql(f"select count(*) from pending_uploads where item_key = '{item}'") == "0"
-        machine.fail(f"mc stat 's3/zotero/{cleanup_blob}'")
+        machine.fail(f"aws s3api head-object --bucket zotero --key '{cleanup_blob}'")
 
 with subtest("provider failures never publish or mark uploads complete"):
     # Run actual Storage through the live upload/registration handlers. This
@@ -2339,7 +2338,7 @@ def restart():
         pass
 
 def bytes_exist(blob):
-    return subprocess.run(["mc", "stat", "s3/zotero/" + blob], capture_output=True).returncode == 0
+    return subprocess.run(["aws", "s3api", "head-object", "--bucket", "zotero", "--key", blob], capture_output=True).returncode == 0
 
 def registration_state(item):
     return scalar("select jsonb_build_object('library', (select version from library where id=1), "
@@ -2702,7 +2701,7 @@ try:
         # Stable fixture keys make distinct advisory IDs deterministic, instead
         # of assuming randomly allocated upload keys never hash-collide.
         stable_blob = "checkpoint10-batch-" + key
-        subprocess.run(["mc", "mv", "s3/zotero/" + blob, "s3/zotero/" + stable_blob], check=True)
+        subprocess.run(["aws", "s3", "mv", "s3://zotero/" + blob, "s3://zotero/" + stable_blob], check=True)
         sql("update file set blob_key=%s where library_id=1 and item_key=%s", (stable_blob, key))
     before_rows = sql("select item_key,blob_key,version from file where item_key=any(%s) order by item_key",
                       (["RTATMA22", "RTATMB22"],)).fetchall()
