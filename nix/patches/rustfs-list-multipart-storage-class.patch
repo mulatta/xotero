@@ -1,7 +1,7 @@
 diff --git a/crates/ecstore/src/set_disk/ops/multipart.rs b/crates/ecstore/src/set_disk/ops/multipart.rs
 --- a/crates/ecstore/src/set_disk/ops/multipart.rs
 +++ b/crates/ecstore/src/set_disk/ops/multipart.rs
-@@ -1398,6 +1398,7 @@
+@@ -1588,6 +1588,7 @@ impl SetDisks {
                          object,
                          upload_id: runtime_sources::deployment_upload_id(raw_upload_id),
                          initiated,
@@ -12,7 +12,7 @@ diff --git a/crates/ecstore/src/set_disk/ops/multipart.rs b/crates/ecstore/src/s
 diff --git a/rustfs/src/storage/s3_api/multipart.rs b/rustfs/src/storage/s3_api/multipart.rs
 --- a/rustfs/src/storage/s3_api/multipart.rs
 +++ b/rustfs/src/storage/s3_api/multipart.rs
-@@ -191,6 +191,14 @@
+@@ -194,6 +194,14 @@ pub(crate) fn build_list_multipart_uploads_output(
                      initiated: u.initiated.map(Timestamp::from),
                      owner: Some(owner.clone()),
                      initiator: Some(initiator.clone()),
@@ -27,8 +27,8 @@ diff --git a/rustfs/src/storage/s3_api/multipart.rs b/rustfs/src/storage/s3_api/
                      ..Default::default()
                  })
                  .collect(),
-@@ -452,6 +460,37 @@
-         );
+@@ -525,6 +533,38 @@ mod tests {
+         assert!(output.common_prefixes.unwrap().is_empty());
      }
  
 +    #[test]
@@ -53,6 +53,7 @@ diff --git a/rustfs/src/storage/s3_api/multipart.rs b/rustfs/src/storage/s3_api/
 +                    uploads: vec![upload],
 +                    ..Default::default()
 +                },
++                None,
 +            );
 +            let xml = String::from_utf8(crate::storage::storage_api::serialize(&output).unwrap()).unwrap();
 +            assert!(
