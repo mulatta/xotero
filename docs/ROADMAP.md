@@ -245,7 +245,7 @@ Exit criteria for 1.0:
 
 ## Current work
 
-Tasks 1 to 20 are merged.
+Tasks 1 to 21 are merged.
 
 ### Wave D: browser API semantics
 
@@ -253,7 +253,7 @@ Tasks 1 to 20 are merged.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L` proves string tombstones and unchanged item deletion shapes.
 - [x] 20. Resolve identity sequence without hard-coded name
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-key-auth -L`; generated IDs remain positive/collision-free.
-- [ ] 21. Serve pinned metadata and item templates
+- [x] 21. Serve pinned metadata and item templates
   - Acceptance: `nix build .#checks.x86_64-linux.api-contracts .#checks.x86_64-linux.nixos-sync -L`.
 - [ ] 22. Complete listing envelopes, paging and query contracts
   - Also add `/keys/sessions` and `/login` to the `checks/contracts` inventory.
