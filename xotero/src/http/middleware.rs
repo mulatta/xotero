@@ -144,6 +144,12 @@ async fn authenticate_request(
 /// without the configured key except bootstrap endpoints. Query strings, form
 /// values, and content never enter logs because they can hold capability tokens
 /// and private library data.
+/// Unmatched paths skip the auth layer, so log them here.
+pub(crate) async fn not_found(method: axum::http::Method, uri: axum::http::Uri) -> Response {
+    tracing::info!(%method, path = %request_log_path(uri.path()), "request");
+    (StatusCode::NOT_FOUND, "Not found").into_response()
+}
+
 pub(crate) async fn log_and_auth(
     State(state): State<AppState>,
     req: Request,

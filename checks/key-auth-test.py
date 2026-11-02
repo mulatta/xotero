@@ -1106,7 +1106,8 @@ with subtest("attachment permission routes require exact paths and scoped grants
     try:
         for path, method, expected in (
             ("/users/202/items/PRIVATCH/file", "GET", 403),
-            ("/users/202/items/PRIVATCH/file/view/url", "GET", 403),
+            # Not implemented yet, so routing answers 404 before any key check.
+            ("/users/202/items/PRIVATCH/file/view/url", "GET", 404),
             ("/users/202/items/PRIVATCH/filesuffix", "GET", 404),
             ("/users/202/items/PRIVATCH/file/view", "GET", 404),
             ("/users/202/items/PRIVATCH/file/view/url/extra", "GET", 404),
@@ -2272,8 +2273,9 @@ with subtest("authorization denies incomplete bodies without continuation"):
     for method in ("POST", "PUT", "PATCH", "DELETE"):
         assert incomplete_body_status("/users/202/items", bob_ro, method) == "403"
     assert incomplete_body_status("/uploads/unknown-capability") == "400"
+    # Lookalikes match no route, so the fallback answers without reading a body.
     for path in ("/uploadsuffix/token", "/uploads/token/extra", "/keys/sessionssuffix"):
-        assert incomplete_body_status(path) == "403"
+        assert incomplete_body_status(path) == "404"
     assert body_admission_snapshot() == before
 
 with subtest("disabled users fail closed for DB and recovery keys"):

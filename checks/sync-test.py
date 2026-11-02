@@ -317,6 +317,13 @@ with subtest("public metadata and templates follow the pinned schema"):
     for key, expected in (("testtoken", "200"), ("readonlytoken", "200"), ("nope", "403")):
         assert http_code(f"-H 'Zotero-API-Key: {key}' {base}/itemTypes") == expected, key
 
+    # dataserver routes before it authenticates, so an unknown path is 404
+    # whatever the key, while a known data route still needs one.
+    for args in ("", " -H 'Zotero-API-Key: nope'", f" {auth}"):
+        assert http_code(f"{base}/itemTypez{args}") == "404", args
+        assert http_code(f"{base}/users/1/nothing{args}") == "404", args
+    assert http_code(f"{base}/users/1/items") == "403"
+
     assert public("/itemTypeCreatorTypes?itemType=note")[:2] == (200, "[]")
     for path, message in (
         ("/items/new", "'itemType' not provided"),

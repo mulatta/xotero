@@ -28,7 +28,7 @@ use crate::handlers::objects::{
 };
 use crate::handlers::settings::{deleted, settings_delete, settings_read, settings_write};
 use crate::handlers::tags::{tags_delete, tags_get};
-use crate::http::middleware::{log_and_auth, MAX_BODY};
+use crate::http::middleware::{log_and_auth, not_found, MAX_BODY};
 use crate::s3;
 
 #[derive(Clone)]
@@ -273,8 +273,11 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/users/{id}/deleted", get(deleted))
         // Attachment uploads exceed the default 2 MiB extractor limit; raise it
         // to MAX_BODY; middleware and the capability handler enforce body bounds.
+        // Route before authenticating, as dataserver does: an unknown path is
+        // 404 whatever the key, and only matched routes reach the auth layer.
+        .route_layer(middleware::from_fn_with_state(state.clone(), log_and_auth))
+        .fallback(not_found)
         .layer(DefaultBodyLimit::max(MAX_BODY))
-        .layer(middleware::from_fn_with_state(state.clone(), log_and_auth))
         .layer(middleware::map_response(stamp_schema_version))
         .with_state(state)
 }
@@ -354,7 +357,7 @@ mod body_tests {
     }
 
     #[tokio::test]
-    async fn public_prefix_lookalikes_require_authentication_before_body_poll() {
+    async fn public_prefix_lookalikes_are_rejected_before_body_poll() {
         for path in [
             "/uploadsuffix/token",
             "/keys/sessionssuffix",
@@ -373,7 +376,8 @@ mod body_tests {
             .await
             .expect("lookalike route waited for body")
             .unwrap();
-            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{path}");
+            // No route matches, so the fallback answers without reading the body.
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
             assert_eq!(polls.load(Ordering::SeqCst), 0, "{path}");
         }
     }
