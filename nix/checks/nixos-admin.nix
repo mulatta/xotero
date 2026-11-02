@@ -59,6 +59,8 @@ testPkgs.testers.runNixOSTest {
     environment.etc."xotero-test/v20-migrations".source = v20Migrations;
     environment.etc."xotero-test/current-migrations".source = ../../xotero/migrations;
     environment.etc."xotero-test/kdf".text = "0123456789abcdef0123456789abcdef";
+    environment.etc."xotero-test/recovery-key".text = "fixture-recovery";
+    environment.etc."xotero-test/admin-recovery-key".text = "fixture-admin-recovery";
     environment.systemPackages = [
       testPkgs.xotero
       testPkgs.sqlx-cli

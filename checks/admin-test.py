@@ -150,7 +150,7 @@ try:
     receipts["one_shot"] = True
 
     recovery = database("recovery")
-    start(recovery, opt_in=False, XOTERO_API_KEY="fixture-recovery")
+    start(recovery, opt_in=False, XOTERO_KEYS="rw:/etc/xotero-test/recovery-key")
     assert reachable(recovery) == 0
     assert sql(recovery, "select count(*) from bootstrap_state where name='instance-admin'") == [(0,)]
     start(recovery)
@@ -695,7 +695,7 @@ try:
         "XOTERO_LOGIN_KDF_KEY_FILE":"/etc/xotero-test/kdf",
         "XOTERO_S3_ENDPOINT":"http://127.0.0.1:9000",
         "XOTERO_S3_ACCESS_KEY":"rustfsadmin","XOTERO_S3_SECRET_KEY":"rustfsadmin",
-        "XOTERO_API_KEY":"fixture-admin-recovery",
+        "XOTERO_KEYS":"rw:/etc/xotero-test/admin-recovery-key",
     }
     server=subprocess.Popen(["xotero"],env=environment,stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT,bufsize=0)

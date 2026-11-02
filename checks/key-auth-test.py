@@ -2131,7 +2131,6 @@ with tempfile.TemporaryDirectory(prefix="xotero-config-") as directory:
         "XOTERO_LOGIN_KDF_KEY_FILE": str(root / "kdf"),
         "XOTERO_DATABASE_URL": "postgres://localhost:1/not-reached",
         "XOTERO_BIND": "127.0.0.1:18194",
-        "XOTERO_API_KEY": "LOWER_SOURCE_SECRET_MARKER_59",
     }
     manifests = [
         "", ",", f",rw:{rw}", f"rw:{rw},", f"rw:{rw},,ro:{ro}",
@@ -2143,14 +2142,12 @@ with tempfile.TemporaryDirectory(prefix="xotero-config-") as directory:
     )]
     cases = [("manifest-" + str(index), {"XOTERO_KEYS": value})
              for index, value in enumerate(manifests)]
-    cases += [("file-" + name, {"XOTERO_API_KEY_FILE": str(root / name)})
-              for name in ("empty", "blank", "multiline", "bad-utf8", "missing")]
-    cases += [("file-path-empty", {"XOTERO_API_KEY_FILE": ""}),
-              ("token-empty", {"XOTERO_API_KEY": ""}),
-              ("token-blank", {"XOTERO_API_KEY": " \t\r\n"})]
-    cases += [("unicode-" + name, {name: "\udcff"}) for name in (
-        "XOTERO_KEYS", "XOTERO_API_KEY_FILE", "XOTERO_API_KEY"
-    )]
+    # Removed single-key sources fail even when their value would be valid.
+    cases += [("removed-file", {"XOTERO_API_KEY_FILE": rw}),
+              ("removed-token", {"XOTERO_API_KEY": "LOWER_SOURCE_SECRET_MARKER_59"}),
+              ("removed-beside-manifest", {"XOTERO_KEYS": f"ro:{ro}",
+                                           "XOTERO_API_KEY": "LOWER_SOURCE_SECRET_MARKER_59"})]
+    cases += [("unicode-XOTERO_KEYS", {"XOTERO_KEYS": "\udcff"})]
     secrets = list(contents.values()) + [
         b"LOWER_SOURCE_SECRET_MARKER_59", b"MANIFEST_SECRET_MARKER_83",
     ]
@@ -2166,8 +2163,7 @@ with tempfile.TemporaryDirectory(prefix="xotero-config-") as directory:
         print("config-rejection " + label + " exit=" + str(result.returncode))
     for name in ("missing", "empty", "short"):
         (root / "short").write_bytes(b"KDF_SHORT_SECRET_31_BYTES_1234567"[:31])
-        env = {key: value for key, value in valid.items()
-               if key != "XOTERO_API_KEY"}
+        env = dict(valid)
         if name == "missing":
             del env["XOTERO_LOGIN_KDF_KEY_FILE"]
         else:
@@ -2697,7 +2693,7 @@ with subtest("explicit recovery roles and pending digest authorization survive r
     machine.succeed("mkdir -p /run/systemd/system/xotero.service.d")
     try:
         for mode, setting in (
-            ("removed", "UnsetEnvironment=XOTERO_KEYS XOTERO_API_KEY_FILE XOTERO_API_KEY"),
+            ("removed", "UnsetEnvironment=XOTERO_KEYS"),
             ("restricted", "Environment=XOTERO_KEYS=ro:%d/key-recovery"),
         ):
             machine.succeed(

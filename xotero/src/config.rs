@@ -187,9 +187,6 @@ where
 /// Build the digest→access map from secret files. `XOTERO_KEYS` is a
 /// comma-separated list of `<role>:<path>` entries (`rw`/`ro`), each path a
 /// single-line token (a sops-nix secret exposed via systemd LoadCredential).
-/// Falls back to a single read/write key from `XOTERO_API_KEY_FILE` /
-/// `XOTERO_API_KEY` for simple deployments. Prefer files over the env, which is
-/// visible in /proc.
 fn load_keys() -> HashMap<[u8; 32], Permissions> {
     load_keys_from(
         |name| std::env::var_os(name),
@@ -224,6 +221,11 @@ fn load_keys_from(
         }
         Ok(token.to_owned())
     };
+    // The removed single-key sources fail startup so a deployment that still sets
+    // them notices instead of silently losing its recovery credential.
+    if env("XOTERO_API_KEY_FILE").is_some() || env("XOTERO_API_KEY").is_some() {
+        return Err("XOTERO_API_KEY_FILE and XOTERO_API_KEY are removed; use XOTERO_KEYS");
+    }
     let mut keys = HashMap::new();
     let mut insert = |token: &str, write| {
         if token.trim().is_empty() {
@@ -250,12 +252,6 @@ fn load_keys_from(
             };
             insert(&read_token(path)?, write)?;
         }
-    } else if let Some(path) = env("XOTERO_API_KEY_FILE") {
-        let path = path.to_str().ok_or("XOTERO_API_KEY_FILE must be Unicode")?;
-        insert(&read_token(path)?, true)?;
-    } else if let Some(token) = env("XOTERO_API_KEY") {
-        let token = token.to_str().ok_or("XOTERO_API_KEY must be Unicode")?;
-        insert(token, true)?;
     }
     Ok(keys)
 }
@@ -407,10 +403,7 @@ mod tests {
         ] {
             positive_env::<usize>(name, 1);
         }
-        if std::env::var_os("XOTERO_KEYS").is_none()
-            && std::env::var_os("XOTERO_API_KEY_FILE").is_none()
-            && std::env::var_os("XOTERO_API_KEY").is_none()
-        {
+        if std::env::var_os("XOTERO_KEYS").is_none() {
             assert!(keys.is_empty());
         }
     }
@@ -444,13 +437,11 @@ mod tests {
     }
 
     #[test]
-    fn explicit_empty_sources_are_rejected() {
-        for name in ["XOTERO_KEYS", "XOTERO_API_KEY_FILE", "XOTERO_API_KEY"] {
-            // Given an explicitly empty source, when loading it.
-            let result = key_loader_child(Some((name, std::ffi::OsStr::new(""))));
-            // Then it cannot silently become an empty or development credential.
-            assert!(!result.status.success(), "{name} accepted empty input");
-        }
+    fn explicit_empty_manifest_is_rejected() {
+        // Given an explicitly empty manifest, when loading it.
+        let result = key_loader_child(Some(("XOTERO_KEYS", std::ffi::OsStr::new(""))));
+        // Then it cannot silently become an empty or development credential.
+        assert!(!result.status.success(), "empty manifest accepted");
     }
 
     #[test]
@@ -475,14 +466,12 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn non_unicode_selected_sources_are_rejected() {
+    fn non_unicode_manifest_is_rejected() {
         use std::os::unix::ffi::OsStrExt;
-        for name in ["XOTERO_KEYS", "XOTERO_API_KEY_FILE", "XOTERO_API_KEY"] {
-            // Given non-Unicode environment bytes, when loading selected source.
-            let result = key_loader_child(Some((name, std::ffi::OsStr::from_bytes(b"\xff"))));
-            // Then invalid bytes cannot select a fallback credential.
-            assert!(!result.status.success(), "{name} ignored invalid Unicode");
-        }
+        // Given non-Unicode environment bytes, when loading the manifest.
+        let result = key_loader_child(Some(("XOTERO_KEYS", std::ffi::OsStr::from_bytes(b"\xff"))));
+        // Then invalid bytes cannot become a credential.
+        assert!(!result.status.success(), "manifest ignored invalid Unicode");
     }
 
     fn parse(
@@ -548,47 +537,17 @@ mod tests {
     }
 
     #[test]
-    fn selected_source_never_falls_back() {
+    fn removed_single_key_sources_are_rejected() {
         for (manifest, file, token) in [
-            (Some(""), Some("rw"), Some("fallback")),
-            (Some("admin:rw"), Some("rw"), Some("fallback")),
-            (None, Some("missing"), Some("fallback")),
-            (None, Some("blank"), Some("fallback")),
-            (None, Some("multiline"), Some("fallback")),
-            (None, None, Some(" \t\r\n")),
+            (None, Some("rw"), None),
+            (None, None, Some("token")),
+            (Some("ro:ro"), Some("rw"), None),
+            (Some("ro:ro"), None, Some("token")),
         ] {
-            // Given invalid higher-priority input, when another source is valid.
+            // Given a removed source, even beside a valid manifest.
             let result = parse(manifest, file, token);
-            // Then invalid selection fails rather than granting fallback authority.
+            // Then startup fails instead of ignoring the configured credential.
             assert!(result.is_err());
         }
-    }
-
-    #[test]
-    fn valid_precedence_and_raw_token_bytes_are_preserved() {
-        // Given distinct values at each priority, when loading selected input.
-        let manifest = parse(Some("ro:ro"), Some("rw"), Some("fallback")).unwrap();
-        let file = parse(None, Some("rw"), Some("fallback")).unwrap();
-        let raw = parse(None, None, Some(" raw token ")).unwrap();
-        // Then each source authenticates only its own exact credential bytes.
-        assert_eq!(manifest.len(), 1);
-        assert_eq!(file.len(), 1);
-        assert_eq!(raw.len(), 1);
-        assert_eq!(
-            recovery_permissions(&manifest, &Sha256::digest(b"RECOVERY_RO_MARKER_628")),
-            Some(Permissions::recovery(false))
-        );
-        assert_eq!(
-            recovery_permissions(&file, &Sha256::digest(b"RECOVERY_RW_MARKER_417")),
-            Some(Permissions::recovery(true))
-        );
-        assert_eq!(
-            recovery_permissions(&raw, &Sha256::digest(b" raw token ")),
-            Some(Permissions::recovery(true))
-        );
-        assert_eq!(
-            recovery_permissions(&raw, &Sha256::digest(b"raw token")),
-            None
-        );
     }
 }
