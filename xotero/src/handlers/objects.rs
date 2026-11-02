@@ -294,7 +294,7 @@ pub(crate) async fn write(
     }
     let expected = match precondition(&headers) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(rejection) => return rejection.into_response(),
     };
     let access = request_access();
     match store::write(
@@ -338,7 +338,7 @@ pub(crate) async fn delete(
 ) -> Response {
     let expected = match precondition(&headers) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(rejection) => return rejection.into_response(),
     };
     let keys = csv_of(&params, &format!("{kind}Key"));
     let access = request_access();

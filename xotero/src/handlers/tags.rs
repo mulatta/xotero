@@ -36,7 +36,7 @@ pub(crate) async fn tags_delete(
 ) -> Response {
     let expected = match precondition(&headers) {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(rejection) => return rejection.into_response(),
     };
     let tags: Vec<String> = params
         .get("tags")

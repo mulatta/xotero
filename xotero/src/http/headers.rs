@@ -61,17 +61,21 @@ pub(crate) fn if_unmodified(headers: &HeaderMap) -> Option<i64> {
 /// Without it the version guard is bypassed (a missing/garbage header would let
 /// the write commit unconditionally), so reject it with `428 Precondition
 /// Required` — the same contract the file endpoints use.
-// The Err is a full Response (the idiomatic axum guard shape); it's only built
-// on the rare rejection path, so the large-Err size is fine.
-#[allow(clippy::result_large_err)]
-pub(crate) fn precondition(headers: &HeaderMap) -> Result<i64, Response> {
-    if_unmodified(headers).ok_or_else(|| {
+pub(crate) fn precondition(headers: &HeaderMap) -> Result<i64, PreconditionRequired> {
+    if_unmodified(headers).ok_or(PreconditionRequired)
+}
+
+/// Rejection for a mutating write without a usable version precondition.
+pub(crate) struct PreconditionRequired;
+
+impl IntoResponse for PreconditionRequired {
+    fn into_response(self) -> Response {
         (
             StatusCode::PRECONDITION_REQUIRED,
             "If-Unmodified-Since-Version required",
         )
             .into_response()
-    })
+    }
 }
 
 pub(crate) fn conflict(current: i64) -> Response {
