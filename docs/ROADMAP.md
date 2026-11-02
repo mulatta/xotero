@@ -245,7 +245,7 @@ Exit criteria for 1.0:
 
 ## Current work
 
-Tasks 1 to 6 are merged. Tasks 7 to 18 are implemented and await review.
+Tasks 1 to 12 are merged. Tasks 13 to 20 are implemented and await review.
 
 ### Wave D: browser API semantics
 
@@ -322,14 +322,12 @@ Tasks 1 to 6 are merged. Tasks 7 to 18 are implemented and await review.
 - [ ] Document backup-before-upgrade and rollback-by-restore procedures.
 - [ ] Add an explicit `xotero migrate` operational path. Plan Task 33.
 - [ ] Audit `IF NOT EXISTS` migration statements that can conceal schema drift.
-- [ ] Update stale migration comments, including the old filesystem description
-  for S3-backed file bytes.
 
 ### P1: HTTP and compatibility structure
 
 - [ ] Centralize Zotero error, version-header, pagination, and conditional-write
   responses so handlers cannot silently omit contract details.
-- [ ] Separate current verified behavior in `xotero/SPEC.md` from target support.
+- [ ] Separate current verified behavior in `docs/API.md` from target support.
 - [ ] Inventory API-version, schema-version, content-negotiation, conditional
   request, pagination, and output-format edge cases. Plan Task 22.
 - [ ] Add a trusted-proxy configuration. The server now requires a loopback bind,
@@ -343,9 +341,12 @@ Tasks 1 to 6 are merged. Tasks 7 to 18 are implemented and await review.
   storage semantics. Plan Task 36.
 - [ ] Configure database pool, request, S3, and shutdown timeouts. Upload
   timeouts exist. Pool and shutdown timeouts do not. Plan Task 35.
-- [ ] Add request concurrency limits. Upload limits exist. _unmerged_
+- [ ] Add request concurrency limits. Upload limits exist.
 - [ ] Exercise backup and restore for metadata, full text, and attachment bytes.
   Plan Task 37.
+- [ ] Bound retention of pending uploads with an unknown remote outcome. Each
+  interrupted upload keeps a row forever, and cleanup retries its object
+  deletion every minute. The bound must outlast any late remote write.
 
 ### P1: test and quality gates
 
@@ -355,8 +356,6 @@ Tasks 1 to 6 are merged. Tasks 7 to 18 are implemented and await review.
 - [ ] Add backup and restore tests. Plan Task 37.
 - [ ] Run Clippy and dependency advisory/license checks in CI. Formatting, unit
   tests, and individual NixOS checks already run.
-- [ ] Replace `minio-client` in `nixos-sync`. The current nixpkgs update refuses
-  to evaluate it as insecure, which blocks dependency PR #23.
 
 ### P2: dependencies and abstractions
 
