@@ -2,7 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = ["pydantic>=2,<3", "typer>=0.12,<1"]
 # ///
-# How to run: python checks/contracts/validate.py --inventory checks/contracts/web-api.json
+# How to run: python checks/contracts/validate.py --inventory checks/contracts/data/web-api.json
 """Validate complete selected API targets and fixtures without executing a server."""
 
 import json
@@ -15,12 +15,13 @@ from models import Fixture, Inventory
 from pydantic import TypeAdapter, ValidationError
 
 ROOT = Path(__file__).parent
+DATA = ROOT / "data"
 app = typer.Typer()
 
 
 def validate(inventory: Inventory, fixtures: list[Fixture]) -> None:
     """Check independent coverage floor, provenance and realistic wire shapes."""
-    floor = json.loads((ROOT / "coverage.json").read_text())
+    floor = json.loads((DATA / "coverage.json").read_text())
     require(inventory.base == floor["base"], "base revision drift")
     require(
         {key: value.model_dump() for key, value in inventory.sources.items()}
@@ -107,7 +108,7 @@ def validate(inventory: Inventory, fixtures: list[Fixture]) -> None:
 
 @app.command()
 def main(
-    inventory: Annotated[Path, typer.Option()] = ROOT / "web-api.json",
+    inventory: Annotated[Path, typer.Option()] = DATA / "web-api.json",
     fixture: Annotated[list[Path] | None, typer.Option()] = None,
 ) -> None:
     """Accept a complete inventory and all fixtures, or exit nonzero."""

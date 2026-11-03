@@ -6,7 +6,7 @@
 }:
 
 let
-  inventory = (lib.importJSON ../../../checks/contracts/web-api.json).sources.EXPORT;
+  inventory = (lib.importJSON ../../../checks/contracts/data/web-api.json).sources.EXPORT;
 
   # The upstream submodules, fetched one by one: translate carries a nested
   # utilities submodule that the server never loads.
@@ -53,7 +53,7 @@ assert lib.assertMsg
     && version == inventory.version
     && lib.mapAttrs (_: s: s.rev) gitlinks == inventory.gitlinks
   )
-  "translation-server pin drifted from checks/contracts/web-api.json (revision, version or gitlinks differ)";
+  "translation-server pin drifted from checks/contracts/data/web-api.json (revision, version or gitlinks differ)";
 
 buildNpmPackage {
   pname = "translation-server";

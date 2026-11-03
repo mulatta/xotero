@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).parent
+DATA = ROOT / "data"
 
 
 def invoke(inventory, fixtures):
@@ -30,10 +31,10 @@ def invoke(inventory, fixtures):
 def test_shipped_personal_and_private_group_contracts():
     # Given the shipped target inventory and realistic request/response fixtures.
     fixtures = [
-        ROOT / name for name in ("personal.json", "private-group.json", "global.json")
+        DATA / name for name in ("personal.json", "private-group.json", "global.json")
     ]
     # When the actual public validator CLI runs.
-    result = invoke(ROOT / "web-api.json", fixtures)
+    result = invoke(DATA / "web-api.json", fixtures)
     # Then structural acceptance is explicit, without claiming server behavior.
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["runtime_verified"] is False
@@ -62,9 +63,9 @@ def test_shipped_personal_and_private_group_contracts():
 )
 def test_incomplete_or_misleading_contracts_fail(tmp_path, mutation):
     # Given a complete inventory and fixtures, change exactly one contract fact.
-    inventory = json.loads((ROOT / "web-api.json").read_text())
+    inventory = json.loads((DATA / "web-api.json").read_text())
     fixtures = {
-        name: json.loads((ROOT / name).read_text())
+        name: json.loads((DATA / name).read_text())
         for name in ("personal.json", "private-group.json", "global.json")
     }
     personal = fixtures["personal.json"][0]

@@ -5,14 +5,14 @@ import json
 import pytest
 from fixtures import ContractError, validate_fixture
 from models import Contract, Fixture
-from test_validator import ROOT
+from test_validator import DATA
 
 
 def write_case(scope="personal"):
     """Build expected output from submitted data, not the shipped response."""
     source = next(
         c
-        for c in json.loads((ROOT / "web-api.json").read_text())["contracts"]
+        for c in json.loads((DATA / "web-api.json").read_text())["contracts"]
         if c["id"] == scope + ".items.bulk.create-no-condition"
     )
     contract = Contract.model_validate(source)
