@@ -22,6 +22,7 @@ def validate_fixture(contract: Contract, fixture: Fixture) -> None:
         "{id}": "202",
         "{keyId}": "71",
         "{uploadKey}": "a" * 32,
+        "{token}": "0123456789abcdef0123456789abcdef",
     }.items():
         path = path.replace(name, value)
     require(fixture.scope == contract.scope, f"{identity}: scope mismatch")
