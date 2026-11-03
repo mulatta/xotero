@@ -15,14 +15,6 @@ let
   );
 in
 {
-  imports = [
-    (lib.mkRemovedOptionModule [
-      "services"
-      "xotero"
-      "apiKeyFile"
-    ] "Use services.xotero.keys, for example keys.default.file.")
-  ];
-
   options.services.xotero = {
     enable = lib.mkEnableOption "self-hosted Zotero sync server";
 
