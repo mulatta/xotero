@@ -2,8 +2,11 @@
 nixosModule-deployed service. Grouped by flow rather than per endpoint, since
 each run boots a VM."""
 
+import base64
+import hashlib
 import json
 import shlex
+from urllib.parse import urlencode
 
 base = "http://localhost:8189"
 auth = "-H 'Zotero-API-Key: testtoken' -H 'Zotero-API-Version: 3'"
@@ -1560,6 +1563,136 @@ with subtest("request journal keeps routing evidence without secrets or content"
         and "path=/uploads/{token}" in line
         for line in journal_lines
     )
+
+# Task 22a: the personal and private-group libraries are seeded from the
+# shared listing dataset through the real API, then every listing contract in
+# the 22a set is replayed against the fixtures in checks/contracts/data.
+fixture_origin = "https://library.example.test"
+listing_key = "listing-fixture-key"
+listing_auth = f"-H 'Zotero-API-Key: {listing_key}' -H 'Zotero-API-Version: 3'"
+listing_seed = json.load(open(f"{contract_data}/listing-seed.json"))
+
+psql("insert into users (id, username, display_name) values (101, 'alice', 'Alice')")
+psql(f"insert into library (id, version, kind) values (101, {listing_seed['library_version_start']}, 'personal')")
+psql("insert into personal_libraries (user_id, library_id) values (101, 101)")
+psql(f"insert into library (id, version, kind) values (303, {listing_seed['library_version_start']}, 'group')")
+psql(
+    """begin;
+       insert into groups (id, library_id, owner_user_id, name)
+       values (303, 303, 101, 'Research group');
+       insert into group_memberships (group_id, user_id, role) values (303, 101, 'owner');
+       commit"""
+)
+psql(
+    f"""insert into api_keys (id, user_id, name, token_hash)
+        values (7101, 101, 'listing fixture',
+                decode('{hashlib.sha256(listing_key.encode()).hexdigest()}', 'hex'));
+        insert into api_key_user_permissions (api_key_id, library, notes, write, files)
+        values (7101, true, true, true, true);
+        insert into api_key_group_permissions (api_key_id, user_id, group_id, library, write)
+        values (7101, 101, 303, true, true)"""
+)
+
+
+def listing_get(url):
+    """Return (status, headers, body) of a GET with the listing key."""
+    machine.succeed("rm -f /tmp/listing.headers /tmp/listing.body")
+    status = machine.succeed(
+        f"curl -s -g -D /tmp/listing.headers -o /tmp/listing.body -w '%{{http_code}}' "
+        f"{shlex.quote(url)} {listing_auth}"
+    ).strip()
+    raw = machine.succeed("base64 -w0 /tmp/listing.headers")
+    headers = {}
+    for line in base64.b64decode(raw).decode().replace("\r", "").split("\n")[1:]:
+        if ":" in line:
+            name, value = line.split(":", 1)
+            headers[name.strip().lower()] = value.strip()
+    body = base64.b64decode(machine.succeed("base64 -w0 /tmp/listing.body")).decode()
+    return int(status), headers, body
+
+
+def seed_listing(prefix, library_id):
+    for write in listing_seed["writes"]:
+        # The API requires a precondition on every write; use the current
+        # library version when the seed does not pin one.
+        unmodified = write["if_unmodified"]
+        if unmodified is None:
+            unmodified = psql(f"select version from library where id = {library_id}")
+        condition = f"-H 'If-Unmodified-Since-Version: {unmodified}'"
+        machine.succeed(
+            f"printf %s {shlex.quote(json.dumps(write['body']))} | curl -sf "
+            f"-X POST {base}{prefix}{write['path_suffix']} {listing_auth} {condition} "
+            f"-H 'Content-Type: application/json' --data-binary @- -o /dev/null"
+        )
+
+
+def listing_keys(fmt, body):
+    if fmt == "keys":
+        return body.split("\n")[:-1]
+    parsed = json.loads(body)
+    return [o["key"] for o in parsed] if isinstance(parsed, list) else list(parsed)
+
+
+listing_sets = (
+    [f"{o}.{f}" for o in ("items", "items-top", "items-trash", "collection-items",
+                          "collection-items-top")
+     for f in ("json", "keys", "versions")]
+    + [f"{o}.list.{f}" for o in ("collections", "searches")
+       for f in ("json", "keys", "versions")]
+    + ["items.stable-page", "items.since-refresh", "unsupported.unknown-format",
+       "unsupported.atom", "unsupported.invalid-sort"]
+)
+
+
+def check_listing_fixtures(scope, prefix, library_id):
+    fixtures = {e["contract"]: e for e in json.load(open(f"{contract_data}/{scope}.json"))}
+    seed_listing(prefix, library_id)
+    for suffix in listing_sets:
+        cid = f"{scope}.{suffix}"
+        entry = fixtures[cid]
+        request, expected = entry["request"], entry["response"]
+
+        def localize(value):
+            return json.loads(json.dumps(value).replace(fixture_origin, base))
+
+        query = urlencode(request["query"], doseq=True)
+        status, headers, body = listing_get(f"{base}{request['path']}?{query}")
+        assert status == expected["status"], (cid, status, expected["status"], body)
+        for name, value in expected["headers"].items():
+            assert headers.get(name.lower()) == localize(value), (
+                cid, name, headers.get(name.lower()), localize(value))
+        for name in ("Link", "Total-Results"):
+            if name not in expected["headers"]:
+                assert name.lower() not in headers, (cid, name, headers[name.lower()])
+        want = localize(expected["body"])
+        if isinstance(want, str):
+            assert body == want, (cid, body, want)
+        else:
+            assert json.loads(body) == want, (cid, json.loads(body), want)
+
+        if "sequence" in entry:
+            fmt = request["query"].get("format", "json")
+            url = f"{base}{request['path']}?" + urlencode({**request["query"], "start": 0}, doseq=True)
+            seen, link = [], ""
+            while url:
+                status, headers, body = listing_get(url)
+                assert status == 200, (cid, url, status)
+                seen += listing_keys(fmt, body)
+                link = headers.get("link", "")
+                url = next(
+                    (part.split(">")[0].lstrip(" <") for part in link.split(", <")
+                     if 'rel="next"' in part),
+                    None,
+                )
+            assert seen == entry["sequence"], (cid, seen, entry["sequence"])
+            assert 'rel="next"' not in link, (cid, link)
+
+
+with subtest("personal listings match the 22a fixtures"):
+    check_listing_fixtures("personal", "/users/101", 101)
+
+with subtest("private-group listings match the 22a fixtures"):
+    check_listing_fixtures("private-group", "/groups/303", 303)
 
 with subtest("storage SDK round-trips small and multipart encoded keys"):
     machine.succeed("printf 'sdk-small' >/tmp/sdk-small")

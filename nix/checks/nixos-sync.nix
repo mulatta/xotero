@@ -71,5 +71,8 @@ testPkgs.testers.runNixOSTest {
     ];
   };
 
-  testScript = builtins.readFile ../../checks/sync-test.py;
+  testScript = ''
+    contract_data = "${../../checks/contracts/data}"
+  ''
+  + builtins.readFile ../../checks/sync-test.py;
 }
