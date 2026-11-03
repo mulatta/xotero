@@ -282,6 +282,9 @@ in
       };
 
       serviceConfig = {
+        # Migrations run as their own step so a failed migration stops the
+        # unit before the server listens.
+        ExecStartPre = "${lib.getExe cfg.package} migrate";
         ExecStart = lib.getExe cfg.package;
         User = cfg.user;
         Group = cfg.user;

@@ -33,6 +33,26 @@ pub(crate) fn upload_token() -> Option<String> {
     Some(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+#[derive(Debug, PartialEq)]
+enum Command {
+    Serve,
+    Migrate,
+    CollectGarbage,
+}
+
+fn parse_command(arguments: &[String]) -> Option<Command> {
+    match arguments {
+        [] => Some(Command::Serve),
+        [migrate] if migrate == "migrate" => Some(Command::Migrate),
+        [maintenance, gc, once]
+            if maintenance == "maintenance" && gc == "gc" && once == "--once" =>
+        {
+            Some(Command::CollectGarbage)
+        }
+        _ => None,
+    }
+}
+
 // --- library data -----------------------------------------------------------
 
 #[tokio::main]
@@ -44,23 +64,33 @@ async fn main() {
         .init();
 
     let arguments: Vec<String> = std::env::args().skip(1).collect();
-    let gc_once = match arguments.as_slice() {
-        [] => false,
-        [maintenance, gc, once]
-            if maintenance == "maintenance" && gc == "gc" && once == "--once" =>
-        {
-            true
-        }
-        _ => {
-            tracing::error!("usage: xotero [maintenance gc --once]");
-            std::process::exit(2);
-        }
+    let Some(command) = parse_command(&arguments) else {
+        tracing::error!("usage: xotero [migrate | maintenance gc --once]");
+        std::process::exit(2);
     };
     let config = Arc::new(Config::from_env());
     // Parse the embedded schema before serving so a bad pin fails at startup.
     std::sync::LazyLock::force(&metadata::SCHEMA);
 
-    if gc_once {
+    if command == Command::Migrate {
+        // Schema step only, so operators can run it before the server starts:
+        // no listener, bootstrap, blob reconciliation, upload reset, or storage.
+        let pool = match sqlx::PgPool::connect(&config.database_url).await {
+            Ok(pool) => pool,
+            Err(error) => {
+                tracing::error!(%error, "connect for migrations");
+                std::process::exit(1);
+            }
+        };
+        if let Err(error) = store::migrate(&pool).await {
+            tracing::error!(%error, "apply migrations");
+            std::process::exit(1);
+        }
+        tracing::info!("migrations applied");
+        return;
+    }
+
+    if command == Command::CollectGarbage {
         // Maintenance runs beside the serving process: never migrate/bootstrap,
         // reset Uploading ownership, spawn cleanup loops, or open a listener.
         let pool = sqlx::PgPool::connect(&config.database_url)
@@ -131,6 +161,46 @@ async fn main() {
         })
         .await
         .expect("server run");
+}
+
+#[cfg(test)]
+mod command_tests {
+    use super::{parse_command, Command};
+
+    fn parse(arguments: &[&str]) -> Option<Command> {
+        let arguments: Vec<String> = arguments.iter().map(|a| a.to_string()).collect();
+        parse_command(&arguments)
+    }
+
+    #[test]
+    fn no_arguments_serve() {
+        assert_eq!(parse(&[]), Some(Command::Serve));
+    }
+
+    #[test]
+    fn migrate_selects_migration_only() {
+        assert_eq!(parse(&["migrate"]), Some(Command::Migrate));
+    }
+
+    #[test]
+    fn maintenance_gc_once_collects_garbage() {
+        assert_eq!(
+            parse(&["maintenance", "gc", "--once"]),
+            Some(Command::CollectGarbage)
+        );
+    }
+
+    #[test]
+    fn unknown_or_partial_commands_are_rejected() {
+        for arguments in [
+            &["migrate", "extra"][..],
+            &["maintenance", "gc"],
+            &["bogus"],
+            &["--once"],
+        ] {
+            assert_eq!(parse(arguments), None, "{arguments:?}");
+        }
+    }
 }
 
 #[cfg(test)]

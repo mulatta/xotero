@@ -95,9 +95,13 @@ pub(super) async fn guarded_version(
     Ok(Outcome::Done(version))
 }
 
+pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    sqlx::migrate!("./migrations").run(pool).await
+}
+
 pub async fn connect(url: &str) -> sqlx::Result<PgPool> {
     let pool = PgPool::connect(url).await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    migrate(&pool).await?;
     Ok(pool)
 }
 
