@@ -283,13 +283,17 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L`; actual file-URL text resolves to correct bytes/range.
 ### Wave E: exports, Web packaging, deployment
 
-- [ ] 27. Package pinned internal translation engine
+- [x] 27. Package pinned internal translation engine
   - Acceptance: `nix build .#packages.x86_64-linux.translation-server -L` succeeds in sandbox with complete pinned dependency closure.
   - Pin commit `672d4f3` (`package.json` 2.0.5). Upstream has not tagged a
     release since 2.0.3 in 2019, which predates the current submodule layout,
     so the commit is the version anchor.
   - The source revision and the four submodule revisions equal the inventory's
     `EXPORT` source. No runtime smoke check; Task 28 exercises the engine.
+  - `translation-server` fails evaluation when its revisions drift from the
+    inventory and fails the build when a pinned file's sha256 differs. Its
+    wrapper sets `NODE_CONFIG='{"host":"127.0.0.1"}'` unless the deployer sets
+    `NODE_CONFIG`, so a deployer override replaces the loopback default.
 - [ ] 28. Implement all advertised export formats
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-web-library -L`; every advertised format has content/MIME fixture checked against same pinned real engine.
 - [ ] 29. Package complete upstream Web Library assets
