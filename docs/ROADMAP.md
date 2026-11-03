@@ -256,11 +256,26 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
 - [x] 21. Serve pinned metadata and item templates
   - Acceptance: `nix build .#checks.x86_64-linux.api-contracts .#checks.x86_64-linux.nixos-sync -L`.
 - [ ] 22. Complete listing envelopes, paging and query contracts
-  - Also add `/keys/sessions` and `/login` to the `checks/contracts` inventory.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L` compares paginated fixtures with full expected key sequence and response headers.
+  - Each sub-task is done when its Task 22 inventory contracts leave `pending`
+    and name a real `nixos-sync` subtest, for both user and group scopes.
+  - [ ] 22a. Item, collection and search listings: `json`, `keys` and
+    `versions` formats, `start`/`limit`/`sort`/`direction` paging, and the
+    unsupported-format and invalid-sort errors. Headers `Total-Results`, `Link`
+    and `Last-Modified-Version` match the fixtures exactly, and list bodies
+    carry the upstream `library`, `links` and `meta` wrappers. Also add
+    `/keys/sessions` and `/login` to the inventory, split contract data into
+    `checks/contracts/data/`, and separate verified behavior from target
+    support in `docs/API.md`.
+  - [ ] 22b. Query filters (`q`/`qmode`, `tag` expressions, `itemType`,
+    `itemKey`, `includeTrashed`, `annotationType`), tag listings with
+    `itemQ`/`itemQMode`/`itemTag`, and refusal of remote export URLs.
+  - [ ] 22c. Full-text index, versions, bulk and per-item reads and writes, and
+    the global `/groups` listing.
 - [ ] 23. Implement single-object conditional CRUD
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L`; pinned single-object request/response fixtures pass for user/group.
 - [ ] 24. Add children, publications and collection hierarchy views
+  - Includes the publications tag listing (`/publications/items/tags`).
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L` checks actual tree/details/publications fixtures.
 - [ ] 25. Add individual-setting conditional operations
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync .#checks.x86_64-linux.nixos-key-auth -L`.

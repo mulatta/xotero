@@ -22,21 +22,27 @@ against the code when the task starts, and update this file when it changes.
    Lane API             Lane packaging       Lane operations
    (Wave D)                                  (Wave F)
 
-   22 listing/paging    27 translation-srv   33 migrate
+   22a listings/paging  27 translation-srv   33 migrate
     |                    |                    |
     v                    |                    v
-   23 conditional CRUD   |                   34 single process
+   22b query filters     |                   34 single process
+    :                    |
+    v                    |
+   22c full text, groups |
+    |                    |
+    v                    |
+   23 conditional CRUD   |
     |                    |
     v                    |                   35 SIGTERM
    26 file URL/range     |                    :
     |                    |                    v
     v                    |                   36 liveness/readiness
-   24 children/tree <-22 |
+   24 children/tree      |  <-- 22a, 22b
     |                    |
     v                    |
    25 settings <..23     |
     |                    |
-    |                    +----> 28 export <-- 22
+    |                    +----> 28 export <-- 22a
     |
     |                   29 web-library assets
     |                    |
@@ -70,16 +76,18 @@ against the code when the task starts, and update this file when it changes.
 
 ## Lanes
 
-- API: 22, 23, 26, 24, 25, one at a time. Each edits `checks/sync-test.py` and
-  `checks/contracts`, and only one agent may write a path. Split contract data
-  into `checks/contracts/data/` with Task 22.
+- API: 22a, 22b, 22c, 23, 26, 24, 25, one at a time. Each edits
+  `checks/sync-test.py` and `checks/contracts`, and only one agent may write a
+  path. 22b filters the listings 22a builds; 22c shares only the `versions`
+  format with them. Split contract data into `checks/contracts/data/` with 22a.
 - Packaging: 27 and 29 can run beside the API lane.
 - Operations: 33 then 34, 35 then 36. They can run beside the other lanes.
   The first of these tasks creates the `nixos-operations` check.
 
 ## Join points
 
-- 28 needs 22 and 27.
+- 24 needs 22a and 22b.
+- 28 needs 22a and 27.
 - 30 needs 29. It needs Wave D to work end to end, and it creates the
   `nixos-web-library` check.
 - 31 needs 27 and 30. 38 needs 31.
@@ -89,5 +97,6 @@ against the code when the task starts, and update this file when it changes.
 
 ## Unconfirmed edges
 
-- 28 on 22: assumes export rides on the item listing (`format=` on `/items`).
+- 28 on 22a: assumes export rides on the item listing (`format=` on `/items`).
 - 26 independent of 22: inferred from acceptance text only.
+- 24 on 22a and 22b: its publications tag listing uses the 22b tag filters.
