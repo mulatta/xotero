@@ -285,6 +285,11 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
 
 - [ ] 27. Package pinned internal translation engine
   - Acceptance: `nix build .#packages.x86_64-linux.translation-server -L` succeeds in sandbox with complete pinned dependency closure.
+  - Pin commit `672d4f3` (`package.json` 2.0.5). Upstream has not tagged a
+    release since 2.0.3 in 2019, which predates the current submodule layout,
+    so the commit is the version anchor.
+  - The source revision and the four submodule revisions equal the inventory's
+    `EXPORT` source. No runtime smoke check; Task 28 exercises the engine.
 - [ ] 28. Implement all advertised export formats
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-web-library -L`; every advertised format has content/MIME fixture checked against same pinned real engine.
 - [ ] 29. Package complete upstream Web Library assets
@@ -299,6 +304,12 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
 
 - [ ] 33. Add controlled explicit migration command
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-operations -L` fresh migration and populated v13->current upgrade succeed before serving.
+  - `xotero migrate` applies pending migrations and exits. Serving still
+    applies pending migrations at startup.
+  - The NixOS module runs it as `ExecStartPre`, as single-service nixpkgs
+    modules do.
+  - v13 means migrations 0001 to 0013 applied and populated, as in the
+    existing `nixos-key-auth` upgrade fixture. The upgrade keeps its data.
 - [ ] 34. Enforce single active process before startup mutations
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-operations -L`; duplicate start/migrate cannot alter schema, identity or pending state.
 - [ ] 35. Drain SIGTERM and bound runtime operations
