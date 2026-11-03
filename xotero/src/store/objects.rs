@@ -6,7 +6,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use crate::domain::LibraryId;
 use crate::envelope::{Children, Library, LibraryKind};
-use crate::query::{Format, ItemQuery, QMode};
+use crate::query::{Format, ItemQuery, Listing, QMode};
 
 use super::{guarded_version, is_stored_file_attachment, no_change, Outcome};
 
@@ -187,37 +187,35 @@ pub struct ListedObject {
     pub data: Option<Value>,
 }
 
-/// Run an item listing: filter, search, sort and page over the stored items.
-/// Returns the page and `total`, the full match count. It is counted
-/// separately from the page so it stays correct even when `start` runs past
-/// the end (a window count would vanish with the rows).
-pub async fn query_items(
+/// Count, then fetch one ordered page of the objects `filters` selects.
+/// `total` is counted separately from the page so it stays correct even when
+/// `start` runs past the end (a window count would vanish with the rows).
+async fn fetch_page(
     pool: &PgPool,
-    library_id: LibraryId,
-    q: &ItemQuery,
-    include_notes: bool,
+    listing: &Listing,
+    order_expr: Option<&str>,
+    filters: impl Fn(&mut QueryBuilder<Postgres>),
 ) -> sqlx::Result<(Vec<ListedObject>, i64)> {
     let mut count: QueryBuilder<Postgres> = QueryBuilder::new("select count(*) from object where ");
-    push_item_filters(&mut count, library_id, q, include_notes);
+    filters(&mut count);
     let total: i64 = count.build().fetch_one(pool).await?.get(0);
 
-    let with_data = q.listing.format == Format::Json;
+    let with_data = listing.format == Format::Json;
     let mut sql: QueryBuilder<Postgres> = QueryBuilder::new(if with_data {
         "select key, version, data from object where "
     } else {
         "select key, version from object where "
     });
-    push_item_filters(&mut sql, library_id, q, include_notes);
+    filters(&mut sql);
     // The order list is built from fixed strings (no user input), so pushing it
     // raw is safe.
-    sql.push(" order by ")
-        .push(q.listing.order_by(q.listing.sort.order_expr()));
-    if q.listing.limit > 0 {
-        sql.push(" limit ").push_bind(q.listing.limit);
+    sql.push(" order by ").push(listing.order_by(order_expr));
+    if listing.limit > 0 {
+        sql.push(" limit ").push_bind(listing.limit);
     }
-    sql.push(" offset ").push_bind(q.listing.start);
+    sql.push(" offset ").push_bind(listing.start);
 
-    let items = sql
+    let objects = sql
         .build()
         .fetch_all(pool)
         .await?
@@ -228,7 +226,79 @@ pub async fn query_items(
             data: with_data.then(|| order_fields(row.get("data"))),
         })
         .collect();
-    Ok((items, total))
+    Ok((objects, total))
+}
+
+/// Run an item listing: filter, search, sort and page over the stored items.
+pub async fn query_items(
+    pool: &PgPool,
+    library_id: LibraryId,
+    q: &ItemQuery,
+    include_notes: bool,
+) -> sqlx::Result<(Vec<ListedObject>, i64)> {
+    fetch_page(pool, &q.listing, Some(q.listing.sort.order_expr()), |sql| {
+        push_item_filters(sql, library_id, q, include_notes)
+    })
+    .await
+}
+
+/// Run a collection or search listing. `name_q` matches the name, as upstream
+/// `q` does for collections.
+pub async fn query_named(
+    pool: &PgPool,
+    library_id: LibraryId,
+    kind: &str,
+    listing: &Listing,
+    name_q: Option<&str>,
+) -> sqlx::Result<(Vec<ListedObject>, i64)> {
+    fetch_page(pool, listing, listing.sort.named_order_expr(), |sql| {
+        sql.push("library_id = ")
+            .push_bind(library_id.get())
+            .push(" and kind = ")
+            .push_bind(kind.to_string());
+        if let Some(since) = listing.since {
+            sql.push(" and version > ").push_bind(since);
+        }
+        if let Some(term) = name_q {
+            sql.push(" and data->>'name' ilike ")
+                .push_bind(format!("%{}%", escape_like(term)))
+                .push(" escape '\\'");
+        }
+    })
+    .await
+}
+
+/// `(numCollections, numItems)` for `keys`: direct subcollections, and
+/// non-trashed items filed directly in the collection.
+pub async fn collection_counts(
+    pool: &PgPool,
+    library_id: LibraryId,
+    keys: &[String],
+) -> sqlx::Result<HashMap<String, (i64, i64)>> {
+    let rows = sqlx::query(
+        "select data->>'parentCollection' as key, count(*) as n, 'collections' as what \
+         from object where library_id = $1 and kind = 'collection' \
+         and data->>'parentCollection' = any($2) group by 1 \
+         union all \
+         select k, count(*), 'items' from object, unnest(collection_keys) as k \
+         where library_id = $1 and kind = 'item' and not deleted \
+         and collection_keys && $2 and k = any($2) group by 1",
+    )
+    .bind(library_id.get())
+    .bind(keys)
+    .fetch_all(pool)
+    .await?;
+    let mut counts: HashMap<String, (i64, i64)> = HashMap::new();
+    for row in rows {
+        let entry = counts.entry(row.get("key")).or_default();
+        let n: i64 = row.get("n");
+        if row.get::<String, _>("what") == "collections" {
+            entry.0 = n;
+        } else {
+            entry.1 = n;
+        }
+    }
+    Ok(counts)
 }
 
 /// The library an envelope names, looked up once per request: the owning

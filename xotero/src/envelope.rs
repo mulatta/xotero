@@ -30,13 +30,13 @@ impl Library {
         json!({"type": kind, "id": self.id, "name": self.name})
     }
 
-    /// `<base>/users/<id>/items` or `<base>/groups/<id>/items`.
-    pub fn items_url(&self, base: &str) -> String {
+    /// `<base>/users/<id>/<objects>` or `<base>/groups/<id>/<objects>`.
+    pub fn objects_url(&self, base: &str, objects: &str) -> String {
         let prefix = match self.kind {
             LibraryKind::User => "users",
             LibraryKind::Group => "groups",
         };
-        format!("{base}/{prefix}/{}/items", self.id)
+        format!("{base}/{prefix}/{}/{objects}", self.id)
     }
 }
 
@@ -68,14 +68,11 @@ pub fn item(
     let field = |name: &str| data.get(name).and_then(Value::as_str).unwrap_or("");
     let key = field("key").to_string();
     let item_type = field("itemType");
-    let items_url = library.items_url(base);
-
-    let mut links = Map::new();
-    links.insert("self".into(), json_link(format!("{items_url}/{key}")));
-    let parent = field("parentItem");
-    if !parent.is_empty() {
-        links.insert("up".into(), json_link(format!("{items_url}/{parent}")));
-    }
+    let links = object_links(
+        &library.objects_url(base, "items"),
+        &data,
+        Some("parentItem"),
+    );
 
     let mut meta = Map::new();
     match item_type {
@@ -106,6 +103,58 @@ pub fn item(
         "library": library.json(),
         "links": links,
         "meta": meta,
+        "data": data,
+    })
+}
+
+/// `links.self`, plus `links.up` when `parent_field` names a parent key.
+fn object_links(url: &str, data: &Value, parent_field: Option<&str>) -> Map<String, Value> {
+    let mut links = Map::new();
+    let key = data.get("key").and_then(Value::as_str).unwrap_or("");
+    links.insert("self".into(), json_link(format!("{url}/{key}")));
+    if let Some(parent) = parent_field
+        .and_then(|field| data.get(field))
+        .and_then(Value::as_str)
+        .filter(|p| !p.is_empty())
+    {
+        links.insert("up".into(), json_link(format!("{url}/{parent}")));
+    }
+    links
+}
+
+/// Upstream `Zotero_Collection::toResponseJSON`: subcollection and
+/// non-trashed item counts in `meta`.
+pub fn collection(
+    library: &Library,
+    base: &str,
+    version: i64,
+    data: Value,
+    num_collections: i64,
+    num_items: i64,
+) -> Value {
+    let links = object_links(
+        &library.objects_url(base, "collections"),
+        &data,
+        Some("parentCollection"),
+    );
+    json!({
+        "key": data.get("key").cloned().unwrap_or_default(),
+        "version": version,
+        "library": library.json(),
+        "links": links,
+        "meta": {"numCollections": num_collections, "numItems": num_items},
+        "data": data,
+    })
+}
+
+/// Upstream `Zotero_Search::toResponseJSON`: no `meta`.
+pub fn search(library: &Library, base: &str, version: i64, data: Value) -> Value {
+    let links = object_links(&library.objects_url(base, "searches"), &data, None);
+    json!({
+        "key": data.get("key").cloned().unwrap_or_default(),
+        "version": version,
+        "library": library.json(),
+        "links": links,
         "data": data,
     })
 }
@@ -288,7 +337,7 @@ mod tests {
             group.json(),
             json!({"type": "group", "id": 303, "name": "Research group"})
         );
-        assert_eq!(group.items_url("B"), "B/groups/303/items");
+        assert_eq!(group.objects_url("B", "items"), "B/groups/303/items");
     }
 
     fn author(last: &str) -> serde_json::Value {
@@ -464,6 +513,47 @@ mod tests {
         assert_eq!(
             item(&alice(), "B", 1, pdf, children, false, None)["meta"],
             json!({})
+        );
+    }
+
+    #[test]
+    fn collection_envelope() {
+        let data = json!({"key": "CQLS2222", "version": 15, "name": "Systems",
+            "parentCollection": "CQLL2222", "relations": {}});
+        let value = collection(&alice(), "B", 15, data.clone(), 0, 0);
+        assert_eq!(
+            value,
+            json!({
+                "key": "CQLS2222",
+                "version": 15,
+                "library": {"type": "user", "id": 101, "name": "Alice"},
+                "links": {
+                    "self": {"href": "B/users/101/collections/CQLS2222", "type": "application/json"},
+                    "up": {"href": "B/users/101/collections/CQLL2222", "type": "application/json"},
+                },
+                "meta": {"numCollections": 0, "numItems": 0},
+                "data": data,
+            })
+        );
+        let top = json!({"key": "CQLL2222", "name": "Research", "parentCollection": false});
+        let value = collection(&alice(), "B", 15, top, 1, 3);
+        assert_eq!(value["meta"], json!({"numCollections": 1, "numItems": 3}));
+        assert!(value["links"].get("up").is_none());
+    }
+
+    #[test]
+    fn search_envelope_has_no_meta() {
+        let data = json!({"key": "SRCH2222", "version": 16, "name": "Systems", "conditions": []});
+        let value = search(&alice(), "B", 16, data.clone());
+        assert_eq!(
+            value,
+            json!({
+                "key": "SRCH2222",
+                "version": 16,
+                "library": {"type": "user", "id": 101, "name": "Alice"},
+                "links": {"self": {"href": "B/users/101/searches/SRCH2222", "type": "application/json"}},
+                "data": data,
+            })
         );
     }
 }

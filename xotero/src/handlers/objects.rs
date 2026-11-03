@@ -18,46 +18,40 @@ use crate::http::validation::valid_object_key;
 use crate::metadata::SCHEMA;
 use crate::{envelope, query, store, AppState};
 
-/// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
-/// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
+/// `GET /collections` and `/searches`: the `?<kind>Key=a,b` batch read the sync
+/// client sends with format json, or the listing.
 pub(crate) async fn read(
     state: &AppState,
     kind: &str,
     params: HashMap<String, String>,
     raw: Option<&str>,
+    path: &str,
 ) -> Response {
     let list_kind = match kind {
         "collection" => query::ListKind::Collections,
         _ => query::ListKind::Searches,
     };
-    let listing = match query::Listing::parse(&query::Params::parse(raw), list_kind) {
+    let query_params = query::Params::parse(raw);
+    let listing = match query::Listing::parse(&query_params, list_kind) {
         Ok(listing) => listing,
         Err(query::Unsupported) => return reject(state).await,
     };
-    if listing.format == query::Format::Versions {
-        let since = listing.since.unwrap_or(0);
-        // Always 200 with the (possibly empty) versions map. The client's
-        // `getVersions` sends no `If-Modified-Since-Version` header and treats a
-        // 304 as "no data", which then mismatches its library-version check and
-        // makes it restart the sync forever. 304 is only for the header path
-        // (settings), not for `?since=` versions reads.
-        let current = match store::current_version(&state.pool, request_library()).await {
-            Ok(current) => current,
-            Err(error) => return server_error("read version", error),
-        };
-        return match store::versions(&state.pool, request_library(), kind, since, true).await {
-            Ok(value) => (version_headers(current), Json(value)).into_response(),
+    let keys = csv_of(&params, &format!("{kind}Key"));
+    if !keys.is_empty() && listing.format == query::Format::Json {
+        return match store::objects(&state.pool, request_library(), kind, &keys, true).await {
+            Ok(value) => match current_headers(state).await {
+                Ok(headers) => (headers, Json(value)).into_response(),
+                Err(error) => server_error("read version", error),
+            },
             Err(error) => server_error("read", error),
         };
     }
-    let keys = csv_of(&params, &format!("{kind}Key"));
-    match store::objects(&state.pool, request_library(), kind, &keys, true).await {
-        Ok(value) => match current_headers(state).await {
-            Ok(headers) => (headers, Json(value)).into_response(),
-            Err(error) => server_error("read version", error),
-        },
-        Err(error) => server_error("read", error),
-    }
+    let name_q = query_params
+        .get("q")
+        .map(str::trim)
+        .filter(|q| !q.is_empty() && list_kind == query::ListKind::Collections);
+    let page = store::query_named(&state.pool, request_library(), kind, &listing, name_q).await;
+    listing_response(state, path, &query_params, &listing, list_kind, page).await
 }
 
 /// 400 for a listing request that `query` rejected.
@@ -99,50 +93,76 @@ async fn item_batch_read(
     )
 }
 
-/// Answer an item listing in its format, always with `Total-Results` and, when
+/// Answer a listing page in its format, always with `Total-Results` and, when
 /// a page link applies, `Link` built against `path` (the public-URL endpoint).
 /// versions is always 200 + map, never 304: the client's `getVersions` treats a
 /// 304 as "no data" and restarts the sync forever.
-async fn item_listing(
+async fn listing_response(
     state: &AppState,
     path: &str,
     params: &query::Params,
-    q: &query::ItemQuery,
+    listing: &query::Listing,
+    kind: query::ListKind,
+    page: sqlx::Result<(Vec<store::ListedObject>, i64)>,
 ) -> Response {
-    let (items, total) = match store::query_items(
-        &state.pool,
-        request_library(),
-        q,
-        request_permissions().notes,
-    )
-    .await
-    {
+    let (objects, total) = match page {
         Ok(page) => page,
-        Err(error) => return server_error("items query", error),
+        Err(error) => return server_error("listing query", error),
     };
     let mut headers = match current_headers(state).await {
         Ok(headers) => headers,
-        Err(error) => return server_error("items query version", error),
+        Err(error) => return server_error("listing version", error),
     };
     headers.insert("total-results", header_value(&total.to_string()));
     let base = format!("{}{}", state.config.public_url, path);
-    let link_params = q.listing.link_params(params);
-    if let Some(link) = link_header(&base, &link_params, q.listing.start, q.listing.limit, total) {
+    let link_params = listing.link_params(params);
+    if let Some(link) = link_header(&base, &link_params, listing.start, listing.limit, total) {
         headers.insert("link", header_value(&link));
     }
-    match q.listing.format {
-        query::Format::Json => {
-            let library = match store::library_envelope(&state.pool, request_library()).await {
-                Ok(library) => library,
-                Err(error) => return server_error("items library", error),
-            };
-            let keys: Vec<String> = items.iter().map(|item| item.key.clone()).collect();
-            let children = match store::child_counts(&state.pool, request_library(), &keys).await {
-                Ok(children) => children,
-                Err(error) => return server_error("items children", error),
-            };
+    match listing.format {
+        query::Format::Json => match envelopes(state, kind, objects).await {
+            Ok(values) => (headers, Json(values)).into_response(),
+            Err(error) => server_error("listing envelopes", error),
+        },
+        // Zotero's `getKeys()` splits the body on '\n'; upstream ends it with one.
+        query::Format::Keys => {
+            headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/plain"),
+            );
+            let mut body: String = objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            body.push('\n');
+            (headers, body).into_response()
+        }
+        query::Format::Versions => {
+            let map: serde_json::Map<String, Value> = objects
+                .into_iter()
+                .map(|object| (object.key, Value::from(object.version)))
+                .collect();
+            (headers, Json(Value::Object(map))).into_response()
+        }
+    }
+}
+
+/// Wrap a json page in the envelope for its kind, with one library lookup and
+/// one count query per page.
+async fn envelopes(
+    state: &AppState,
+    kind: query::ListKind,
+    objects: Vec<store::ListedObject>,
+) -> sqlx::Result<Vec<Value>> {
+    let library = store::library_envelope(&state.pool, request_library()).await?;
+    let base = &state.config.public_url;
+    let keys: Vec<String> = objects.iter().map(|object| object.key.clone()).collect();
+    Ok(match kind {
+        query::ListKind::Items => {
+            let children = store::child_counts(&state.pool, request_library(), &keys).await?;
             let notes = request_permissions().notes;
-            let items: Vec<Value> = items
+            objects
                 .into_iter()
                 .map(|item| {
                     let data = item.data.unwrap_or_default();
@@ -152,7 +172,7 @@ async fn item_listing(
                         .and_then(|t| SCHEMA.primary_creator_type(t));
                     envelope::item(
                         &library,
-                        &state.config.public_url,
+                        base,
                         item.version,
                         data,
                         children.get(&item.key).copied().unwrap_or_default(),
@@ -160,31 +180,62 @@ async fn item_listing(
                         primary,
                     )
                 })
-                .collect();
-            (headers, Json(items)).into_response()
+                .collect()
         }
-        // Zotero's `getKeys()` splits the body on '\n'; upstream ends it with one.
-        query::Format::Keys => {
-            headers.insert(
-                header::CONTENT_TYPE,
-                header::HeaderValue::from_static("text/plain"),
-            );
-            let mut body: String = items
-                .iter()
-                .map(|item| item.key.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            body.push('\n');
-            (headers, body).into_response()
-        }
-        query::Format::Versions => {
-            let map: serde_json::Map<String, Value> = items
+        query::ListKind::Collections => {
+            let counts = store::collection_counts(&state.pool, request_library(), &keys).await?;
+            objects
                 .into_iter()
-                .map(|item| (item.key, Value::from(item.version)))
-                .collect();
-            (headers, Json(Value::Object(map))).into_response()
+                .map(|object| {
+                    let (collections, items) = counts.get(&object.key).copied().unwrap_or_default();
+                    envelope::collection(
+                        &library,
+                        base,
+                        object.version,
+                        object.data.unwrap_or_default(),
+                        collections,
+                        items,
+                    )
+                })
+                .collect()
         }
-    }
+        query::ListKind::Searches => objects
+            .into_iter()
+            .map(|object| {
+                envelope::search(
+                    &library,
+                    base,
+                    object.version,
+                    object.data.unwrap_or_default(),
+                )
+            })
+            .collect(),
+    })
+}
+
+/// Run an item listing and answer it.
+async fn item_listing(
+    state: &AppState,
+    path: &str,
+    params: &query::Params,
+    q: &query::ItemQuery,
+) -> Response {
+    let page = store::query_items(
+        &state.pool,
+        request_library(),
+        q,
+        request_permissions().notes,
+    )
+    .await;
+    listing_response(
+        state,
+        path,
+        params,
+        &q.listing,
+        query::ListKind::Items,
+        page,
+    )
+    .await
 }
 
 /// `GET /users/<id>/items`: the `itemKey` batch read, or the listing.

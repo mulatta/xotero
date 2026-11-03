@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Query, RawQuery, State},
+    extract::{DefaultBodyLimit, OriginalUri, Query, RawQuery, State},
     http::HeaderMap,
     middleware,
     routing::{delete as route_delete, get, patch, post, put},
@@ -48,9 +48,10 @@ pub(crate) fn router(state: AppState) -> Router {
     let objects = |kind: &'static str| {
         get(
             move |State(state): State<AppState>,
+                  OriginalUri(uri): OriginalUri,
                   Query(p): Query<HashMap<String, String>>,
                   RawQuery(raw): RawQuery| async move {
-                read(&state, kind, p, raw.as_deref()).await
+                read(&state, kind, p, raw.as_deref(), uri.path()).await
             },
         )
         .post(

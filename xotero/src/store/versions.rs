@@ -22,28 +22,6 @@ pub async fn current_version(pool: &PgPool, library_id: LibraryId) -> sqlx::Resu
     Ok(row.get("version"))
 }
 
-/// `{key: version}` for objects of `kind` changed after `since`.
-pub async fn versions(
-    pool: &PgPool,
-    library_id: LibraryId,
-    kind: &str,
-    since: i64,
-    include_notes: bool,
-) -> sqlx::Result<Value> {
-    let rows = sqlx::query(
-        "select key, version from object \
-         where library_id = $1 and kind = $2 and version > $3 \
-         and ($4 or kind <> 'item' or item_type is distinct from 'note')",
-    )
-    .bind(library_id.get())
-    .bind(kind)
-    .bind(since)
-    .bind(include_notes)
-    .fetch_all(pool)
-    .await?;
-    Ok(version_map(rows, "key"))
-}
-
 /// Deleted object keys after `since`, grouped by kind for the /deleted endpoint.
 pub async fn deleted(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::Result<Value> {
     let rows = sqlx::query("select kind, key from deletion where library_id = $1 and version > $2")

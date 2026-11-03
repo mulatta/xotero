@@ -44,7 +44,8 @@ pub use identity::{authenticate_api_key, bootstrap_identity, bootstrap_principal
 pub use keys::{admin_key_guard, deny_key, key_guard, ApiKeyTarget};
 pub use mutation_authority::MutationProof;
 pub use objects::{
-    child_counts, delete, library_envelope, objects, query_items, write, ObjectMutation,
+    child_counts, collection_counts, delete, library_envelope, objects, query_items, query_named,
+    write, ListedObject, ObjectMutation,
 };
 pub use sessions::{
     cancel_login_session, complete_login_session, create_login_session, login_session,
@@ -53,7 +54,7 @@ pub use sessions::{
 pub use settings::{delete_settings, settings, write_settings};
 pub use tags::{delete_tags, tags};
 pub(super) use versions::version_map;
-pub use versions::{current_version, deleted, versions};
+pub use versions::{current_version, deleted};
 pub use web_sessions::{
     admin_guard, complete_web_login, create_web_challenge, deny_web_session, logout_web_session,
     AdminDenial, WebLogin, WebSessionAction,

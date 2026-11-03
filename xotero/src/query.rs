@@ -216,6 +216,15 @@ impl Sort {
         matches!(self, Sort::Title | Sort::Date)
     }
 
+    /// The SQL expression to order collections and searches by. Their JSON has
+    /// no timestamps, so the date sorts fall back to version order (`None`).
+    pub fn named_order_expr(self) -> Option<&'static str> {
+        match self {
+            Sort::Title => Some("data->>'name'"),
+            _ => None,
+        }
+    }
+
     /// The SQL expression to order items by. `date`/`itemType` use the generated
     /// columns (migration 0006) — `date_year` is the first 4-digit year from the
     /// freeform date, so "circa 1990" / "January 2000" sort chronologically
@@ -357,9 +366,13 @@ impl Listing {
     }
 
     /// The `order by` list for a listing sorted by `expr`: upstream's
-    /// empty-value rule, then version and key in the same direction.
-    pub fn order_by(&self, expr: &str) -> String {
+    /// empty-value rule, then version and key in the same direction. Without
+    /// `expr` the listing orders by version and key alone.
+    pub fn order_by(&self, expr: Option<&str>) -> String {
         let dir = self.direction.sql();
+        let Some(expr) = expr else {
+            return format!("version {dir}, key {dir}");
+        };
         let sort = if self.sort.empty_first() {
             let nulls = match self.direction {
                 Direction::Asc => "first",
@@ -682,7 +695,7 @@ mod tests {
     fn order_by_ties_break_on_version_then_key() {
         let order = |raw| {
             let l = listing(raw, ListKind::Items).unwrap();
-            l.order_by(l.sort.order_expr())
+            l.order_by(Some(l.sort.order_expr()))
         };
         // Empty-first sorts: empties are the lowest values.
         assert_eq!(
@@ -704,5 +717,25 @@ mod tests {
             "coalesce(data->>'dateModified', '') = '' desc, data->>'dateModified' desc, \
              version desc, key desc"
         );
+    }
+
+    #[test]
+    fn collections_and_searches_order_by_name_or_version() {
+        let order = |raw, kind| {
+            let l = listing(raw, kind).unwrap();
+            l.order_by(l.sort.named_order_expr())
+        };
+        for kind in [ListKind::Collections, ListKind::Searches] {
+            assert_eq!(
+                order("sort=title", kind),
+                "nullif(data->>'name', '') asc nulls first, version asc, key asc"
+            );
+            // Collection and search JSON has no timestamps.
+            assert_eq!(order("", kind), "version desc, key desc");
+            assert_eq!(
+                order("sort=dateAdded&direction=asc", kind),
+                "version asc, key asc"
+            );
+        }
     }
 }
