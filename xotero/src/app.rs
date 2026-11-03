@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::{DefaultBodyLimit, Query, State},
+    extract::{DefaultBodyLimit, Query, RawQuery, State},
     http::HeaderMap,
     middleware,
     routing::{delete as route_delete, get, patch, post, put},
@@ -48,28 +48,35 @@ pub(crate) fn router(state: AppState) -> Router {
     let objects = |kind: &'static str| {
         get(
             move |State(state): State<AppState>,
-                  Query(p): Query<HashMap<String, String>>| async move {
-                read(&state, kind, p).await
+                  Query(p): Query<HashMap<String, String>>,
+                  RawQuery(raw): RawQuery| async move {
+                read(&state, kind, p, raw.as_deref()).await
             },
         )
         .post(
-            move |State(state): State<AppState>, Extension(context): Extension<crate::domain::RequestContext>, headers: HeaderMap, body: Bytes| async move {
+            move |State(state): State<AppState>,
+                  Extension(context): Extension<crate::domain::RequestContext>,
+                  headers: HeaderMap,
+                  body: Bytes| async move {
                 write(&state, &context, kind, headers, body).await
             },
         )
         .patch(
-            move |State(state): State<AppState>, Extension(context): Extension<crate::domain::RequestContext>, headers: HeaderMap, body: Bytes| async move {
+            move |State(state): State<AppState>,
+                  Extension(context): Extension<crate::domain::RequestContext>,
+                  headers: HeaderMap,
+                  body: Bytes| async move {
                 write(&state, &context, kind, headers, body).await
             },
         )
-            .delete(
-                move |State(state): State<AppState>,
-                      Extension(context): Extension<crate::domain::RequestContext>,
-                      headers: HeaderMap,
-                      Query(p): Query<HashMap<String, String>>| async move {
-                    delete(&state, &context, kind, headers, p).await
-                },
-            )
+        .delete(
+            move |State(state): State<AppState>,
+                  Extension(context): Extension<crate::domain::RequestContext>,
+                  headers: HeaderMap,
+                  Query(p): Query<HashMap<String, String>>| async move {
+                delete(&state, &context, kind, headers, p).await
+            },
+        )
     };
     Router::new()
         .route(

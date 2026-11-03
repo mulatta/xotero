@@ -1,7 +1,7 @@
-//! Parsing for the CLI-facing item query API (`GET /users/<id>/items`).
+//! Parsing for the item, collection and search listing APIs.
 //!
-//! This module is pure — it turns the request's query string into an
-//! [`ItemQuery`] without touching the database — so the filter/sort/paginate
+//! This module is pure — it turns the request's query string into a
+//! [`Listing`] or [`ItemQuery`] without touching the database — so the filter/sort/paginate
 //! semantics can be unit-tested. `store::query_items` turns the result into SQL.
 
 /// Multi-valued query parameters. axum's `Query<HashMap>` collapses repeated
@@ -78,7 +78,56 @@ impl QMode {
     }
 }
 
-/// Sort key. Each maps to a SQL ordering expression over the item's jsonb.
+/// A listing request the server cannot answer. Upstream rejects these with a
+/// specific message; xotero answers every one with the same 400.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Unsupported;
+
+/// Response format of a listing. atom, bib and the export formats are not
+/// served, so they parse to `Unsupported` rather than falling back to JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Format {
+    Json,
+    Keys,
+    Versions,
+}
+
+impl Format {
+    fn parse(value: Option<&str>) -> Result<Self, Unsupported> {
+        match value {
+            None | Some("json") => Ok(Format::Json),
+            Some("keys") => Ok(Format::Keys),
+            Some("versions") => Ok(Format::Versions),
+            Some(_) => Err(Unsupported),
+        }
+    }
+
+    /// Upstream page size: json pages by 25 (max 100); keys and versions are
+    /// unlimited unless the request names a limit.
+    fn default_limit(self) -> i64 {
+        match self {
+            Format::Json => 25,
+            Format::Keys | Format::Versions => 0,
+        }
+    }
+
+    fn max_limit(self) -> Option<i64> {
+        match self {
+            Format::Json => Some(100),
+            Format::Keys | Format::Versions => None,
+        }
+    }
+}
+
+/// Which object listing is requested; it decides the accepted sorts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListKind {
+    Items,
+    Collections,
+    Searches,
+}
+
+/// Sort key, named after its upstream `sort` value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sort {
     DateModified,
@@ -87,33 +136,93 @@ pub enum Sort {
     Creator,
     Date,
     ItemType,
+    Publisher,
+    PublicationTitle,
+    JournalAbbreviation,
+    Language,
+    AccessDate,
+    LibraryCatalog,
+    CallNumber,
+    Rights,
+    Extra,
+    AddedBy,
 }
 
 impl Sort {
-    fn parse(value: Option<&str>) -> Self {
-        match value {
-            Some("dateAdded") => Sort::DateAdded,
-            Some("title") => Sort::Title,
-            Some("creator") => Sort::Creator,
-            Some("date") => Sort::Date,
-            Some("itemType") => Sort::ItemType,
-            _ => Sort::DateModified,
+    const ALL: [(&'static str, Sort); 16] = [
+        ("dateModified", Sort::DateModified),
+        ("dateAdded", Sort::DateAdded),
+        ("title", Sort::Title),
+        ("creator", Sort::Creator),
+        ("date", Sort::Date),
+        ("itemType", Sort::ItemType),
+        ("publisher", Sort::Publisher),
+        ("publicationTitle", Sort::PublicationTitle),
+        ("journalAbbreviation", Sort::JournalAbbreviation),
+        ("language", Sort::Language),
+        ("accessDate", Sort::AccessDate),
+        ("libraryCatalog", Sort::LibraryCatalog),
+        ("callNumber", Sort::CallNumber),
+        ("rights", Sort::Rights),
+        ("extra", Sort::Extra),
+        ("addedBy", Sort::AddedBy),
+    ];
+
+    fn parse(value: &str, kind: ListKind) -> Result<Self, Unsupported> {
+        let sort = Sort::ALL
+            .iter()
+            .find(|(name, _)| *name == value)
+            .map(|(_, sort)| *sort)
+            .ok_or(Unsupported)?;
+        match kind {
+            ListKind::Items => Ok(sort),
+            ListKind::Collections | ListKind::Searches => match sort {
+                Sort::Title | Sort::DateAdded | Sort::DateModified => Ok(sort),
+                _ => Err(Unsupported),
+            },
         }
     }
 
-    /// The SQL expression to order by. `date`/`itemType` use the generated
+    pub fn name(self) -> &'static str {
+        Sort::ALL
+            .iter()
+            .find(|(_, sort)| *sort == self)
+            .map(|(name, _)| *name)
+            .expect("every sort is named")
+    }
+
+    /// Upstream `getDefaultDirection`: date fields newest first.
+    pub fn default_direction(self) -> Direction {
+        if self.name().starts_with("date") {
+            Direction::Desc
+        } else {
+            Direction::Asc
+        }
+    }
+
+    /// The SQL expression to order items by. `date`/`itemType` use the generated
     /// columns (migration 0006) — `date_year` is the first 4-digit year from the
     /// freeform date, so "circa 1990" / "January 2000" sort chronologically
     /// rather than by their leading character. `creator` orders by the first
-    /// creator's last name; the rest read a top-level jsonb field.
+    /// creator's last name; the rest read a top-level jsonb field. xotero
+    /// records no adding user, so `addedBy` orders by `dateAdded`.
     pub fn order_expr(self) -> &'static str {
         match self {
             Sort::DateModified => "data->>'dateModified'",
-            Sort::DateAdded => "data->>'dateAdded'",
+            Sort::DateAdded | Sort::AddedBy => "data->>'dateAdded'",
             Sort::Title => "data->>'title'",
             Sort::Creator => "data->'creators'->0->>'lastName'",
             Sort::Date => "date_year",
             Sort::ItemType => "item_type",
+            Sort::Publisher => "data->>'publisher'",
+            Sort::PublicationTitle => "data->>'publicationTitle'",
+            Sort::JournalAbbreviation => "data->>'journalAbbreviation'",
+            Sort::Language => "data->>'language'",
+            Sort::AccessDate => "data->>'accessDate'",
+            Sort::LibraryCatalog => "data->>'libraryCatalog'",
+            Sort::CallNumber => "data->>'callNumber'",
+            Sort::Rights => "data->>'rights'",
+            Sort::Extra => "data->>'extra'",
         }
     }
 }
@@ -125,10 +234,11 @@ pub enum Direction {
 }
 
 impl Direction {
-    fn parse(value: Option<&str>) -> Self {
+    fn parse(value: &str) -> Result<Self, Unsupported> {
         match value {
-            Some("asc") => Direction::Asc,
-            _ => Direction::Desc,
+            "asc" => Ok(Direction::Asc),
+            "desc" => Ok(Direction::Desc),
+            _ => Err(Unsupported),
         }
     }
 
@@ -140,11 +250,63 @@ impl Direction {
     }
 }
 
-const DEFAULT_LIMIT: i64 = 25;
-const MAX_LIMIT: i64 = 100;
+/// The paging and rendering half of a listing request, shared by items,
+/// collections and searches.
+#[derive(Debug)]
+pub struct Listing {
+    pub format: Format,
+    pub sort: Sort,
+    pub direction: Direction,
+    /// Page size; 0 means unlimited.
+    pub limit: i64,
+    pub start: i64,
+    pub since: Option<i64>,
+}
 
-/// A parsed item listing request: a search term, filters, an ordering and a page
-/// window. Built from the query string; consumed by `store::query_items`.
+impl Listing {
+    pub fn parse(params: &Params, kind: ListKind) -> Result<Self, Unsupported> {
+        let format = Format::parse(params.get("format"))?;
+
+        // Upstream moves `sort=asc|desc` to the direction of the default sort.
+        let (sort, sort_direction) = match params.get("sort") {
+            None => (Sort::DateModified, None),
+            Some(value @ ("asc" | "desc")) => (Sort::DateModified, Some(Direction::parse(value)?)),
+            Some(value) => (Sort::parse(value, kind)?, None),
+        };
+        let direction = match (sort_direction, params.get("direction")) {
+            (Some(direction), _) => direction,
+            (None, Some(value)) => Direction::parse(value)?,
+            (None, None) => sort.default_direction(),
+        };
+
+        // Like upstream, a non-positive or unparseable limit keeps the default.
+        let limit = match params.get("limit").and_then(|s| s.parse::<i64>().ok()) {
+            Some(n) if n > 0 => format.max_limit().map_or(n, |max| n.min(max)),
+            _ => format.default_limit(),
+        };
+        let start = params
+            .get("start")
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|n| *n >= 0)
+            .unwrap_or(0);
+        let since = params
+            .get("since")
+            .map(|s| s.parse::<i64>().map_err(|_| Unsupported))
+            .transpose()?;
+
+        Ok(Listing {
+            format,
+            sort,
+            direction,
+            limit,
+            start,
+            since,
+        })
+    }
+}
+
+/// A parsed item listing request: a search term, filters and the shared
+/// listing window. Built from the query string; consumed by `store::query_items`.
 #[derive(Debug)]
 pub struct ItemQuery {
     pub q: Option<String>,
@@ -153,10 +315,7 @@ pub struct ItemQuery {
     /// AND of OR-groups: each repeated `tag` param is one group, `||`-split into
     /// alternatives. An item must carry a tag from every group.
     pub tags: Vec<Vec<String>>,
-    pub sort: Sort,
-    pub direction: Direction,
-    pub limit: i64,
-    pub start: i64,
+    pub listing: Listing,
     pub include_trashed: bool,
     /// Convenience-route filters, set by the handler rather than parsed from the
     /// query string: `top` keeps only top-level items (no `parentItem`),
@@ -168,7 +327,7 @@ pub struct ItemQuery {
 }
 
 impl ItemQuery {
-    pub fn from_params(params: &Params) -> Self {
+    pub fn from_params(params: &Params) -> Result<Self, Unsupported> {
         let q = params
             .get("q")
             .map(str::trim)
@@ -189,36 +348,19 @@ impl ItemQuery {
             .filter(|group: &Vec<String>| !group.is_empty())
             .collect();
 
-        // Page window: default 25, hard cap 100. A non-positive or unparseable
-        // limit falls back to the default rather than returning nothing.
-        let limit = params
-            .get("limit")
-            .and_then(|s| s.parse::<i64>().ok())
-            .filter(|n| *n >= 1)
-            .map(|n| n.min(MAX_LIMIT))
-            .unwrap_or(DEFAULT_LIMIT);
-        let start = params
-            .get("start")
-            .and_then(|s| s.parse::<i64>().ok())
-            .filter(|n| *n >= 0)
-            .unwrap_or(0);
-
         let include_trashed = matches!(params.get("includeTrashed"), Some("1") | Some("true"));
 
-        ItemQuery {
+        Ok(ItemQuery {
             q,
             qmode: QMode::parse(params.get("qmode")),
             item_type: TypeFilter::parse(params.get("itemType")),
             tags,
-            sort: Sort::parse(params.get("sort")),
-            direction: Direction::parse(params.get("direction")),
-            limit,
-            start,
+            listing: Listing::parse(params, ListKind::Items)?,
             include_trashed,
             top: false,
             only_trashed: false,
             collection: None,
-        }
+        })
     }
 }
 
@@ -227,7 +369,7 @@ mod tests {
     use super::*;
 
     fn query(raw: &str) -> ItemQuery {
-        ItemQuery::from_params(&Params::parse(Some(raw)))
+        ItemQuery::from_params(&Params::parse(Some(raw))).unwrap()
     }
 
     #[test]
@@ -235,10 +377,10 @@ mod tests {
         let q = query("");
         assert!(q.q.is_none());
         assert_eq!(q.qmode, QMode::TitleCreatorYear);
-        assert_eq!(q.sort, Sort::DateModified);
-        assert_eq!(q.direction, Direction::Desc);
-        assert_eq!(q.limit, 25);
-        assert_eq!(q.start, 0);
+        assert_eq!(q.listing.sort, Sort::DateModified);
+        assert_eq!(q.listing.direction, Direction::Desc);
+        assert_eq!(q.listing.limit, 25);
+        assert_eq!(q.listing.start, 0);
         assert!(!q.include_trashed);
         assert!(q.tags.is_empty());
         assert_eq!(q.item_type, TypeFilter::default());
@@ -289,12 +431,12 @@ mod tests {
 
     #[test]
     fn limit_is_clamped_and_start_floored() {
-        assert_eq!(query("limit=500").limit, 100);
-        assert_eq!(query("limit=0").limit, 25);
-        assert_eq!(query("limit=-3").limit, 25);
-        assert_eq!(query("limit=10").limit, 10);
-        assert_eq!(query("start=-5").start, 0);
-        assert_eq!(query("start=40").start, 40);
+        assert_eq!(query("limit=500").listing.limit, 100);
+        assert_eq!(query("limit=0").listing.limit, 25);
+        assert_eq!(query("limit=-3").listing.limit, 25);
+        assert_eq!(query("limit=10").listing.limit, 10);
+        assert_eq!(query("start=-5").listing.start, 0);
+        assert_eq!(query("start=40").listing.start, 40);
     }
 
     #[test]
@@ -307,18 +449,94 @@ mod tests {
 
     #[test]
     fn sort_and_direction_whitelist() {
-        assert_eq!(query("sort=title").sort, Sort::Title);
-        assert_eq!(query("sort=creator").sort, Sort::Creator);
-        assert_eq!(query("sort=nonsense").sort, Sort::DateModified);
-        assert_eq!(query("direction=asc").direction, Direction::Asc);
-        assert_eq!(query("direction=nonsense").direction, Direction::Desc);
+        assert_eq!(query("sort=title").listing.sort, Sort::Title);
+        assert_eq!(query("sort=creator").listing.sort, Sort::Creator);
+        assert_eq!(query("direction=asc").listing.direction, Direction::Asc);
         assert_eq!(
             Sort::Creator.order_expr(),
             "data->'creators'->0->>'lastName'"
         );
         // date/itemType sort via the generated columns (migration 0006).
-        assert_eq!(query("sort=date").sort, Sort::Date);
+        assert_eq!(query("sort=date").listing.sort, Sort::Date);
         assert_eq!(Sort::Date.order_expr(), "date_year");
         assert_eq!(Sort::ItemType.order_expr(), "item_type");
+    }
+
+    fn listing(raw: &str, kind: ListKind) -> Result<Listing, Unsupported> {
+        Listing::parse(&Params::parse(Some(raw)), kind)
+    }
+
+    #[test]
+    fn listing_rejects_unsupported_requests() {
+        for raw in [
+            "format=bogus",
+            "format=atom",
+            "format=bib",
+            "format=ris",
+            "sort=bogus",
+            "sort=numItems",
+            "sort=itemKeyList",
+            "direction=sideways",
+            "since=abc",
+        ] {
+            assert!(listing(raw, ListKind::Items).is_err(), "{raw}");
+        }
+        assert!(listing("sort=creator", ListKind::Collections).is_err());
+        assert!(listing("sort=publisher", ListKind::Searches).is_err());
+    }
+
+    #[test]
+    fn listing_defaults_follow_upstream() {
+        let l = listing("", ListKind::Items).unwrap();
+        assert_eq!(l.format, Format::Json);
+        assert_eq!(l.sort, Sort::DateModified);
+        assert_eq!(l.direction, Direction::Desc);
+        assert_eq!((l.limit, l.start, l.since), (25, 0, None));
+        assert_eq!(listing("format=keys", ListKind::Items).unwrap().limit, 0);
+        assert_eq!(
+            listing("format=versions", ListKind::Items).unwrap().limit,
+            0
+        );
+        assert_eq!(
+            listing("format=keys&limit=500", ListKind::Items)
+                .unwrap()
+                .limit,
+            500
+        );
+        assert_eq!(listing("limit=500", ListKind::Items).unwrap().limit, 100);
+        assert_eq!(listing("limit=0", ListKind::Items).unwrap().limit, 25);
+        assert_eq!(
+            listing("since=17", ListKind::Items).unwrap().since,
+            Some(17)
+        );
+    }
+
+    #[test]
+    fn direction_defaults_by_sort() {
+        let dir = |raw| listing(raw, ListKind::Items).unwrap().direction;
+        assert_eq!(dir("sort=title"), Direction::Asc);
+        assert_eq!(dir("sort=publisher"), Direction::Asc);
+        assert_eq!(dir("sort=addedBy"), Direction::Asc);
+        assert_eq!(dir("sort=date"), Direction::Desc);
+        assert_eq!(dir("sort=dateAdded"), Direction::Desc);
+        assert_eq!(dir("sort=title&direction=desc"), Direction::Desc);
+        // sort=asc|desc is a direction on the default sort.
+        let l = listing("sort=asc", ListKind::Items).unwrap();
+        assert_eq!((l.sort, l.direction), (Sort::DateModified, Direction::Asc));
+    }
+
+    #[test]
+    fn collections_and_searches_accept_their_sorts() {
+        for kind in [ListKind::Collections, ListKind::Searches] {
+            for raw in [
+                "sort=title",
+                "sort=dateAdded",
+                "sort=dateModified",
+                "format=keys",
+                "format=versions",
+            ] {
+                assert!(listing(raw, kind).is_ok(), "{raw}");
+            }
+        }
     }
 }

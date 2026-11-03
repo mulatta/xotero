@@ -9,10 +9,10 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::error::server_error;
+use crate::error::{server_error, unsupported};
 use crate::http::access::{request_access, request_library, request_permissions};
 use crate::http::headers::{
-    conflict, csv_of, current_headers, next_link, precondition, since_of, version_headers,
+    conflict, csv_of, current_headers, next_link, precondition, version_headers,
 };
 use crate::http::validation::valid_object_key;
 use crate::{query, store, AppState};
@@ -23,9 +23,18 @@ pub(crate) async fn read(
     state: &AppState,
     kind: &str,
     params: HashMap<String, String>,
+    raw: Option<&str>,
 ) -> Response {
-    if params.get("format").map(String::as_str) == Some("versions") {
-        let since = since_of(&params);
+    let list_kind = match kind {
+        "collection" => query::ListKind::Collections,
+        _ => query::ListKind::Searches,
+    };
+    let listing = match query::Listing::parse(&query::Params::parse(raw), list_kind) {
+        Ok(listing) => listing,
+        Err(query::Unsupported) => return reject(state).await,
+    };
+    if listing.format == query::Format::Versions {
+        let since = listing.since.unwrap_or(0);
         // Always 200 with the (possibly empty) versions map. The client's
         // `getVersions` sends no `If-Modified-Since-Version` header and treats a
         // 304 as "no data", which then mismatches its library-version check and
@@ -50,16 +59,26 @@ pub(crate) async fn read(
     }
 }
 
+/// 400 for a listing request that `query` rejected.
+async fn reject(state: &AppState) -> Response {
+    match current_headers(state).await {
+        Ok(headers) => unsupported(headers),
+        Err(error) => server_error("unsupported version", error),
+    }
+}
+
 /// The two sync reads shared by `/items` and `/items/top`: the `format=versions`
 /// map and the `?itemKey=…` batch. With `top`, the versions map is restricted to
 /// top-level items (the client's parent-first phase). Returns `None` when the
 /// request carries neither, i.e. it is a CLI query rather than a sync read.
-async fn item_sync_read(state: &AppState, params: &query::Params, top: bool) -> Option<Response> {
-    if params.get("format") == Some("versions") {
-        let since = params
-            .get("since")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0);
+async fn item_sync_read(
+    state: &AppState,
+    params: &query::Params,
+    q: &query::ItemQuery,
+    top: bool,
+) -> Option<Response> {
+    if q.listing.format == query::Format::Versions {
+        let since = q.listing.since.unwrap_or(0);
         // Always 200 + map (never 304); see `read` — a 304 here loops the client.
         let current = match store::current_version(&state.pool, request_library()).await {
             Ok(current) => current,
@@ -134,8 +153,9 @@ async fn item_listing(
                 Err(error) => return server_error("items query version", error),
             };
             headers.insert("total-results", total.to_string().parse().unwrap());
-            if q.start + q.limit < total {
-                let link = next_link(&state.config, path, raw, q.start + q.limit);
+            let (start, limit) = (q.listing.start, q.listing.limit);
+            if start + limit < total {
+                let link = next_link(&state.config, path, raw, start + limit);
                 headers.insert("link", link.parse().unwrap());
             }
             (headers, Json(Value::Array(items))).into_response()
@@ -147,12 +167,8 @@ async fn item_listing(
 /// `format=keys` returns every matching item key (no paging) as a plain-text
 /// newline list — the shape Zotero's `getKeys()` parses (it reads the body as
 /// `responseText.split('\n')`). Returns `None` for any other format.
-async fn item_keys_response(
-    state: &AppState,
-    params: &query::Params,
-    q: &query::ItemQuery,
-) -> Option<Response> {
-    if params.get("format") != Some("keys") {
+async fn item_keys_response(state: &AppState, q: &query::ItemQuery) -> Option<Response> {
+    if q.listing.format != query::Format::Keys {
         return None;
     }
     Some(
@@ -182,11 +198,14 @@ pub(crate) async fn items_get(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&state, &params, false).await {
+    let q = match query::ItemQuery::from_params(&params) {
+        Ok(q) => q,
+        Err(query::Unsupported) => return reject(&state).await,
+    };
+    if let Some(resp) = item_sync_read(&state, &params, &q, false).await {
         return resp;
     }
-    let q = query::ItemQuery::from_params(&params);
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &q).await {
         return resp;
     }
     item_listing(&state, uri.path(), raw.as_deref(), &q).await
@@ -200,12 +219,15 @@ pub(crate) async fn items_top(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    if let Some(resp) = item_sync_read(&state, &params, true).await {
+    let mut q = match query::ItemQuery::from_params(&params) {
+        Ok(q) => q,
+        Err(query::Unsupported) => return reject(&state).await,
+    };
+    if let Some(resp) = item_sync_read(&state, &params, &q, true).await {
         return resp;
     }
-    let mut q = query::ItemQuery::from_params(&params);
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &q).await {
         return resp;
     }
     item_listing(&state, uri.path(), raw.as_deref(), &q).await
@@ -218,9 +240,12 @@ pub(crate) async fn items_trash(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    let mut q = query::ItemQuery::from_params(&params);
+    let mut q = match query::ItemQuery::from_params(&params) {
+        Ok(q) => q,
+        Err(query::Unsupported) => return reject(&state).await,
+    };
     q.only_trashed = true;
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &q).await {
         return resp;
     }
     item_listing(&state, uri.path(), raw.as_deref(), &q).await
@@ -234,9 +259,12 @@ pub(crate) async fn collection_items(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    let mut q = query::ItemQuery::from_params(&params);
+    let mut q = match query::ItemQuery::from_params(&params) {
+        Ok(q) => q,
+        Err(query::Unsupported) => return reject(&state).await,
+    };
     q.collection = Some(key.clone());
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &q).await {
         return resp;
     }
     item_listing(&state, uri.path(), raw.as_deref(), &q).await
@@ -252,10 +280,13 @@ pub(crate) async fn collection_items_top(
     RawQuery(raw): RawQuery,
 ) -> Response {
     let params = query::Params::parse(raw.as_deref());
-    let mut q = query::ItemQuery::from_params(&params);
+    let mut q = match query::ItemQuery::from_params(&params) {
+        Ok(q) => q,
+        Err(query::Unsupported) => return reject(&state).await,
+    };
     q.collection = Some(key.clone());
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, &params, &q).await {
+    if let Some(resp) = item_keys_response(&state, &q).await {
         return resp;
     }
     item_listing(&state, uri.path(), raw.as_deref(), &q).await

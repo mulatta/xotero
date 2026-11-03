@@ -193,13 +193,13 @@ pub async fn query_items(
     // order_expr/sql() are fixed strings (no user input), so pushing them raw is
     // safe; nulls sort last so items missing the sort field don't lead.
     sql.push(" order by ")
-        .push(q.sort.order_expr())
+        .push(q.listing.sort.order_expr())
         .push(" ")
-        .push(q.direction.sql())
+        .push(q.listing.direction.sql())
         .push(" nulls last, key asc limit ")
-        .push_bind(q.limit)
+        .push_bind(q.listing.limit)
         .push(" offset ")
-        .push_bind(q.start);
+        .push_bind(q.listing.start);
 
     let items = sql
         .build()
