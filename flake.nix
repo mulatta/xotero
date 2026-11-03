@@ -54,6 +54,7 @@
     {
       overlays.default = final: prev: {
         xotero = prev.callPackage ./nix/packages/xotero { inherit (final) zotero-schema; };
+        translation-server = prev.callPackage ./nix/packages/translation-server { };
         zotero-schema = prev.callPackage ./nix/packages/zotero-schema { };
       };
 
@@ -67,6 +68,7 @@
         in
         {
           inherit zotero-schema;
+          translation-server = pkgs.callPackage ./nix/packages/translation-server { };
           xotero = pkgs.callPackage ./nix/packages/xotero { inherit zotero-schema; };
         }
       );
