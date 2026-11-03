@@ -69,17 +69,16 @@ against the code when the task starts, and update this file when it changes.
 - P1. Pin RustFS to its own nixpkgs input so nixpkgs bumps stop rebuilding the
   patched fixture. Remove the input and the patch once an upstream release
   emits StorageClass in multipart listings.
-- P2. Decide whether VM test scripts move from `checks/*.py` to
-  `nix/checks/<name>/`. Do it before Task 22 or after Task 26, since every
-  Wave D task edits `checks/sync-test.py`.
+- P2. Done. Each VM test keeps its Nix wiring and script together in
+  `nix/checks/<name>/`; `checks/` holds only the contract inventory.
 - P3. Report the missing StorageClass in ListMultipartUploads to RustFS.
 
 ## Lanes
 
 - API: 22a, 22b, 22c, 23, 26, 24, 25, one at a time. Each edits
-  `checks/sync-test.py` and `checks/contracts`, and only one agent may write a
-  path. 22b filters the listings 22a builds; 22c shares only the `versions`
-  format with them. Contract data lives in `checks/contracts/data/`.
+  `nix/checks/nixos-sync/test.py` and `checks/contracts`, and only one agent
+  may write a path. 22b filters the listings 22a builds; 22c shares only the
+  `versions` format with them. Contract data lives in `checks/contracts/data/`.
 - Packaging: 27 and 29 can run beside the API lane.
 - Operations: 33 then 34, 35 then 36. They can run beside the other lanes.
   The first of these tasks creates the `nixos-operations` check.
