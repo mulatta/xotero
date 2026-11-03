@@ -147,3 +147,4 @@ class Fixture(Record):
     kind: Literal["expected-contract"]
     request: Request
     response: Response
+    sequence: list[str] | None = None

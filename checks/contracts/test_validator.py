@@ -136,3 +136,27 @@ def test_incomplete_or_misleading_contracts_fail(tmp_path, mutation):
     # Then exit status, not apparent success text, rejects it.
     assert result.returncode != 0, result.stdout
     assert "accepted" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("listing", "accepted"),
+    [("searches.list.json", True), ("items.json", False)],
+)
+def test_list_meta_is_optional_only_for_searches(tmp_path, listing, accepted):
+    # Given shipped fixtures whose listing entries drop `meta`; upstream search
+    # JSON has none (dataserver model/Search.inc.php:222-255), items always do.
+    names = ("personal.json", "private-group.json", "global.json")
+    fixture_paths = []
+    for name in names:
+        fixtures = json.loads((DATA / name).read_text())
+        for fixture in fixtures:
+            if fixture["contract"].endswith("." + listing):
+                for entry in fixture["response"]["body"]:
+                    entry.pop("meta", None)
+        path = tmp_path / name
+        path.write_text(json.dumps(fixtures))
+        fixture_paths.append(path)
+    # When the public validator CLI runs.
+    result = invoke(DATA / "web-api.json", fixture_paths)
+    # Then only the search listing may omit the object meta.
+    assert (result.returncode == 0) is accepted, result.stderr

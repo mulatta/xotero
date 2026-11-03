@@ -1,0 +1,601 @@
+{
+  "library_version_start": 14,
+  "writes": [
+    {
+      "path_suffix": "/collections",
+      "body": [
+        {
+          "key": "CQLL2222",
+          "name": "Research",
+          "parentCollection": false,
+          "relations": {}
+        },
+        {
+          "key": "CQLS2222",
+          "name": "Systems",
+          "parentCollection": "CQLL2222",
+          "relations": {}
+        }
+      ],
+      "if_unmodified": null
+    },
+    {
+      "path_suffix": "/searches",
+      "body": [
+        {
+          "key": "SRCH2222",
+          "name": "Systems",
+          "conditions": [
+            {
+              "condition": "tag",
+              "operator": "is",
+              "value": "systems"
+            }
+          ]
+        }
+      ],
+      "if_unmodified": null
+    },
+    {
+      "path_suffix": "/items",
+      "body": [
+        {
+          "key": "BQQK2222",
+          "itemType": "book",
+          "title": "Private research",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "Ada",
+              "lastName": "Lovelace"
+            }
+          ],
+          "date": "1843",
+          "collections": [
+            "CQLL2222"
+          ],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:00:00Z",
+          "dateModified": "2024-01-01T00:00:00Z"
+        },
+        {
+          "key": "BKA32222",
+          "itemType": "book",
+          "title": "Book 01",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer01"
+            }
+          ],
+          "date": "1901",
+          "collections": [
+            "CQLL2222"
+          ],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:01:00Z",
+          "dateModified": "2024-01-01T00:01:00Z"
+        },
+        {
+          "key": "BKA42222",
+          "itemType": "book",
+          "title": "Book 02",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "X",
+              "lastName": "Turing"
+            },
+            {
+              "creatorType": "author",
+              "firstName": "X",
+              "lastName": "Hopper"
+            }
+          ],
+          "date": "1902",
+          "collections": [
+            "CQLL2222"
+          ],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:02:00Z",
+          "dateModified": "2024-01-01T00:02:00Z"
+        },
+        {
+          "key": "BKA52222",
+          "itemType": "book",
+          "title": "Book 03",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "X",
+              "lastName": "Knuth"
+            },
+            {
+              "creatorType": "author",
+              "firstName": "X",
+              "lastName": "Dijkstra"
+            },
+            {
+              "creatorType": "author",
+              "firstName": "X",
+              "lastName": "Hoare"
+            }
+          ],
+          "date": "1903",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:03:00Z",
+          "dateModified": "2024-01-01T00:03:00Z"
+        },
+        {
+          "key": "BKA62222",
+          "itemType": "book",
+          "title": "Book 04",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer04"
+            }
+          ],
+          "date": "1904",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:04:00Z",
+          "dateModified": "2024-01-01T00:04:00Z"
+        },
+        {
+          "key": "BKA72222",
+          "itemType": "book",
+          "title": "Book 05",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer05"
+            }
+          ],
+          "date": "1905",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:05:00Z",
+          "dateModified": "2024-01-01T00:05:00Z"
+        },
+        {
+          "key": "BKA82222",
+          "itemType": "book",
+          "title": "Book 06",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer06"
+            }
+          ],
+          "date": "1906",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:06:00Z",
+          "dateModified": "2024-01-01T00:06:00Z"
+        },
+        {
+          "key": "BKA92222",
+          "itemType": "book",
+          "title": "Book 07",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer07"
+            }
+          ],
+          "date": "1907",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:07:00Z",
+          "dateModified": "2024-01-01T00:07:00Z"
+        },
+        {
+          "key": "BKAA2222",
+          "itemType": "book",
+          "title": "Book 08",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer08"
+            }
+          ],
+          "date": "1908",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:08:00Z",
+          "dateModified": "2024-01-01T00:08:00Z"
+        },
+        {
+          "key": "BKAB2222",
+          "itemType": "book",
+          "title": "Book 09",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer09"
+            }
+          ],
+          "date": "1909",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:09:00Z",
+          "dateModified": "2024-01-01T00:09:00Z"
+        },
+        {
+          "key": "BKAC2222",
+          "itemType": "book",
+          "title": "Book 10",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer10"
+            }
+          ],
+          "date": "1910",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:10:00Z",
+          "dateModified": "2024-01-01T00:10:00Z"
+        },
+        {
+          "key": "BKAD2222",
+          "itemType": "book",
+          "title": "Book 11",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer11"
+            }
+          ],
+          "date": "1911",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:11:00Z",
+          "dateModified": "2024-01-01T00:11:00Z"
+        },
+        {
+          "key": "BKAE2222",
+          "itemType": "book",
+          "title": "Book 12",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer12"
+            }
+          ],
+          "date": "1912",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:12:00Z",
+          "dateModified": "2024-01-01T00:12:00Z"
+        },
+        {
+          "key": "BKAF2222",
+          "itemType": "book",
+          "title": "Book 13",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer13"
+            }
+          ],
+          "date": "1913",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:13:00Z",
+          "dateModified": "2024-01-01T00:13:00Z"
+        },
+        {
+          "key": "BKAG2222",
+          "itemType": "book",
+          "title": "Book 14",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer14"
+            }
+          ],
+          "date": "1914",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:14:00Z",
+          "dateModified": "2024-01-01T00:14:00Z"
+        },
+        {
+          "key": "BKAH2222",
+          "itemType": "book",
+          "title": "Book 15",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer15"
+            }
+          ],
+          "date": "1915",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:15:00Z",
+          "dateModified": "2024-01-01T00:15:00Z"
+        },
+        {
+          "key": "BKAI2222",
+          "itemType": "book",
+          "title": "Book 16",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer16"
+            }
+          ],
+          "date": "1916",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:16:00Z",
+          "dateModified": "2024-01-01T00:16:00Z"
+        },
+        {
+          "key": "BKAJ2222",
+          "itemType": "book",
+          "title": "Book 17",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer17"
+            }
+          ],
+          "date": "1917",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:17:00Z",
+          "dateModified": "2024-01-01T00:17:00Z"
+        },
+        {
+          "key": "BKAK2222",
+          "itemType": "book",
+          "title": "Book 18",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer18"
+            }
+          ],
+          "date": "1918",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:18:00Z",
+          "dateModified": "2024-01-01T00:18:00Z"
+        },
+        {
+          "key": "BKAL2222",
+          "itemType": "book",
+          "title": "Book 19",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer19"
+            }
+          ],
+          "date": "1919",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:19:00Z",
+          "dateModified": "2024-01-01T00:19:00Z"
+        },
+        {
+          "key": "BKAM2222",
+          "itemType": "book",
+          "title": "Book 20",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer20"
+            }
+          ],
+          "date": "1920",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:20:00Z",
+          "dateModified": "2024-01-01T00:20:00Z"
+        },
+        {
+          "key": "BKAN2222",
+          "itemType": "book",
+          "title": "Book 21",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer21"
+            }
+          ],
+          "date": "1921",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:21:00Z",
+          "dateModified": "2024-01-01T00:21:00Z"
+        },
+        {
+          "key": "BKAP2222",
+          "itemType": "book",
+          "title": "Book 22",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer22"
+            }
+          ],
+          "date": "1922",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:22:00Z",
+          "dateModified": "2024-01-01T00:22:00Z"
+        },
+        {
+          "key": "BKAQ2222",
+          "itemType": "book",
+          "title": "Book 23",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer23"
+            }
+          ],
+          "date": "1923",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:23:00Z",
+          "dateModified": "2024-01-01T00:23:00Z"
+        },
+        {
+          "key": "BKAR2222",
+          "itemType": "book",
+          "title": "Book 24",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer24"
+            }
+          ],
+          "date": "1924",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:24:00Z",
+          "dateModified": "2024-01-01T00:24:00Z"
+        },
+        {
+          "key": "BKAS2222",
+          "itemType": "book",
+          "title": "Book 25",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer25"
+            }
+          ],
+          "date": "1925",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:25:00Z",
+          "dateModified": "2024-01-01T00:25:00Z"
+        },
+        {
+          "key": "BKAT2222",
+          "itemType": "book",
+          "title": "Book 26",
+          "creators": [
+            {
+              "creatorType": "author",
+              "firstName": "W",
+              "lastName": "Writer26"
+            }
+          ],
+          "date": "1926",
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:26:00Z",
+          "dateModified": "2024-01-01T00:26:00Z"
+        },
+        {
+          "key": "LINK2222",
+          "itemType": "attachment",
+          "linkMode": "linked_url",
+          "title": "Book 00 link",
+          "url": "https://example.org/",
+          "parentItem": "BQQK2222",
+          "contentType": "",
+          "charset": "",
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-02T00:00:00Z",
+          "dateModified": "2024-01-02T00:00:00Z"
+        },
+        {
+          "key": "TRSH2222",
+          "itemType": "book",
+          "title": "Trashed book",
+          "creators": [
+            {
+              "creatorType": "author",
+              "lastName": "Gone"
+            }
+          ],
+          "date": "1950",
+          "deleted": 1,
+          "collections": [],
+          "tags": [],
+          "relations": {},
+          "dateAdded": "2024-01-01T00:00:00Z",
+          "dateModified": "2024-01-01T00:00:00Z"
+        }
+      ],
+      "if_unmodified": null
+    },
+    {
+      "path_suffix": "/items",
+      "body": [
+        {
+          "key": "BQQK2222",
+          "version": 17,
+          "tags": [
+            {
+              "tag": "systems"
+            }
+          ],
+          "dateModified": "2024-03-01T00:00:00Z"
+        }
+      ],
+      "if_unmodified": 17
+    }
+  ]
+}

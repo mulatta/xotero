@@ -4,7 +4,60 @@ import re
 from typing import assert_never
 
 from models import Contract, Fixture
+from pydantic import JsonValue
 from wire import OBJECT_KEY, ContractError, require, validate_wire
+
+
+# Task 22a listings whose fixture records the full key order across every page,
+# so the runtime check can page through the live listing and compare.
+LISTING_SEQUENCE = frozenset(
+    [
+        f"{listing}.{fmt}"
+        for listing in (
+            "items",
+            "items-top",
+            "items-trash",
+            "collection-items",
+            "collection-items-top",
+        )
+        for fmt in ("json", "keys")
+    ]
+    + [
+        "collections.list.json",
+        "collections.list.keys",
+        "searches.list.json",
+        "searches.list.keys",
+        "items.stable-page",
+        "items.since-refresh",
+    ]
+)
+
+
+def check_sequence(contract: Contract, fixture: Fixture) -> None:
+    """Bind the fixture page to its slice of the full listing order."""
+    identity = contract.id
+    if identity.partition(".")[2] not in LISTING_SEQUENCE:
+        return
+    sequence = fixture.sequence
+    if sequence is None:
+        raise ContractError(f"{identity}: missing key sequence")
+    query = fixture.request.query
+    start = query.get("start", 0)
+    limit = query.get("limit", 25 if contract.format == "json" else 0)
+    if not isinstance(start, int) or not isinstance(limit, int):
+        raise ContractError(f"{identity}: page bounds")
+    payload = fixture.response.body
+    keys: list[JsonValue]
+    if isinstance(payload, str):
+        keys = list(payload.splitlines())
+    elif isinstance(payload, list):
+        keys = [
+            entry.get("key") if isinstance(entry, dict) else None for entry in payload
+        ]
+    else:
+        raise ContractError(f"{identity}: listing body")
+    page = sequence[start : start + limit] if limit else sequence[start:]
+    require(keys == page, f"{identity}: page is not the sequence slice")
 
 
 def validate_fixture(contract: Contract, fixture: Fixture) -> None:
@@ -12,6 +65,7 @@ def validate_fixture(contract: Contract, fixture: Fixture) -> None:
     identity = contract.id
     request, response = fixture.request, fixture.response
     validate_wire(contract, fixture)
+    check_sequence(contract, fixture)
     path = contract.path
     for name, value in {
         "{userId}": "101",
@@ -95,10 +149,13 @@ def validate_fixture(contract: Contract, fixture: Fixture) -> None:
             if not isinstance(payload, list):
                 raise ContractError(f"{identity}: list envelope")
             require(bool(payload), f"{identity}: empty list fixture")
+            # Upstream search JSON carries no meta (model/Search.inc.php:222-255).
+            wrapper = {"key", "version", "data", "links"}
+            if not contract.path.endswith("/searches"):
+                wrapper.add("meta")
             for entry in payload:
                 require(
-                    isinstance(entry, dict)
-                    and {"key", "version", "data", "links", "meta"} <= entry.keys(),
+                    isinstance(entry, dict) and wrapper <= entry.keys(),
                     f"{identity}: incomplete object wrapper",
                 )
         case "write-report":
