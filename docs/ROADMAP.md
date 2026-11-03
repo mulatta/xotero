@@ -302,7 +302,7 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-web-library -L` returns successful real rendered browser assertions and network trace.
 ### Wave F: operations and release gates
 
-- [ ] 33. Add controlled explicit migration command
+- [x] 33. Add controlled explicit migration command
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-operations -L` fresh migration and populated v13->current upgrade succeed before serving.
   - `xotero migrate` applies pending migrations and exits. Serving still
     applies pending migrations at startup.
