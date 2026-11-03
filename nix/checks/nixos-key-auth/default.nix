@@ -9,16 +9,16 @@ let
         inherit path;
       })
       [
-        ../../xotero/migrations/0001_init.sql
-        ../../xotero/migrations/0002_files.sql
-        ../../xotero/migrations/0003_fulltext.sql
-        ../../xotero/migrations/0004_fulltext_search.sql
-        ../../xotero/migrations/0005_item_search.sql
-        ../../xotero/migrations/0006_item_columns.sql
-        ../../xotero/migrations/0007_item_columns_fixes.sql
+        ../../../xotero/migrations/0001_init.sql
+        ../../../xotero/migrations/0002_files.sql
+        ../../../xotero/migrations/0003_fulltext.sql
+        ../../../xotero/migrations/0004_fulltext_search.sql
+        ../../../xotero/migrations/0005_item_search.sql
+        ../../../xotero/migrations/0006_item_columns.sql
+        ../../../xotero/migrations/0007_item_columns_fixes.sql
       ]
   );
-  v13Migrations = import ./v13-migrations.nix { pkgs = testPkgs; };
+  v13Migrations = import ../v13-migrations.nix { pkgs = testPkgs; };
 in
 testPkgs.testers.runNixOSTest {
   name = "xotero-key-auth";
@@ -26,7 +26,7 @@ testPkgs.testers.runNixOSTest {
   nodes.machine = {
     imports = [
       self.nixosModules.xotero
-      (import ./aws-client.nix { pkgs = testPkgs; })
+      (import ../aws-client.nix { pkgs = testPkgs; })
     ];
 
     services.xotero = {
@@ -52,7 +52,7 @@ testPkgs.testers.runNixOSTest {
 
     services.rustfs = {
       enable = true;
-      package = import ./rustfs.nix { pkgs = testPkgs; };
+      package = import ../rustfs.nix { pkgs = testPkgs; };
       environmentFile = toString (
         testPkgs.writeText "rustfs-secrets.env" ''
           RUSTFS_ACCESS_KEY=rustfsadmin
@@ -71,7 +71,7 @@ testPkgs.testers.runNixOSTest {
 
     environment.etc."xotero-test/migrations".source = legacyMigrations;
     environment.etc."xotero-test/v13-migrations".source = v13Migrations;
-    environment.etc."xotero-test/current-migrations".source = ../../xotero/migrations;
+    environment.etc."xotero-test/current-migrations".source = ../../../xotero/migrations;
     environment.systemPackages = [
       testPkgs.curl
       testPkgs.jq
@@ -103,5 +103,5 @@ testPkgs.testers.runNixOSTest {
     ];
   };
 
-  testScript = builtins.readFile ../../checks/key-auth-test.py;
+  testScript = builtins.readFile ./test.py;
 }

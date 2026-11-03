@@ -2,7 +2,7 @@
 
 let
   testPkgs = pkgs.extend self.overlays.default;
-  v13Migrations = import ./v13-migrations.nix { pkgs = testPkgs; };
+  v13Migrations = import ../v13-migrations.nix { pkgs = testPkgs; };
 in
 testPkgs.testers.runNixOSTest {
   name = "xotero-operations";
@@ -10,7 +10,7 @@ testPkgs.testers.runNixOSTest {
   nodes.machine = {
     imports = [
       self.nixosModules.xotero
-      (import ./aws-client.nix { pkgs = testPkgs; })
+      (import ../aws-client.nix { pkgs = testPkgs; })
     ];
 
     services.xotero = {
@@ -32,7 +32,7 @@ testPkgs.testers.runNixOSTest {
 
     services.rustfs = {
       enable = true;
-      package = import ./rustfs.nix { pkgs = testPkgs; };
+      package = import ../rustfs.nix { pkgs = testPkgs; };
       environmentFile = toString (
         testPkgs.writeText "rustfs-secrets.env" ''
           RUSTFS_ACCESS_KEY=rustfsadmin
@@ -50,7 +50,7 @@ testPkgs.testers.runNixOSTest {
     };
 
     environment.etc."xotero-test/v13-migrations".source = v13Migrations;
-    environment.etc."xotero-test/current-migrations".source = ../../xotero/migrations;
+    environment.etc."xotero-test/current-migrations".source = ../../../xotero/migrations;
     environment.systemPackages = [
       testPkgs.curl
       testPkgs.jq
@@ -60,5 +60,5 @@ testPkgs.testers.runNixOSTest {
     ];
   };
 
-  testScript = builtins.readFile ../../checks/operations-test.py;
+  testScript = builtins.readFile ./test.py;
 }

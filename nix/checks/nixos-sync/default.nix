@@ -13,7 +13,7 @@ testPkgs.testers.runNixOSTest {
   nodes.machine = {
     imports = [
       self.nixosModules.xotero
-      (import ./aws-client.nix { pkgs = testPkgs; })
+      (import ../aws-client.nix { pkgs = testPkgs; })
     ];
 
     services.xotero = {
@@ -44,7 +44,7 @@ testPkgs.testers.runNixOSTest {
     # Share the pinned provider compatibility correction across service checks.
     services.rustfs = {
       enable = true;
-      package = import ./rustfs.nix { pkgs = testPkgs; };
+      package = import ../rustfs.nix { pkgs = testPkgs; };
       environmentFile = toString (
         testPkgs.writeText "rustfs-secrets.env" ''
           RUSTFS_ACCESS_KEY=rustfsadmin
@@ -57,7 +57,7 @@ testPkgs.testers.runNixOSTest {
       log_lock_waits = true;
       deadlock_timeout = "10ms";
     };
-    environment.etc."xotero-checkpoint9-migrations".source = ../../xotero/migrations;
+    environment.etc."xotero-checkpoint9-migrations".source = ../../../xotero/migrations;
     environment.etc."xotero-test/zotero-schema.json".source = "${testPkgs.zotero-schema}/schema.json";
 
     environment.systemPackages = [
@@ -72,7 +72,7 @@ testPkgs.testers.runNixOSTest {
   };
 
   testScript = ''
-    contract_data = "${../../checks/contracts/data}"
+    contract_data = "${../../../checks/contracts/data}"
   ''
-  + builtins.readFile ../../checks/sync-test.py;
+  + builtins.readFile ./test.py;
 }

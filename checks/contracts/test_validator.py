@@ -82,7 +82,7 @@ def test_incomplete_or_misleading_contracts_fail(tmp_path, mutation):
             inventory["contracts"][0]["proof"] = {
                 "state": "covered",
                 "task": 1,
-                "file": "checks/sync-test.py",
+                "file": "nix/checks/nixos-sync/test.py",
                 "subtest": "imaginary passing test",
                 "reason": "not real",
             }

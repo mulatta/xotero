@@ -8,11 +8,11 @@ let
       map
         (name: {
           inherit name;
-          path = ../../xotero/migrations + "/${name}";
+          path = ../../../xotero/migrations + "/${name}";
         })
         (
           builtins.filter (name: builtins.substring 0 4 name <= version) (
-            builtins.attrNames (builtins.readDir ../../xotero/migrations)
+            builtins.attrNames (builtins.readDir ../../../xotero/migrations)
           )
         )
     );
@@ -44,7 +44,7 @@ testPkgs.testers.runNixOSTest {
     '';
     services.rustfs = {
       enable = true;
-      package = import ./rustfs.nix { pkgs = testPkgs; };
+      package = import ../rustfs.nix { pkgs = testPkgs; };
       environmentFile = toString (
         testPkgs.writeText "admin-rustfs.env" ''
           RUSTFS_ACCESS_KEY=rustfsadmin
@@ -57,7 +57,7 @@ testPkgs.testers.runNixOSTest {
     environment.etc."xotero-test/v18-migrations".source = v18Migrations;
     environment.etc."xotero-test/v19-migrations".source = v19Migrations;
     environment.etc."xotero-test/v20-migrations".source = v20Migrations;
-    environment.etc."xotero-test/current-migrations".source = ../../xotero/migrations;
+    environment.etc."xotero-test/current-migrations".source = ../../../xotero/migrations;
     environment.etc."xotero-test/kdf".text = "0123456789abcdef0123456789abcdef";
     environment.etc."xotero-test/recovery-key".text = "fixture-recovery";
     environment.etc."xotero-test/admin-recovery-key".text = "fixture-admin-recovery";
@@ -73,5 +73,5 @@ testPkgs.testers.runNixOSTest {
       ]))
     ];
   };
-  testScript = builtins.readFile ../../checks/admin-test.py;
+  testScript = builtins.readFile ./test.py;
 }

@@ -86,7 +86,7 @@ def validate(inventory: Inventory, fixtures: list[Fixture]) -> None:
         proof = contract.proof
         if proof.state in {"covered", "partial"}:
             if (
-                proof.file not in {"checks/sync-test.py", "checks/key-auth-test.py"}
+                proof.file not in {"nix/checks/nixos-sync/test.py", "nix/checks/nixos-key-auth/test.py"}
                 or proof.file is None
             ):
                 raise ContractError(f"{identity}: unsupported proof file")
