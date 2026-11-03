@@ -43,7 +43,9 @@ pub use groups::{
 pub use identity::{authenticate_api_key, bootstrap_identity, bootstrap_principal};
 pub use keys::{admin_key_guard, deny_key, key_guard, ApiKeyTarget};
 pub use mutation_authority::MutationProof;
-pub use objects::{delete, objects, query_items, write, ObjectMutation};
+pub use objects::{
+    child_counts, delete, library_envelope, objects, query_items, write, ObjectMutation,
+};
 pub use sessions::{
     cancel_login_session, complete_login_session, create_login_session, login_session,
     LoginSession, LoginSessionChange,

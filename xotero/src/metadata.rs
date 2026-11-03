@@ -152,6 +152,15 @@ impl Schema {
         self.item_types.iter().find(|t| t.item_type == name)
     }
 
+    /// The creator type an item type lists first in summaries.
+    pub(crate) fn primary_creator_type(&self, item_type: &str) -> Option<&str> {
+        self.item_type(item_type)?
+            .creator_types
+            .iter()
+            .find(|c| c.primary)
+            .map(|c| c.creator_type.as_str())
+    }
+
     /// The type a mapping endpoint describes. Annotations have no mappings.
     fn mapped_type(&self, name: Option<&str>) -> Result<&ItemType, Invalid> {
         let name = name
@@ -369,6 +378,13 @@ pub(crate) fn creator_fields() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_creator_type_comes_from_the_schema() {
+        assert_eq!(SCHEMA.primary_creator_type("book"), Some("author"));
+        assert_eq!(SCHEMA.primary_creator_type("note"), None);
+        assert_eq!(SCHEMA.primary_creator_type("bogus"), None);
+    }
 
     fn keys(value: &Value) -> Vec<&str> {
         value

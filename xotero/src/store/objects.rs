@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use crate::domain::LibraryId;
+use crate::envelope::{Children, Library, LibraryKind};
 use crate::query::{Format, ItemQuery, QMode};
 
 use super::{guarded_version, is_stored_file_attachment, no_change, Outcome};
@@ -226,6 +229,60 @@ pub async fn query_items(
         })
         .collect();
     Ok((items, total))
+}
+
+/// The library an envelope names, looked up once per request: the owning
+/// user (by display name) or the group.
+pub async fn library_envelope(pool: &PgPool, library_id: LibraryId) -> sqlx::Result<Library> {
+    let row = sqlx::query(
+        "select 'group' as kind, id, name from groups where library_id = $1 \
+         union all \
+         select 'user', u.id, u.display_name from personal_libraries p \
+         join users u on u.id = p.user_id where p.library_id = $1",
+    )
+    .bind(library_id.get())
+    .fetch_one(pool)
+    .await?;
+    Ok(Library {
+        kind: if row.get::<String, _>("kind") == "group" {
+            LibraryKind::Group
+        } else {
+            LibraryKind::User
+        },
+        id: row.get("id"),
+        name: row.get("name"),
+    })
+}
+
+/// Non-trashed child counts for `parents`, by child kind. Note access is
+/// applied by the envelope, which knows each parent's type.
+pub async fn child_counts(
+    pool: &PgPool,
+    library_id: LibraryId,
+    parents: &[String],
+) -> sqlx::Result<HashMap<String, Children>> {
+    let rows = sqlx::query(
+        "select data->>'parentItem' as parent, item_type, count(*) as n from object \
+         where library_id = $1 and kind = 'item' and not deleted \
+         and data->>'parentItem' = any($2) \
+         group by 1, 2",
+    )
+    .bind(library_id.get())
+    .bind(parents)
+    .fetch_all(pool)
+    .await?;
+    let mut counts: HashMap<String, Children> = HashMap::new();
+    for row in rows {
+        let entry = counts.entry(row.get("parent")).or_default();
+        let n: i64 = row.get("n");
+        match row.get::<Option<String>, _>("item_type").as_deref() {
+            Some("note") => entry.notes += n,
+            Some("attachment") => entry.attachments += n,
+            Some("annotation") => entry.annotations += n,
+            _ => {}
+        }
+    }
+    Ok(counts)
 }
 
 /// Store a batch, stamping each object with the new library version. Both `POST`

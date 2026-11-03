@@ -7,6 +7,7 @@
 mod app;
 mod config;
 mod domain;
+mod envelope;
 mod error;
 mod handlers;
 mod http;

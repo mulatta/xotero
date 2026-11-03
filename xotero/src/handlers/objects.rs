@@ -15,7 +15,8 @@ use crate::http::headers::{
     conflict, csv_of, current_headers, header_value, link_header, precondition, version_headers,
 };
 use crate::http::validation::valid_object_key;
-use crate::{query, store, AppState};
+use crate::metadata::SCHEMA;
+use crate::{envelope, query, store, AppState};
 
 /// `format=versions&since=N` returns the changed `{key: version}` map; otherwise
 /// `?<kind>Key=a,b&format=json` returns the full `[{key, version, data}]`.
@@ -131,9 +132,34 @@ async fn item_listing(
     }
     match q.listing.format {
         query::Format::Json => {
+            let library = match store::library_envelope(&state.pool, request_library()).await {
+                Ok(library) => library,
+                Err(error) => return server_error("items library", error),
+            };
+            let keys: Vec<String> = items.iter().map(|item| item.key.clone()).collect();
+            let children = match store::child_counts(&state.pool, request_library(), &keys).await {
+                Ok(children) => children,
+                Err(error) => return server_error("items children", error),
+            };
+            let notes = request_permissions().notes;
             let items: Vec<Value> = items
                 .into_iter()
-                .map(|item| json!({"key": item.key, "version": item.version, "data": item.data}))
+                .map(|item| {
+                    let data = item.data.unwrap_or_default();
+                    let primary = data
+                        .get("itemType")
+                        .and_then(Value::as_str)
+                        .and_then(|t| SCHEMA.primary_creator_type(t));
+                    envelope::item(
+                        &library,
+                        &state.config.public_url,
+                        item.version,
+                        data,
+                        children.get(&item.key).copied().unwrap_or_default(),
+                        notes,
+                        primary,
+                    )
+                })
                 .collect();
             (headers, Json(items)).into_response()
         }
