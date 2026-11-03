@@ -302,7 +302,7 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-web-library -L` returns successful real rendered browser assertions and network trace.
 ### Wave F: operations and release gates
 
-- [x] 33. Add controlled explicit migration command
+- [ ] 33. Add controlled explicit migration command
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-operations -L` fresh migration and populated v13->current upgrade succeed before serving.
   - `xotero migrate` applies pending migrations and exits. Serving still
     applies pending migrations at startup.
@@ -310,6 +310,13 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
     modules do.
   - v13 means migrations 0001 to 0013 applied and populated, as in the
     existing `nixos-key-auth` upgrade fixture. The upgrade keeps its data.
+  - [x] Command, `ExecStartPre` and the `nixos-operations` check.
+  - [ ] `xotero migrate` reads the full service configuration
+    (`Config::from_env`), so a manual run needs the recovery keys, the login
+    KDF key and S3 credentials. It should need only the database URL.
+  - [ ] With `Restart=on-failure`, a failing `ExecStartPre` restarts the unit
+    until the start limit. Decide whether a migration failure should stop
+    retries, and assert the behavior in `nixos-operations`.
 - [ ] 34. Enforce single active process before startup mutations
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-operations -L`; duplicate start/migrate cannot alter schema, identity or pending state.
 - [ ] 35. Drain SIGTERM and bound runtime operations
@@ -346,7 +353,7 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
 ### P1: schema and migrations
 
 - [ ] Document backup-before-upgrade and rollback-by-restore procedures.
-- [ ] Add an explicit `xotero migrate` operational path. Plan Task 33.
+- [x] Add an explicit `xotero migrate` operational path. Plan Task 33.
 - [ ] Audit `IF NOT EXISTS` migration statements that can conceal schema drift.
 
 ### P1: HTTP and compatibility structure
