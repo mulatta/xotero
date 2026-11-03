@@ -46,6 +46,15 @@ Use real PostgreSQL and RustFS, not mocks.
   - instance authority, one-shot bootstrap, and audit
   - web sessions and CSRF
   - user, identity, key, group, membership, and ownership administration
+- `checks.x86_64-linux.nixos-operations`
+  - `xotero migrate` on a fresh database: current schema, no listener, no
+    identity rows beyond the migrations' own, idempotent rerun, and usage exit 2 for unknown arguments
+  - fresh database through the unit: `ExecStartPre` migrates, then an
+    authenticated request succeeds
+  - populated v13 database, from the fixture shared with `nixos-key-auth`:
+    the unit upgrades to current and the old item, setting, and full text read
+    back through the API
+  - failed migration: the unit fails in `ExecStartPre` and nothing listens
 
 ### Tier 2: real browser Web Library (planned)
 

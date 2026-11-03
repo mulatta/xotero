@@ -128,7 +128,14 @@ startup. Every response carries `Zotero-Schema-Version`.
 - Every schema change is an ordered migration. Merged migrations are not edited.
 - Tests start from realistic previous schemas and data.
 - Performance normalization happens only from measured query or integrity needs.
-- The server runs migrations at startup today. An explicit command is planned.
+- `xotero migrate` applies pending migrations and exits. It opens no listener,
+  starts no background loop, and changes no identity or upload state. A failed
+  migration exits 1. Unknown arguments print the usage and exit 2.
+- The NixOS module runs `xotero migrate` as `ExecStartPre` with the service's
+  environment and credentials, so a failed migration stops the unit before it
+  listens.
+- Serving still applies pending migrations at startup, so a process started
+  without the separate step reaches the same schema.
 
 ## Not reproduced from upstream
 
