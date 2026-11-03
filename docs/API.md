@@ -4,6 +4,19 @@
 > user and omits `/groups/...` and `/xotero/...`. Use `checks/contracts` and the
 > code until the rewrite lands.
 
+## Support levels
+
+Each behavior below is one of two levels:
+
+- **Verified.** A NixOS subtest exercises it against real PostgreSQL and
+  RustFS, and its inventory entry in `checks/contracts/data/web-api.json` has
+  proof state `covered` naming that subtest.
+- **Target.** The inventory records the upstream wire shape in a fixture, but
+  the proof state is still `pending` or `partial`. The server may differ.
+
+The inventory is authoritative. Sections that do not name a level describe
+the sync subset this document was first written for.
+
 Derived from the Zotero client sync code (`~/git/zotero/chrome/content/zotero/xpcom/sync/`,
 `storage/zfs.js`), the official Web API v3 docs, and live testing against a real
 Zotero 9 client. This is the contract the server must satisfy so a
@@ -216,12 +229,57 @@ GETs `Location` directly from the bucket. The pre-signed URL is an unguessable,
 expiring capability, so it needs no API key (mirroring how the client downloaded
 from S3 against zotero.org). `404` if absent. (zfs.js:52, zfs.js:109)
 
-## Pagination & throttling
+## Listings
 
-Multi-object listings page via `Link: <next>; rel=next` and `Total-Results`;
-client follows `rel=next` until absent (syncAPIClient.js:923). MVP can return all
-results in one page (no `Link`). `Backoff`/`Retry-After` honored by the client
-but optional to emit.
+### Verified
+
+`nixos-sync` subtests `personal listings match the 22a fixtures` and
+`private-group listings match the 22a fixtures` seed
+`checks/contracts/data/listing-seed.json` into a user and a group library,
+then replay each Task 22a fixture and page every listing to its end.
+
+Routes, under `/users/<id>` and `/groups/<id>`: `/items`, `/items/top`,
+`/items/trash`, `/collections/<key>/items`, `/collections/<key>/items/top`,
+`/collections`, `/searches`.
+
+- `format` is `json` (default), `keys` or `versions`. Any other value,
+  including `atom` and the export formats, answers `400`
+  `{"error":"Unsupported API combination"}`.
+- `sort` must be a dataserver sort field for the route, and `direction` must
+  be `asc` or `desc`; otherwise the same `400`. Without `direction`, date
+  fields sort descending and other fields ascending. Ties order by object
+  version, then key, in the same direction.
+- `limit` defaults to 25 (max 100) for `json`. `keys` and `versions` are
+  unlimited unless `limit` is given. `start` offsets the page. `since` keeps
+  objects whose version is greater.
+- Every response carries `Last-Modified-Version` and `Total-Results`, the
+  full match count.
+- `Link` lists `first`, `prev`, `next` and `last` as dataserver builds them:
+  only non-default parameters, sorted by name, and `first`/`last` only when
+  they differ from the requested page. xotero has no website, so it never
+  emits `rel="alternate"`. A single-page listing has no `Link`.
+- `keys` is `text/plain`, one key per line with a trailing newline.
+  `versions` is a `{key: version}` object.
+- `/items` excludes trashed items in every format unless `includeTrashed` is
+  set. `/items/trash` lists only trashed items.
+- `json` entries are dataserver envelopes:
+  - item: `{key, version, library, links, meta, data}`. `links.self`, and
+    `links.up` for a child. `meta` holds `creatorSummary` and `parsedDate` for
+    regular items, and `numChildren` for regular items, notes and PDF
+    attachments.
+  - collection: the same, with `links.up` for a subcollection and `meta`
+    `{numCollections, numItems}`.
+  - search: `{key, version, library, links, data}` with no `meta`.
+  - `library` is `{type, id, name}`, named after the user's display name or
+    the group.
+
+### Target
+
+- Group item `meta.createdByUser` and `meta.lastModifiedByUser`, and the
+  `links.attachment` and `links.enclosure` file links, are not emitted.
+- `itemKey`, `collectionKey` and `searchKey` batch reads still return bare
+  `{key, version, data}` objects (Task 22b).
+- Query filters and tag listings below are inventory targets for Task 22b.
 
 ## Read/query API (CLI-facing extension)
 
@@ -239,8 +297,7 @@ Item listings (`GET /users/<id>/items?format=json`) accept:
 | `q` + `qmode` | Search term. `titleCreatorYear` (default) matches title/creators/date; `everything` also matches stored full-text content. |
 | `itemType` | Filter by type (`book`; OR via `a \|\| b`; negate via `-note`). |
 | `tag` | Filter by tag (repeat for AND, `\|\|` for OR). |
-| `sort` + `direction` | `dateModified` (default), `dateAdded`, `title`, `creator`, `date`, `itemType`; `asc`/`desc`. |
-| `limit` + `start` | Page window (default 25, max 100). Response sets `Total-Results` and `Link: …; rel="next"`. |
+| `sort`, `direction`, `limit`, `start`, `since` | See Listings. |
 | `includeTrashed` | Include trashed items (excluded by default). |
 
 Convenience listings: `GET /users/<id>/items/top` (no `parentItem`),
@@ -250,12 +307,6 @@ trashed items excluded), `/collections/<key>/items` and
 listings carry the same search/filter/sort/paginate params as `/items`;
 `/items/top` also still answers the sync `format=versions`/`itemKey` reads the
 client may send there.
-
-`format=keys` returns every matching key (unpaged) as a plain-text,
-newline-separated list rather than JSON. The sync client uses it on
-`/collections/<key>/items/top` when restoring a previously-deleted collection
-(`syncEngine.js` `_restoreRestoredCollectionItems`); the list is the same set the
-JSON listing would return.
 
 Matching is case-insensitive substring (`ILIKE`). The default `titleCreatorYear`
 search runs against an immutable `xotero_item_text(data)` expression (title, date

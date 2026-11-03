@@ -259,7 +259,7 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L` compares paginated fixtures with full expected key sequence and response headers.
   - Each sub-task is done when its Task 22 inventory contracts leave `pending`
     and name a real `nixos-sync` subtest, for both user and group scopes.
-  - [ ] 22a. Item, collection and search listings: `json`, `keys` and
+  - [x] 22a. Item, collection and search listings: `json`, `keys` and
     `versions` formats, `start`/`limit`/`sort`/`direction` paging, and the
     unsupported-format and invalid-sort errors. Headers `Total-Results`, `Link`
     and `Last-Modified-Version` match the fixtures exactly, and list bodies

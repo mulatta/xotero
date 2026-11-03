@@ -77,9 +77,9 @@ same item key in two libraries -> isolated metadata and bytes
 
 ### API contract entries
 
-Each inventory entry in `checks/contracts` links upstream documentation, the
-`dataserver` location, request and response fixtures, the integration test, and
-its profile and support status.
+Each inventory entry in `checks/contracts/data/web-api.json` links upstream
+documentation, the `dataserver` location, request and response fixtures, the
+integration test, and its profile and support status.
 
 ## Historical desktop compatibility run
 
