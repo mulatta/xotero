@@ -1508,15 +1508,15 @@ with subtest("group data routes resolve the authorized group library"):
         "GRPTRS22": 17,
     }
     assert (
-        get_json("/groups/303/items?format=versions&since=0", bob)
+        get_json("/groups/303/items?format=versions&since=0&includeTrashed=1", bob)
         == expected_group_versions
     )
     assert (
-        get_json("/groups/303/items?format=versions&since=0", alice)
+        get_json("/groups/303/items?format=versions&since=0&includeTrashed=1", alice)
         == expected_group_versions
     )
     assert (
-        get_json("/groups/303/items?format=versions&since=0", recovery)
+        get_json("/groups/303/items?format=versions&since=0&includeTrashed=1", recovery)
         == expected_group_versions
     )
     group_items = get_json(
@@ -2340,7 +2340,7 @@ with subtest("DB permissions allow full keys and gate read-only mutations"):
 with subtest("notes permission filters notes without hiding library or annotations"):
     machine.succeed(
         f"""curl -sf {api_headers} -H 'Zotero-API-Key: {bob_full}' \
-        '{base}/users/202/items?format=versions&since=0' |
+        '{base}/users/202/items?format=versions&since=0&includeTrashed=1' |
         jq -e '. == {{
           "LEGACY22":3,
           "PRIVANN2":3,
@@ -2352,7 +2352,7 @@ with subtest("notes permission filters notes without hiding library or annotatio
     )
     machine.succeed(
         f"""curl -sf {api_headers} -H 'Zotero-API-Key: {bob}' \
-        '{base}/users/202/items?format=versions&since=0' |
+        '{base}/users/202/items?format=versions&since=0&includeTrashed=1' |
         jq -e '. == {{
           "LEGACY22":3,
           "PRIVANN2":3,

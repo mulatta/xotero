@@ -102,6 +102,14 @@ impl Format {
         }
     }
 
+    fn name(self) -> &'static str {
+        match self {
+            Format::Json => "json",
+            Format::Keys => "keys",
+            Format::Versions => "versions",
+        }
+    }
+
     /// Upstream page size: json pages by 25 (max 100); keys and versions are
     /// unlimited unless the request names a limit.
     fn default_limit(self) -> i64 {
@@ -146,10 +154,11 @@ pub enum Sort {
     Rights,
     Extra,
     AddedBy,
+    ServerDateModified,
 }
 
 impl Sort {
-    const ALL: [(&'static str, Sort); 16] = [
+    const ALL: [(&'static str, Sort); 17] = [
         ("dateModified", Sort::DateModified),
         ("dateAdded", Sort::DateAdded),
         ("title", Sort::Title),
@@ -166,6 +175,7 @@ impl Sort {
         ("rights", Sort::Rights),
         ("extra", Sort::Extra),
         ("addedBy", Sort::AddedBy),
+        ("serverDateModified", Sort::ServerDateModified),
     ];
 
     fn parse(value: &str, kind: ListKind) -> Result<Self, Unsupported> {
@@ -200,15 +210,22 @@ impl Sort {
         }
     }
 
+    /// Upstream `getSortEmptyFirst`: these sorts order empty values as lowest
+    /// instead of pushing them behind the non-empty ones.
+    pub fn empty_first(self) -> bool {
+        matches!(self, Sort::Title | Sort::Date)
+    }
+
     /// The SQL expression to order items by. `date`/`itemType` use the generated
     /// columns (migration 0006) — `date_year` is the first 4-digit year from the
     /// freeform date, so "circa 1990" / "January 2000" sort chronologically
     /// rather than by their leading character. `creator` orders by the first
     /// creator's last name; the rest read a top-level jsonb field. xotero
-    /// records no adding user, so `addedBy` orders by `dateAdded`.
+    /// records no adding user, so `addedBy` orders by `dateAdded`, and keeps
+    /// no separate server timestamp, so `serverDateModified` by `dateModified`.
     pub fn order_expr(self) -> &'static str {
         match self {
-            Sort::DateModified => "data->>'dateModified'",
+            Sort::DateModified | Sort::ServerDateModified => "data->>'dateModified'",
             Sort::DateAdded | Sort::AddedBy => "data->>'dateAdded'",
             Sort::Title => "data->>'title'",
             Sort::Creator => "data->'creators'->0->>'lastName'",
@@ -303,7 +320,73 @@ impl Listing {
             since,
         })
     }
+
+    /// Upstream `getNonDefaultParams` without `start`: the query parameters a
+    /// `Link` URL must repeat, sorted by name. Parameters upstream does not know
+    /// (such as `key`) are dropped.
+    pub fn link_params(&self, params: &Params) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        if self.format != Format::Json {
+            out.push(("format".into(), self.format.name().into()));
+        }
+        if self.sort != Sort::DateModified {
+            out.push(("sort".into(), self.sort.name().into()));
+        }
+        if self.direction != self.sort.default_direction() {
+            out.push(("direction".into(), self.direction.sql().into()));
+        }
+        if self.limit != self.format.default_limit() {
+            out.push(("limit".into(), self.limit.to_string()));
+        }
+        if let Some(since) = self.since {
+            out.push(("since".into(), since.to_string()));
+        }
+        for (name, default) in FILTER_DEFAULTS {
+            let values = params.all(name);
+            if values.is_empty() {
+                continue;
+            }
+            // PHP turns a repeated parameter into an array and joins it with ','.
+            let value = values.join(",");
+            if value != default {
+                out.push((name.into(), value));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// The `order by` list for a listing sorted by `expr`: upstream's
+    /// empty-value rule, then version and key in the same direction.
+    pub fn order_by(&self, expr: &str) -> String {
+        let dir = self.direction.sql();
+        let sort = if self.sort.empty_first() {
+            let nulls = match self.direction {
+                Direction::Asc => "first",
+                Direction::Desc => "last",
+            };
+            format!("nullif({expr}, '') {dir} nulls {nulls}")
+        } else {
+            format!("coalesce({expr}, '') = '' {dir}, {expr} {dir}")
+        };
+        format!("{sort}, version {dir}, key {dir}")
+    }
 }
+
+/// Upstream filter parameters and their defaults, as `getNonDefaultParams`
+/// compares them. `includeTrashed` defaults to 0, which PHP equates with "0".
+const FILTER_DEFAULTS: [(&str, &str); 10] = [
+    ("collectionKey", ""),
+    ("include", "data"),
+    ("includeTrashed", "0"),
+    ("itemKey", ""),
+    ("itemType", ""),
+    ("q", ""),
+    ("qmode", ""),
+    ("searchKey", ""),
+    ("tag", ""),
+    ("tagType", ""),
+];
 
 /// A parsed item listing request: a search term, filters and the shared
 /// listing window. Built from the query string; consumed by `store::query_items`.
@@ -538,5 +621,88 @@ mod tests {
                 assert!(listing(raw, kind).is_ok(), "{raw}");
             }
         }
+    }
+
+    fn link_params(raw: &str) -> Vec<(String, String)> {
+        let params = Params::parse(Some(raw));
+        Listing::parse(&params, ListKind::Items)
+            .unwrap()
+            .link_params(&params)
+    }
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn link_params_keep_only_non_defaults_sorted() {
+        assert!(link_params("").is_empty());
+        assert!(
+            link_params("format=json&sort=dateModified&direction=desc&limit=25&start=5").is_empty()
+        );
+        assert_eq!(
+            link_params("sort=title&key=secret"),
+            pairs(&[("sort", "title")])
+        );
+        // date's default direction is desc, so only the sort survives.
+        assert_eq!(
+            link_params("sort=date&direction=desc"),
+            pairs(&[("sort", "date")])
+        );
+        assert_eq!(
+            link_params("sort=title&direction=desc"),
+            pairs(&[("direction", "desc"), ("sort", "title")])
+        );
+        assert_eq!(
+            link_params("sort=title&limit=25&format=keys"),
+            pairs(&[("format", "keys"), ("limit", "25"), ("sort", "title")])
+        );
+        assert_eq!(
+            link_params("since=17&q=rust&includeTrashed=0&tag=a&tag=b&itemType=book&include=data"),
+            pairs(&[
+                ("itemType", "book"),
+                ("q", "rust"),
+                ("since", "17"),
+                ("tag", "a,b")
+            ])
+        );
+        assert_eq!(link_params("sort=asc"), pairs(&[("direction", "asc")]));
+    }
+
+    #[test]
+    fn server_date_modified_sorts_by_date_modified() {
+        let l = listing("sort=serverDateModified", ListKind::Items).unwrap();
+        assert_eq!(l.sort.order_expr(), "data->>'dateModified'");
+        assert_eq!(l.direction, Direction::Asc);
+    }
+
+    #[test]
+    fn order_by_ties_break_on_version_then_key() {
+        let order = |raw| {
+            let l = listing(raw, ListKind::Items).unwrap();
+            l.order_by(l.sort.order_expr())
+        };
+        // Empty-first sorts: empties are the lowest values.
+        assert_eq!(
+            order("sort=title"),
+            "nullif(data->>'title', '') asc nulls first, version asc, key asc"
+        );
+        assert_eq!(
+            order("sort=date"),
+            "nullif(date_year, '') desc nulls last, version desc, key desc"
+        );
+        // Other sorts put empties after values ascending, before them descending.
+        assert_eq!(
+            order("sort=creator"),
+            "coalesce(data->'creators'->0->>'lastName', '') = '' asc, \
+             data->'creators'->0->>'lastName' asc, version asc, key asc"
+        );
+        assert_eq!(
+            order(""),
+            "coalesce(data->>'dateModified', '') = '' desc, data->>'dateModified' desc, \
+             version desc, key desc"
+        );
     }
 }

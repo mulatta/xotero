@@ -3,7 +3,7 @@ use sqlx::postgres::PgRow;
 use sqlx::{PgPool, Postgres, QueryBuilder, Row};
 
 use crate::domain::LibraryId;
-use crate::query::{ItemQuery, QMode};
+use crate::query::{Format, ItemQuery, QMode};
 
 use super::{guarded_version, is_stored_file_attachment, no_change, Outcome};
 
@@ -161,6 +161,10 @@ fn push_item_filters(
         sql.push(" and tag_names && ").push_bind(group.clone());
     }
 
+    if let Some(since) = q.listing.since {
+        sql.push(" and version > ").push_bind(since);
+    }
+
     // /items/top: only top-level items.
     if q.top {
         sql.push(" and is_top");
@@ -173,65 +177,55 @@ fn push_item_filters(
     }
 }
 
-/// Run a CLI-facing item listing: filter, search, sort and page over the stored
-/// items. Returns `([{key, version, data}], total)`, where `total` is the full
-/// match count. It is counted separately from the page so it stays correct even
-/// when `start` runs past the end (a window count would vanish with the rows).
+/// One row of a listing page. `data` is loaded only for `format=json`.
+pub struct ListedObject {
+    pub key: String,
+    pub version: i64,
+    pub data: Option<Value>,
+}
+
+/// Run an item listing: filter, search, sort and page over the stored items.
+/// Returns the page and `total`, the full match count. It is counted
+/// separately from the page so it stays correct even when `start` runs past
+/// the end (a window count would vanish with the rows).
 pub async fn query_items(
     pool: &PgPool,
     library_id: LibraryId,
     q: &ItemQuery,
     include_notes: bool,
-) -> sqlx::Result<(Vec<Value>, i64)> {
+) -> sqlx::Result<(Vec<ListedObject>, i64)> {
     let mut count: QueryBuilder<Postgres> = QueryBuilder::new("select count(*) from object where ");
     push_item_filters(&mut count, library_id, q, include_notes);
     let total: i64 = count.build().fetch_one(pool).await?.get(0);
 
-    let mut sql: QueryBuilder<Postgres> =
-        QueryBuilder::new("select key, version, data from object where ");
+    let with_data = q.listing.format == Format::Json;
+    let mut sql: QueryBuilder<Postgres> = QueryBuilder::new(if with_data {
+        "select key, version, data from object where "
+    } else {
+        "select key, version from object where "
+    });
     push_item_filters(&mut sql, library_id, q, include_notes);
-    // order_expr/sql() are fixed strings (no user input), so pushing them raw is
-    // safe; nulls sort last so items missing the sort field don't lead.
+    // The order list is built from fixed strings (no user input), so pushing it
+    // raw is safe.
     sql.push(" order by ")
-        .push(q.listing.sort.order_expr())
-        .push(" ")
-        .push(q.listing.direction.sql())
-        .push(" nulls last, key asc limit ")
-        .push_bind(q.listing.limit)
-        .push(" offset ")
-        .push_bind(q.listing.start);
+        .push(q.listing.order_by(q.listing.sort.order_expr()));
+    if q.listing.limit > 0 {
+        sql.push(" limit ").push_bind(q.listing.limit);
+    }
+    sql.push(" offset ").push_bind(q.listing.start);
 
     let items = sql
         .build()
         .fetch_all(pool)
         .await?
         .into_iter()
-        .map(object_json)
+        .map(|row| ListedObject {
+            key: row.get("key"),
+            version: row.get("version"),
+            data: with_data.then(|| order_fields(row.get("data"))),
+        })
         .collect();
     Ok((items, total))
-}
-
-/// Every item key matching the query, ordered, with no paging — the plain key
-/// list the sync client's `getKeys()` consumes (e.g. the top-level items of a
-/// restored collection). Shares `push_item_filters`, so `format=keys` honours
-/// the same filters as the JSON listing.
-pub async fn item_keys(
-    pool: &PgPool,
-    library_id: LibraryId,
-    q: &ItemQuery,
-    include_notes: bool,
-) -> sqlx::Result<Vec<String>> {
-    let mut sql: QueryBuilder<Postgres> = QueryBuilder::new("select key from object where ");
-    push_item_filters(&mut sql, library_id, q, include_notes);
-    sql.push(" order by key");
-    let keys = sql
-        .build()
-        .fetch_all(pool)
-        .await?
-        .into_iter()
-        .map(|row| row.get::<String, _>("key"))
-        .collect();
-    Ok(keys)
 }
 
 /// Store a batch, stamping each object with the new library version. Both `POST`

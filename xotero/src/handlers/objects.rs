@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use axum::{
     body::Bytes,
     extract::{OriginalUri, Path, RawQuery, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::error::{server_error, unsupported};
 use crate::http::access::{request_access, request_library, request_permissions};
 use crate::http::headers::{
-    conflict, csv_of, current_headers, next_link, precondition, version_headers,
+    conflict, csv_of, current_headers, header_value, link_header, precondition, version_headers,
 };
 use crate::http::validation::valid_object_key;
 use crate::{query, store, AppState};
@@ -67,79 +67,48 @@ async fn reject(state: &AppState) -> Response {
     }
 }
 
-/// The two sync reads shared by `/items` and `/items/top`: the `format=versions`
-/// map and the `?itemKey=…` batch. With `top`, the versions map is restricted to
-/// top-level items (the client's parent-first phase). Returns `None` when the
-/// request carries neither, i.e. it is a CLI query rather than a sync read.
-async fn item_sync_read(
+/// The `?itemKey=…` batch read the sync client sends to `/items` and
+/// `/items/top`. Returns `None` for any other request.
+async fn item_batch_read(
     state: &AppState,
     params: &query::Params,
     q: &query::ItemQuery,
-    top: bool,
 ) -> Option<Response> {
-    if q.listing.format == query::Format::Versions {
-        let since = q.listing.since.unwrap_or(0);
-        // Always 200 + map (never 304); see `read` — a 304 here loops the client.
-        let current = match store::current_version(&state.pool, request_library()).await {
-            Ok(current) => current,
-            Err(error) => return Some(server_error("items versions", error)),
-        };
-        let result = if top {
-            store::top_versions(
-                &state.pool,
-                request_library(),
-                since,
-                request_permissions().notes,
-            )
-            .await
-        } else {
-            store::versions(
-                &state.pool,
-                request_library(),
-                "item",
-                since,
-                request_permissions().notes,
-            )
-            .await
-        };
-        return Some(match result {
-            Ok(value) => (version_headers(current), Json(value)).into_response(),
-            Err(error) => server_error("items versions", error),
-        });
+    let csv = params.get("itemKey")?;
+    if q.listing.format != query::Format::Json {
+        return None;
     }
-    if let Some(csv) = params.get("itemKey") {
-        let keys: Vec<String> = csv.split(',').map(String::from).collect();
-        return Some(
-            match store::objects(
-                &state.pool,
-                request_library(),
-                "item",
-                &keys,
-                request_permissions().notes,
-            )
-            .await
-            {
-                Ok(value) => match current_headers(state).await {
-                    Ok(headers) => (headers, Json(value)).into_response(),
-                    Err(error) => server_error("items batch version", error),
-                },
-                Err(error) => server_error("items batch", error),
+    let keys: Vec<String> = csv.split(',').map(String::from).collect();
+    Some(
+        match store::objects(
+            &state.pool,
+            request_library(),
+            "item",
+            &keys,
+            request_permissions().notes,
+        )
+        .await
+        {
+            Ok(value) => match current_headers(state).await {
+                Ok(headers) => (headers, Json(value)).into_response(),
+                Err(error) => server_error("items batch version", error),
             },
-        );
-    }
-    None
+            Err(error) => server_error("items batch", error),
+        },
+    )
 }
 
-/// Render an item query as a paged JSON listing: the `[{key, version, data}]`
-/// array plus `Total-Results` and, while more rows remain, a `Link: …;
-/// rel="next"` built against `path` (the public-URL endpoint).
+/// Answer an item listing in its format, always with `Total-Results` and, when
+/// a page link applies, `Link` built against `path` (the public-URL endpoint).
+/// versions is always 200 + map, never 304: the client's `getVersions` treats a
+/// 304 as "no data" and restarts the sync forever.
 async fn item_listing(
     state: &AppState,
     path: &str,
-    raw: Option<&str>,
+    params: &query::Params,
     q: &query::ItemQuery,
 ) -> Response {
-    match store::query_items(
+    let (items, total) = match store::query_items(
         &state.pool,
         request_library(),
         q,
@@ -147,51 +116,52 @@ async fn item_listing(
     )
     .await
     {
-        Ok((items, total)) => {
-            let mut headers = match current_headers(state).await {
-                Ok(headers) => headers,
-                Err(error) => return server_error("items query version", error),
-            };
-            headers.insert("total-results", total.to_string().parse().unwrap());
-            let (start, limit) = (q.listing.start, q.listing.limit);
-            if start + limit < total {
-                let link = next_link(&state.config, path, raw, start + limit);
-                headers.insert("link", link.parse().unwrap());
-            }
-            (headers, Json(Value::Array(items))).into_response()
+        Ok(page) => page,
+        Err(error) => return server_error("items query", error),
+    };
+    let mut headers = match current_headers(state).await {
+        Ok(headers) => headers,
+        Err(error) => return server_error("items query version", error),
+    };
+    headers.insert("total-results", header_value(&total.to_string()));
+    let base = format!("{}{}", state.config.public_url, path);
+    let link_params = q.listing.link_params(params);
+    if let Some(link) = link_header(&base, &link_params, q.listing.start, q.listing.limit, total) {
+        headers.insert("link", header_value(&link));
+    }
+    match q.listing.format {
+        query::Format::Json => {
+            let items: Vec<Value> = items
+                .into_iter()
+                .map(|item| json!({"key": item.key, "version": item.version, "data": item.data}))
+                .collect();
+            (headers, Json(items)).into_response()
         }
-        Err(error) => server_error("items query", error),
+        // Zotero's `getKeys()` splits the body on '\n'; upstream ends it with one.
+        query::Format::Keys => {
+            headers.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("text/plain"),
+            );
+            let mut body: String = items
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            body.push('\n');
+            (headers, body).into_response()
+        }
+        query::Format::Versions => {
+            let map: serde_json::Map<String, Value> = items
+                .into_iter()
+                .map(|item| (item.key, Value::from(item.version)))
+                .collect();
+            (headers, Json(Value::Object(map))).into_response()
+        }
     }
 }
 
-/// `format=keys` returns every matching item key (no paging) as a plain-text
-/// newline list — the shape Zotero's `getKeys()` parses (it reads the body as
-/// `responseText.split('\n')`). Returns `None` for any other format.
-async fn item_keys_response(state: &AppState, q: &query::ItemQuery) -> Option<Response> {
-    if q.listing.format != query::Format::Keys {
-        return None;
-    }
-    Some(
-        match store::item_keys(
-            &state.pool,
-            request_library(),
-            q,
-            request_permissions().notes,
-        )
-        .await
-        {
-            // A `String` body sets `Content-Type: text/plain`, which is what the
-            // client expects; current_headers adds `Last-Modified-Version`.
-            Ok(keys) => match current_headers(state).await {
-                Ok(headers) => (headers, keys.join("\n")).into_response(),
-                Err(error) => server_error("item keys version", error),
-            },
-            Err(error) => server_error("item keys", error),
-        },
-    )
-}
-
-/// `GET /users/<id>/items`: the two sync reads, or the CLI query when neither.
+/// `GET /users/<id>/items`: the `itemKey` batch read, or the listing.
 pub(crate) async fn items_get(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -202,17 +172,14 @@ pub(crate) async fn items_get(
         Ok(q) => q,
         Err(query::Unsupported) => return reject(&state).await,
     };
-    if let Some(resp) = item_sync_read(&state, &params, &q, false).await {
+    if let Some(resp) = item_batch_read(&state, &params, &q).await {
         return resp;
     }
-    if let Some(resp) = item_keys_response(&state, &q).await {
-        return resp;
-    }
-    item_listing(&state, uri.path(), raw.as_deref(), &q).await
+    item_listing(&state, uri.path(), &params, &q).await
 }
 
 /// `GET /users/<id>/items/top`: top-level items (no `parentItem`). Also answers
-/// the sync `format=versions` (top-filtered) and `itemKey` reads sent here.
+/// the sync `itemKey` batch read sent here.
 pub(crate) async fn items_top(
     State(state): State<AppState>,
     OriginalUri(uri): OriginalUri,
@@ -223,14 +190,11 @@ pub(crate) async fn items_top(
         Ok(q) => q,
         Err(query::Unsupported) => return reject(&state).await,
     };
-    if let Some(resp) = item_sync_read(&state, &params, &q, true).await {
+    if let Some(resp) = item_batch_read(&state, &params, &q).await {
         return resp;
     }
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, &q).await {
-        return resp;
-    }
-    item_listing(&state, uri.path(), raw.as_deref(), &q).await
+    item_listing(&state, uri.path(), &params, &q).await
 }
 
 /// `GET /users/<id>/items/trash`: only trashed items (`data.deleted`).
@@ -245,10 +209,7 @@ pub(crate) async fn items_trash(
         Err(query::Unsupported) => return reject(&state).await,
     };
     q.only_trashed = true;
-    if let Some(resp) = item_keys_response(&state, &q).await {
-        return resp;
-    }
-    item_listing(&state, uri.path(), raw.as_deref(), &q).await
+    item_listing(&state, uri.path(), &params, &q).await
 }
 
 /// `GET /users/<id>/collections/<key>/items`: items in the given collection.
@@ -263,11 +224,8 @@ pub(crate) async fn collection_items(
         Ok(q) => q,
         Err(query::Unsupported) => return reject(&state).await,
     };
-    q.collection = Some(key.clone());
-    if let Some(resp) = item_keys_response(&state, &q).await {
-        return resp;
-    }
-    item_listing(&state, uri.path(), raw.as_deref(), &q).await
+    q.collection = Some(key);
+    item_listing(&state, uri.path(), &params, &q).await
 }
 
 /// `GET /users/<id>/collections/<key>/items/top`: top-level items in the
@@ -284,12 +242,9 @@ pub(crate) async fn collection_items_top(
         Ok(q) => q,
         Err(query::Unsupported) => return reject(&state).await,
     };
-    q.collection = Some(key.clone());
+    q.collection = Some(key);
     q.top = true;
-    if let Some(resp) = item_keys_response(&state, &q).await {
-        return resp;
-    }
-    item_listing(&state, uri.path(), raw.as_deref(), &q).await
+    item_listing(&state, uri.path(), &params, &q).await
 }
 
 /// Both POST and PATCH create-or-update with merge semantics (see `store::write`):

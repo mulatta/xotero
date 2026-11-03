@@ -44,28 +44,6 @@ pub async fn versions(
     Ok(version_map(rows, "key"))
 }
 
-/// `{key: version}` for top-level items changed after `since`. The client's
-/// sync fetches top-level items first (a parent-first phase), so this is the
-/// top-filtered counterpart of `versions(pool, library_id, "item", since)`.
-pub async fn top_versions(
-    pool: &PgPool,
-    library_id: LibraryId,
-    since: i64,
-    include_notes: bool,
-) -> sqlx::Result<Value> {
-    let rows = sqlx::query(
-        "select key, version from object \
-         where library_id = $1 and kind = 'item' and is_top and version > $2 \
-         and ($3 or item_type is distinct from 'note')",
-    )
-    .bind(library_id.get())
-    .bind(since)
-    .bind(include_notes)
-    .fetch_all(pool)
-    .await?;
-    Ok(version_map(rows, "key"))
-}
-
 /// Deleted object keys after `since`, grouped by kind for the /deleted endpoint.
 pub async fn deleted(pool: &PgPool, library_id: LibraryId, since: i64) -> sqlx::Result<Value> {
     let rows = sqlx::query("select kind, key from deletion where library_id = $1 and version > $2")

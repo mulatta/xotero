@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-use crate::{http::access::request_library, store, AppState, Config};
+use crate::{http::access::request_library, store, AppState};
 
 pub(crate) fn version_headers(version: i64) -> HeaderMap {
     let mut headers = HeaderMap::new();
@@ -103,14 +103,118 @@ pub(crate) fn csv_of(params: &HashMap<String, String>, key: &str) -> Vec<String>
         .unwrap_or_default()
 }
 
-/// The `Link: <…>; rel="next"` header for the page after `start`, preserving the
-/// request's other params and pointing at the public (reverse-proxy) URL.
-pub(crate) fn next_link(config: &Config, path: &str, raw: Option<&str>, start: i64) -> String {
-    let mut pairs: Vec<(String, String)> = raw
-        .and_then(|q| serde_urlencoded::from_str(q).ok())
-        .unwrap_or_default();
-    pairs.retain(|(k, _)| k != "start");
-    pairs.push(("start".into(), start.to_string()));
-    let qs = serde_urlencoded::to_string(&pairs).unwrap_or_default();
-    format!("<{}{}?{}>; rel=\"next\"", config.public_url, path, qs)
+/// Upstream `buildLinks`/`buildLinkHeader` for a listing page at `base` (the
+/// public URL plus path). `params` are the sorted non-default parameters
+/// without `start`. `alternate` is never emitted: it names the zotero.org
+/// website, which xotero does not have. `None` when no link applies.
+pub(crate) fn link_header(
+    base: &str,
+    params: &[(String, String)],
+    start: i64,
+    limit: i64,
+    total: i64,
+) -> Option<String> {
+    // Upstream drops a non-positive start from every link URL.
+    let url = |start: i64| {
+        let mut pairs = params.to_vec();
+        if start > 0 {
+            pairs.push(("start".into(), start.to_string()));
+            pairs.sort();
+        }
+        if pairs.is_empty() {
+            return base.to_string();
+        }
+        format!(
+            "{base}?{}",
+            serde_urlencoded::to_string(&pairs).unwrap_or_default()
+        )
+    };
+    let this = url(start);
+    let mut parts = Vec::new();
+    let first = url(0);
+    if first != this {
+        parts.push(format!("<{first}>; rel=\"first\""));
+    }
+    if start > 0 {
+        parts.push(format!("<{}>; rel=\"prev\"", url(start - limit)));
+    }
+    if (start > 0 || limit < total) && limit != 0 {
+        if start + limit < total {
+            parts.push(format!("<{}>; rel=\"next\"", url(start + limit)));
+        }
+        let last_start = if start >= total || total % limit == 0 {
+            total - limit
+        } else {
+            total - total % limit
+        };
+        let last = url(last_start);
+        if last != this {
+            parts.push(format!("<{last}>; rel=\"last\""));
+        }
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "B/users/101/items";
+
+    fn params(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn link_first_page_has_next_and_last() {
+        assert_eq!(
+            link_header(BASE, &params(&[("sort", "title")]), 0, 25, 28).as_deref(),
+            Some("<B/users/101/items?sort=title&start=25>; rel=\"next\", <B/users/101/items?sort=title&start=25>; rel=\"last\"")
+        );
+        assert_eq!(
+            link_header(BASE, &params(&[("format", "keys"), ("limit", "25"), ("sort", "title")]), 0, 25, 28).as_deref(),
+            Some("<B/users/101/items?format=keys&limit=25&sort=title&start=25>; rel=\"next\", <B/users/101/items?format=keys&limit=25&sort=title&start=25>; rel=\"last\"")
+        );
+    }
+
+    #[test]
+    fn link_last_page_has_first_and_prev() {
+        assert_eq!(
+            link_header(BASE, &params(&[("sort", "date")]), 25, 25, 28).as_deref(),
+            Some("<B/users/101/items?sort=date>; rel=\"first\", <B/users/101/items?sort=date>; rel=\"prev\"")
+        );
+    }
+
+    #[test]
+    fn link_single_page_and_unlimited_are_empty() {
+        assert_eq!(link_header(BASE, &[], 0, 25, 3), None);
+        assert_eq!(link_header(BASE, &[], 0, 0, 28), None);
+        assert_eq!(link_header(BASE, &[], 0, 25, 0), None);
+    }
+
+    #[test]
+    fn link_edge_cases() {
+        // An exact multiple of the limit: the last page starts one limit back.
+        assert_eq!(
+            link_header(BASE, &[], 0, 25, 50).as_deref(),
+            Some("<B/users/101/items?start=25>; rel=\"next\", <B/users/101/items?start=25>; rel=\"last\"")
+        );
+        // Start past the end: last is total - limit, no next.
+        assert_eq!(
+            link_header(BASE, &[], 100, 25, 28).as_deref(),
+            Some("<B/users/101/items>; rel=\"first\", <B/users/101/items?start=75>; rel=\"prev\", <B/users/101/items?start=3>; rel=\"last\"")
+        );
+        // limit 0 past the first row: only first and prev.
+        assert_eq!(
+            link_header(BASE, &[], 10, 0, 28).as_deref(),
+            Some("<B/users/101/items>; rel=\"first\", <B/users/101/items?start=10>; rel=\"prev\"")
+        );
+        // start lands between keys alphabetically; spaces encode as `+`.
+        assert_eq!(
+            link_header(BASE, &params(&[("q", "a b"), ("tag", "x")]), 0, 1, 2).as_deref(),
+            Some("<B/users/101/items?q=a+b&start=1&tag=x>; rel=\"next\", <B/users/101/items?q=a+b&start=1&tag=x>; rel=\"last\"")
+        );
+    }
 }
