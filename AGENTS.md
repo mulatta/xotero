@@ -13,6 +13,7 @@
 - `docs/DESIGN.md` describes what exists. Keep plans out of it.
 - `docs/API.md` holds the wire contract.
 - `docs/ROADMAP.md` holds plans, current work, and technical debt.
+- `docs/TASK.md` holds the order and dependencies of open tasks.
 - `docs/TESTING.md` holds verification tiers.
 - `docs/adr/` holds the reasons for accepted decisions.
 

@@ -245,7 +245,7 @@ Exit criteria for 1.0:
 
 ## Current work
 
-Tasks 1 to 21 are merged.
+Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
 
 ### Wave D: browser API semantics
 
