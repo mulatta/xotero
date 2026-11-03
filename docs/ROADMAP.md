@@ -269,13 +269,20 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
     support in `docs/API.md`.
   - [ ] 22b. Query filters (`q`/`qmode`, `tag` expressions, `itemType`,
     `itemKey`, `includeTrashed`, `annotationType`), tag listings with
-    `itemQ`/`itemQMode`/`itemTag`, and refusal of remote export URLs.
+    `itemQ`/`itemQMode`/`itemTag`, and refusal of remote export URLs. Also
+    accept the `itemKeyList`, `collectionKeyList` and `searchKeyList` sorts
+    that 22a rejects with 400, and prove with fixtures that `format=versions`
+    omits trashed items unless `includeTrashed` is set.
   - [ ] 22c. Full-text index, versions, bulk and per-item reads and writes, and
     the global `/groups` listing.
 - [ ] 23. Implement single-object conditional CRUD
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L`; pinned single-object request/response fixtures pass for user/group.
 - [ ] 24. Add children, publications and collection hierarchy views
   - Includes the publications tag listing (`/publications/items/tags`).
+  - Index `data->>'parentItem'` and `data->>'parentCollection'`; 22a counts
+    children and subcollections by scanning each listed page.
+  - Add the group `createdByUser`/`lastModifiedByUser` and the attachment
+    `enclosure` links that 22a leaves out of the envelope.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync -L` checks actual tree/details/publications fixtures.
 - [ ] 25. Add individual-setting conditional operations
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-sync .#checks.x86_64-linux.nixos-key-auth -L`.
@@ -295,6 +302,7 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
     wrapper sets `NODE_CONFIG='{"host":"127.0.0.1"}'` unless the deployer sets
     `NODE_CONFIG`, so a deployer override replaces the loopback default.
 - [ ] 28. Implement all advertised export formats
+  - Replaces the 400 that 22a returns for every export `format=` value.
   - Acceptance: `nix build .#checks.x86_64-linux.nixos-web-library -L`; every advertised format has content/MIME fixture checked against same pinned real engine.
 - [ ] 29. Package complete upstream Web Library assets
   - Acceptance: `nix build .#packages.x86_64-linux.web-library -L` creates HTML, JS/CSS, reader/editor/worker/font/locale/style assets from complete sandbox closure.
@@ -367,6 +375,11 @@ Tasks 1 to 21 are merged. See `docs/TASK.md` for task order and dependencies.
 - [ ] Separate current verified behavior in `docs/API.md` from target support.
 - [ ] Inventory API-version, schema-version, content-negotiation, conditional
   request, pagination, and output-format edge cases. Plan Task 22.
+- [ ] Match dataserver sort keys. Title sort uses `data->>'title'` instead of
+  `sortTitle`, creator sort uses the first creator's last name instead of the
+  creator summary, and `parsedDate` is a reduced port of
+  `Zotero_Date::strToDate`. Resolve after 22c and before Task 30 connects the
+  Web UI, because the UI orders every list by these keys.
 - [ ] Add a trusted-proxy configuration. The server now requires a loopback bind,
   but it has no separate proxy setting. Plan Task 31.
 

@@ -89,8 +89,8 @@ against the code when the task starts, and update this file when it changes.
 - 24 needs 22a and 22b.
 - 28 needs 22a and 27. Export rides on `format=` of the item listings, which
   22a answers with 400 for every export format until 28 serves them.
-- 30 needs 29. It needs Wave D to work end to end, and it creates the
-  `nixos-web-library` check.
+- 30 needs 29. It needs Wave D and the sort-key debt fix to work end to end,
+  and it creates the `nixos-web-library` check.
 - 31 needs 27 and 30. 38 needs 31.
 - 32 needs 30.
 - 37 needs 33, 26 and 30.
